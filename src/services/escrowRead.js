@@ -15,11 +15,12 @@ const logger = require('../logger');
 
 /**
  * Regex that a valid invoice ID must satisfy.
- * Allows alphanumeric characters, underscores, and hyphens, 1–128 chars.
+ * Aligned with IDENTIFIER_PATTERN in escrowSubmit.js.
+ * Allows alphanumeric start, followed by alphanumeric, underscores, hyphens, dots, or colons, 1–128 chars.
  *
  * @constant {RegExp}
  */
-const INVOICE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const INVOICE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 /**
  * Validates an invoice ID string.
