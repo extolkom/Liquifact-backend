@@ -347,6 +347,7 @@ const sentry = require('./observability/sentry');
 const requestId = require('./middleware/requestId');
 const pinoHttp = require('pino-http');
 const investRoutes = require('./routes/invest');
+const marketplaceRoutes = require('./routes/marketplace');
 const invoiceFileRouter = require('./routes/invoiceFile');
 
 const PORT = process.env.PORT || 3001;
@@ -419,6 +420,7 @@ function createApp(options = {}) {
 
   app.use('/api/sme', smeRouter);
   app.use('/api/invest', investRoutes);
+  app.use('/api/marketplace', marketplaceRoutes);
   app.use('/api/invoices', invoiceFileRouter);
 
   app.get('/health', async (req, res) => {

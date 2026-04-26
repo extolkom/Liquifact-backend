@@ -136,6 +136,14 @@ The API is documented using OpenAPI 3.0 specification.
 
 The documentation covers all public endpoints including health checks, invoice management, escrow operations, and investment opportunities.
 
+- **Marketplace**: `GET /api/marketplace` - Search and sort invoices by yield, maturity, and funded ratio. Supports advanced filtering (`yieldBpsMin`, `maturityDateTo`, `fundedRatioMin`, etc.) and pagination.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer <token>" \
+     "http://localhost:3001/api/marketplace?yieldBpsMin=500&sortBy=yield_bps&order=desc"
+```
+
 ---
 
 Core routes currently covered:
