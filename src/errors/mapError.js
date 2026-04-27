@@ -70,9 +70,9 @@ function mapError(error) {
   }
 
   return {
-    status: 500,
-    code: 'INTERNAL_SERVER_ERROR',
-    message: 'An internal server error occurred.',
+    status: error.status || 500,
+    code: error.status === 403 ? 'FORBIDDEN' : 'INTERNAL_SERVER_ERROR',
+    message: error.message || 'An internal server error occurred.',
     retryable: false,
     retryHint: 'Do not retry until the issue is resolved or support is contacted.',
   };
