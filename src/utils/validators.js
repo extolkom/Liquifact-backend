@@ -101,6 +101,142 @@ function validateInvoiceQueryParams(query) {
 }
 
 /**
+ * Validates marketplace query parameters.
+ * 
+ * @param {Object} query - The Express query object.
+ * @returns {Object} { isValid, errors, validatedParams }
+ */
+function validateMarketplaceQueryParams(query) {
+  const errors = [];
+  const validatedParams = {
+    filters: {},
+    sorting: {},
+    pagination: {}
+  };
+
+  const {
+    status,
+    yieldBpsMin,
+    yieldBpsMax,
+    maturityDateFrom,
+    maturityDateTo,
+    fundedRatioMin,
+    fundedRatioMax,
+    sortBy,
+    order,
+    page,
+    limit
+  } = query;
+
+  // Validate status
+  if (status !== undefined) {
+    const validStatuses = ['pending_verification', 'verified', 'funded', 'partially_funded', 'completed', 'defaulted'];
+    if (validStatuses.includes(status)) {
+      validatedParams.filters.status = status;
+    } else {
+      errors.push(`Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+    }
+  }
+
+  // Validate Yield BPS
+  if (yieldBpsMin !== undefined) {
+    const val = parseInt(yieldBpsMin);
+    if (!isNaN(val) && val >= 0) {
+      validatedParams.filters.yieldBpsMin = val;
+    } else {
+      errors.push('yieldBpsMin must be a non-negative integer');
+    }
+  }
+  if (yieldBpsMax !== undefined) {
+    const val = parseInt(yieldBpsMax);
+    if (!isNaN(val) && val >= 0) {
+      validatedParams.filters.yieldBpsMax = val;
+    } else {
+      errors.push('yieldBpsMax must be a non-negative integer');
+    }
+  }
+
+  // Validate Dates
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+  if (maturityDateFrom !== undefined) {
+    if (dateRegex.test(maturityDateFrom) && !isNaN(Date.parse(maturityDateFrom))) {
+      validatedParams.filters.maturityDateFrom = maturityDateFrom;
+    } else {
+      errors.push('Invalid maturityDateFrom format. Use YYYY-MM-DD');
+    }
+  }
+  if (maturityDateTo !== undefined) {
+    if (dateRegex.test(maturityDateTo) && !isNaN(Date.parse(maturityDateTo))) {
+      validatedParams.filters.maturityDateTo = maturityDateTo;
+    } else {
+      errors.push('Invalid maturityDateTo format. Use YYYY-MM-DD');
+    }
+  }
+
+  // Validate Funded Ratio
+  if (fundedRatioMin !== undefined) {
+    const val = parseFloat(fundedRatioMin);
+    if (!isNaN(val) && val >= 0 && val <= 100) {
+      validatedParams.filters.fundedRatioMin = val;
+    } else {
+      errors.push('fundedRatioMin must be a number between 0 and 100');
+    }
+  }
+  if (fundedRatioMax !== undefined) {
+    const val = parseFloat(fundedRatioMax);
+    if (!isNaN(val) && val >= 0 && val <= 100) {
+      validatedParams.filters.fundedRatioMax = val;
+    } else {
+      errors.push('fundedRatioMax must be a number between 0 and 100');
+    }
+  }
+
+  // Validate sortBy
+  if (sortBy !== undefined) {
+    const validSortFields = ['yield_bps', 'maturity_date', 'funded_ratio', 'amount', 'created_at'];
+    if (validSortFields.includes(sortBy)) {
+      validatedParams.sorting.sortBy = sortBy;
+    } else {
+      errors.push(`Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`);
+    }
+  }
+
+  // Validate order
+  if (order !== undefined) {
+    const lowerOrder = order.toLowerCase();
+    if (['asc', 'desc'].includes(lowerOrder)) {
+      validatedParams.sorting.order = lowerOrder;
+    } else {
+      errors.push('Invalid order. Must be "asc" or "desc"');
+    }
+  }
+
+  // Validate pagination
+  if (page !== undefined) {
+    const val = parseInt(page);
+    if (!isNaN(val) && val >= 1) {
+      validatedParams.pagination.page = val;
+    } else {
+      errors.push('page must be an integer >= 1');
+    }
+  }
+  if (limit !== undefined) {
+    const val = parseInt(limit);
+    if (!isNaN(val) && val >= 1 && val <= 100) {
+      validatedParams.pagination.limit = val;
+    } else {
+      errors.push('limit must be an integer between 1 and 100');
+    }
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    validatedParams
+  };
+}
+
+/**
  * Supported ISO 4217 currency codes accepted by the invoice API.
  *
  * @constant {Set<string>}
@@ -201,6 +337,7 @@ function validateInvoicePayload(body) {
 
 module.exports = {
   validateInvoiceQueryParams,
+  validateMarketplaceQueryParams,
   validateInvoicePayload,
   VALID_CURRENCIES,
 };
