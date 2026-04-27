@@ -17,7 +17,6 @@ const DB_PATH = process.env.API_KEYS_DB_PATH || path.join(__dirname, '../../data
 
 /**
  * Hash API key using SHA-256 for storage/comparison.
- *
  * @param {string} apiKey - Plain API key.
  * @returns {string} Hex hash.
  */
@@ -27,7 +26,6 @@ function hashApiKey(apiKey) {
 
 /**
  * Initialize database connection and run migrations if needed.
- *
  * @returns {sqlite3.Database} DB instance.
  */
 function initDb() {
@@ -48,7 +46,6 @@ function initDb() {
 
 /**
  * Validate API key against database.
- *
  * @param {string} apiKey - Plain API key from header.
  * @returns {Promise<object|null>} Key data or null if invalid.
  */
@@ -58,9 +55,7 @@ function validateApiKey(apiKey) {
     const keyHash = hashApiKey(apiKey);
     db.get('SELECT * FROM api_keys WHERE key_hash = ? AND is_active = 1', [keyHash], (err, row) => {
       db.close();
-      if (err) {
-        return reject(err);
-      }
+      if (err) return reject(err);
       resolve(row);
     });
   });
@@ -68,10 +63,8 @@ function validateApiKey(apiKey) {
 
 /**
  * Update last used and audit log for a key.
- *
  * @param {number} keyId - Key ID.
  * @param {string} action - Action performed.
- * @returns {void}
  */
 function updateAudit(keyId, action) {
   const db = initDb();
@@ -87,11 +80,9 @@ function updateAudit(keyId, action) {
 /**
  * Middleware to authenticate API key for service-to-service calls.
  * Checks X-API-KEY header, validates against DB, sets req.apiKey on success.
- *
  * @param {object} req - Express request.
  * @param {object} res - Express response.
  * @param {function} next - Next middleware.
- * @returns {Promise<void>} A promise that resolves when the middleware finishes.
  */
 async function apiKeyAuth(req, res, next) {
   const apiKey = req.headers['x-api-key'];

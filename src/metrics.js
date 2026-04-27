@@ -24,28 +24,23 @@ client.collectDefaultMetrics({ register: registry });
 /**
  * Express middleware that enforces metrics auth.
  *
- * @param {import('express').Request} req - The request object.
- * @param {import('express').Response} res - The response object.
- * @param {import('express').NextFunction} next - The next middleware function.
- * @returns {void}
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
  */
 function metricsAuth(req, res, next) {
   const token = process.env.METRICS_BEARER_TOKEN;
 
   if (token) {
     const auth = req.headers['authorization'] || '';
-    if (auth === `Bearer ${token}`) {
-      return next();
-    }
+    if (auth === `Bearer ${token}`) return next();
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
   // No token configured — allow loopback only
   const ip = req.ip || req.socket.remoteAddress || '';
-  if (LOOPBACK.has(ip)) {
-    return next();
-  }
+  if (LOOPBACK.has(ip)) return next();
 
   res.status(401).json({ error: 'Unauthorized' });
 }
@@ -53,9 +48,8 @@ function metricsAuth(req, res, next) {
 /**
  * Express route handler that returns Prometheus metrics.
  *
- * @param {import('express').Request} _req - The request object.
- * @param {import('express').Response} res - The response object.
- * @returns {Promise<void>} A promise that resolves when the response is sent.
+ * @param {import('express').Request} _req
+ * @param {import('express').Response} res
  */
 async function metricsHandler(_req, res) {
   res.set('Content-Type', registry.contentType);

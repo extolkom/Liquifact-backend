@@ -7,15 +7,14 @@ const { getStellarConfig } = require('../config/stellar');
 
 /**
  * Checks if the Soroban RPC endpoint is reachable.
- *
- * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
+ * * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
  */
 async function checkSorobanHealth() {
   let url;
   try {
     const stellarConfig = getStellarConfig();
     url = stellarConfig.rpcUrl;
-  } catch (_error) {
+  } catch (error) {
     return { status: 'unknown', error: 'Configuration not loaded or invalid' };
   }
 
@@ -23,17 +22,17 @@ async function checkSorobanHealth() {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-
+    
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
-      signal: controller.signal,
+      signal: controller.signal
     });
-
+    
     clearTimeout(timeout);
     const latency = Date.now() - start;
-
+    
     if (response.ok) {
       return { status: 'healthy', latency };
     }
@@ -46,27 +45,25 @@ async function checkSorobanHealth() {
 
 /**
  * Checks if the database is reachable (placeholder for future implementation).
- *
- * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
+ * * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
  */
 async function checkDatabaseHealth() {
   if (!process.env.DATABASE_URL) {
     return { status: 'not_configured' };
   }
-
+  
   // Placeholder: implement actual DB ping when database is added
   return { status: 'not_implemented', error: 'Database health check pending' };
 }
 
 /**
  * Performs all dependency health checks.
- *
- * @returns {Promise<{healthy: boolean, checks: Object}>} Aggregated health status.
+ * * @returns {Promise<{healthy: boolean, checks: Object}>} Aggregated health status.
  */
 async function performHealthChecks() {
   const [soroban, database] = await Promise.all([
     checkSorobanHealth(),
-    checkDatabaseHealth(),
+    checkDatabaseHealth()
   ]);
 
   const checks = { soroban, database };
@@ -78,5 +75,5 @@ async function performHealthChecks() {
 module.exports = {
   checkSorobanHealth,
   checkDatabaseHealth,
-  performHealthChecks,
+  performHealthChecks
 };
