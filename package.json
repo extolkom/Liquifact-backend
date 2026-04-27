@@ -9,6 +9,7 @@
     "dev:ts": "node --watch -r ts-node/register/transpile-only src/ts-entry.ts",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "lint:new": "eslint src/routes/invoiceStateRoutes.js src/services/invoiceStateMachine.js tests/invoice.state.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:jsdoc": "tsc -p tsconfig.checkjs.json --noEmit",
     "build": "tsc -p tsconfig.build.json",
