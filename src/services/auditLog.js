@@ -144,7 +144,7 @@ function createAuditLog({
     throw new Error('Audit log resourceId is required');
   }
 
-  const validActions = ['CREATE', 'UPDATE', 'DELETE', 'READ'];
+  const validActions = ['CREATE', 'UPDATE', 'DELETE', 'READ', 'STATE_TRANSITION'];
   if (!validActions.includes(action)) {
     throw new Error(`Invalid action: ${action}. Must be one of: ${validActions.join(', ')}`);
   }

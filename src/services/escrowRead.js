@@ -12,6 +12,7 @@
 
 const { callSorobanContract } = require('./soroban');
 const logger = require('../logger');
+const { getTokenMetadata } = require('./tokenMeta');
 
 /**
  * Regex that a valid invoice ID must satisfy.
@@ -74,7 +75,7 @@ async function fetchLegalHold(invoiceId, adapter) {
     // transient RPC failure does not permanently block all funding.
     // Callers that need stricter behaviour can override via the adapter.
     logger.warn(
-      { invoiceId, errCode: err && err.code },
+      { invoiceId, errCode: err?.code },
       'escrowRead: get_legal_hold call failed — defaulting to false',
     );
     return false;
@@ -83,7 +84,7 @@ async function fetchLegalHold(invoiceId, adapter) {
 
 /**
  * Reads the full escrow state for an invoice from the Soroban contract and
- * enriches it with the `legal_hold` flag.
+ * enriches it with the `legal_hold` flag and token metadata.
  *
  * @param {string} invoiceId - Invoice identifier (validated internally).
  * @param {object}  [options={}]
@@ -91,6 +92,8 @@ async function fetchLegalHold(invoiceId, adapter) {
  *   `get_legal_hold`; used in tests.
  * @param {Function} [options.escrowAdapter] - Injected adapter for the base
  *   escrow state read; used in tests.
+ * @param {Object} [options.fundingAsset] - Funding asset descriptor for token metadata.
+ * @param {Function} [options.tokenMetaAdapter] - Injected adapter for token metadata.
  * @returns {Promise<EscrowState>} Enriched escrow state object.
  * @throws {EscrowReadError} When `invoiceId` is invalid.
  *
@@ -99,9 +102,10 @@ async function fetchLegalHold(invoiceId, adapter) {
  * @property {string}  status       - On-chain escrow status string.
  * @property {number}  fundedAmount - Amount currently held in escrow.
  * @property {boolean} legal_hold   - Whether the escrow is under legal hold.
+ * @property {Object|null} funding_token - Token metadata (symbol, name, decimals).
  */
 async function readEscrowState(invoiceId, options = {}) {
-  const { legalHoldAdapter, escrowAdapter } = options;
+  const { legalHoldAdapter, escrowAdapter, fundingAsset, tokenMetaAdapter } = options;
 
   const { valid, reason } = validateInvoiceId(invoiceId);
   if (!valid) {
@@ -119,9 +123,28 @@ async function readEscrowState(invoiceId, options = {}) {
     fetchLegalHold(safeId, legalHoldAdapter),
   ]);
 
+  // Fetch token metadata if funding asset is provided
+  let tokenMetadata = null;
+  if (fundingAsset) {
+    try {
+      if (tokenMetaAdapter) {
+        tokenMetadata = await tokenMetaAdapter(fundingAsset);
+      } else {
+        tokenMetadata = await getTokenMetadata(fundingAsset);
+      }
+    } catch (error) {
+      // Log error but don't fail the entire request
+      logger.warn(
+        { invoiceId: safeId, asset: fundingAsset, error: error.message },
+        'escrowRead: Failed to fetch token metadata, continuing without it',
+      );
+    }
+  }
+
   return {
     ...baseState,
     legal_hold: legalHold,
+    funding_token: tokenMetadata,
   };
 }
 
@@ -178,7 +201,7 @@ async function fetchAttestationAppendLog(invoiceId, adapter) {
     }));
   } catch (err) {
     logger.warn(
-      { invoiceId, errCode: err && err.code },
+      { invoiceId, errCode: err?.code },
       'escrowRead: get_attestation_append_log call failed — returning empty array',
     );
     return [];
@@ -193,6 +216,8 @@ async function fetchAttestationAppendLog(invoiceId, adapter) {
  * @param {Function} [options.legalHoldAdapter] - Injected adapter for `get_legal_hold`.
  * @param {Function} [options.escrowAdapter] - Injected adapter for base escrow state.
  * @param {Function} [options.attestationAdapter] - Injected adapter for attestation log.
+ * @param {Object} [options.fundingAsset] - Funding asset descriptor for token metadata.
+ * @param {Function} [options.tokenMetaAdapter] - Injected adapter for token metadata.
  * @returns {Promise<EscrowStateWithAttestations>} Enriched escrow state with attestations.
  * @throws {EscrowReadError} When `invoiceId` is invalid.
  *
@@ -202,9 +227,10 @@ async function fetchAttestationAppendLog(invoiceId, adapter) {
  * @property {number} fundedAmount - Amount currently held in escrow.
  * @property {boolean} legal_hold - Whether the escrow is under legal hold.
  * @property {Array<{index: number, digest: string}>} attestations - Append-only attestation digests.
+ * @property {Object|null} funding_token - Token metadata (symbol, name, decimals).
  */
 async function readEscrowStateWithAttestations(invoiceId, options = {}) {
-  const { legalHoldAdapter, escrowAdapter, attestationAdapter } = options;
+  const { legalHoldAdapter, escrowAdapter, attestationAdapter, fundingAsset, tokenMetaAdapter } = options;
 
   const { valid, reason } = validateInvoiceId(invoiceId);
   if (!valid) {
@@ -223,10 +249,29 @@ async function readEscrowStateWithAttestations(invoiceId, options = {}) {
     fetchAttestationAppendLog(safeId, attestationAdapter),
   ]);
 
+  // Fetch token metadata if funding asset is provided
+  let tokenMetadata = null;
+  if (fundingAsset) {
+    try {
+      if (tokenMetaAdapter) {
+        tokenMetadata = await tokenMetaAdapter(fundingAsset);
+      } else {
+        tokenMetadata = await getTokenMetadata(fundingAsset);
+      }
+    } catch (error) {
+      // Log error but don't fail the entire request
+      logger.warn(
+        { invoiceId: safeId, asset: fundingAsset, error: error.message },
+        'escrowRead: Failed to fetch token metadata, continuing without it',
+      );
+    }
+  }
+
   return {
     ...baseState,
     legal_hold: legalHold,
     attestations,
+    funding_token: tokenMetadata,
   };
 }
 
