@@ -10,9 +10,12 @@ const express = require('express');
 const router = express.Router();
 const investService = require('../services/investService');
 const { authenticateToken } = require('../middleware/auth');
+const { extractTenant } = require('../middleware/tenant');
 const { requireKycForFunding } = require('../middleware/kycGating');
 const logger = require('../logger');
 const AppError = require('../errors/AppError');
+
+router.use(authenticateToken, extractTenant);
 
 /**
  * @swagger
@@ -78,11 +81,11 @@ const AppError = require('../errors/AppError');
  *       401:
  *         description: Unauthorized
  */
-router.get('/list', authenticateToken, async (req, res, next) => {
+router.get('/list', async (req, res, next) => {
   try {
     const { cursor, limit = 10 } = req.query;
 
-    const result = await investService.listInvestments({ cursor, limit });
+    const result = await investService.listInvestments({ tenantId: req.tenantId, cursor, limit });
 
     logger.info({ 
       requestId: req.id, 
@@ -99,11 +102,11 @@ router.get('/list', authenticateToken, async (req, res, next) => {
   }
 });
 
-router.get('/opportunities', authenticateToken, async (req, res, next) => {
+router.get('/opportunities', async (req, res, next) => {
   try {
     const { page = 1, limit = 10 } = req.query;
 
-    const result = await investService.getOpportunities({ page, limit });
+    const result = await investService.getOpportunities({ tenantId: req.tenantId, page, limit });
 
     logger.info({ 
       requestId: req.id, 
@@ -169,7 +172,6 @@ router.get('/opportunities', authenticateToken, async (req, res, next) => {
  */
 router.post(
   '/fund-invoice',
-  authenticateToken,
   requireKycForFunding,
   async (req, res, next) => {
     try {

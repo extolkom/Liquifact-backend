@@ -19,67 +19,77 @@
  * @property {string} onChain.ledgerIndex - The last ledger index synchronized for this opportunity.
  */
 
-// In-memory projection of investable items.
-// In a real environment, this would be updated via event-listeners from Stellar.
-const opportunities = [
-  {
-    invoiceId: 'inv_7788',
-    fundedBpsOfTarget: 2500, // 25% funded
-    maturityAt: '2026-06-15T00:00:00Z',
-    yieldBpsDisplay: 850, // 8.5%
-    onChain: {
-      escrowAddress: 'CABCDE1234567890FGHIJKLMN',
-      ledgerIndex: '124450',
-    },
-  },
-  {
-    invoiceId: 'inv_2244',
-    fundedBpsOfTarget: 9500, // 95% funded
-    maturityAt: '2026-05-20T00:00:00Z',
-    yieldBpsDisplay: 700, // 7.0%
-    onChain: {
-      escrowAddress: 'CZXCVB0987654321QWERTYUIO',
-      ledgerIndex: '124455',
-    },
-  },
-  {
-    invoiceId: 'inv_9900',
-    fundedBpsOfTarget: 0, // 0% funded
-    maturityAt: '2026-09-01T00:00:00Z',
-    yieldBpsDisplay: 1200, // 12%
-    onChain: {
-      escrowAddress: 'CPOLKJHGFDSA4321MNBVCXZA',
-      ledgerIndex: '124460',
-    },
-  },
-];
-
+const db = require('../db/knex');
 const { batchReadEscrowStates } = require('./escrowBatchRead');
+const { PUBLIC_INVESTABLE_INVOICE_STATUSES } = require('./marketplaceService');
+
+function toOpportunityDto(invoiceRow) {
+  const fundedRatio = invoiceRow && invoiceRow.funded_ratio !== undefined ? Number(invoiceRow.funded_ratio) : 0;
+  const fundedBpsOfTarget = Number.isFinite(fundedRatio) ? Math.round(fundedRatio * 100) : 0;
+  const maturityDate = invoiceRow && invoiceRow.maturity_date ? new Date(invoiceRow.maturity_date) : null;
+
+  return {
+    invoiceId: invoiceRow.id,
+    fundedBpsOfTarget,
+    maturityAt: maturityDate ? maturityDate.toISOString() : null,
+    yieldBpsDisplay: invoiceRow.yield_bps !== undefined ? Number(invoiceRow.yield_bps) : null,
+    onChain: {
+      // These are pointers to LiquifactEscrow / Stellar state; until invoice rows
+      // persist them, keep explicit nulls.
+      escrowAddress: null,
+      ledgerIndex: null,
+    },
+  };
+}
 
 /**
  * Retrieves paginated list of investment opportunities.
  *
- * @param {Object} [options={}] - Pagination and filtering options.
+ * @param {Object} [options={}] - Tenant context + pagination options.
+ * @param {string} options.tenantId - The resolved tenant identifier (server-side).
  * @param {number} [options.page=1] - Page number (1-based).
  * @param {number} [options.limit=10] - Items per page.
  * @returns {Promise<{data: InvestmentOpportunity[], meta: Object}>}
  */
-async function getOpportunities({ page = 1, limit = 10 } = {}) {
+async function getOpportunities({ tenantId, page = 1, limit = 10 } = {}) {
+  if (!tenantId || typeof tenantId !== 'string') {
+    throw new Error('Missing tenant context');
+  }
+
   const pageNum = Math.max(1, parseInt(page, 10) || 1);
   const limitSize = Math.max(1, Math.min(100, parseInt(limit, 10) || 10)); // Cap limit at 100
   
   const start = (pageNum - 1) * limitSize;
-  const end = start + limitSize;
-  
-  const paginatedData = opportunities.slice(start, end);
-  
+
+  const baseQuery = db('invoices')
+    .whereNull('deleted_at')
+    .where('tenant_id', tenantId)
+    .whereIn('status', PUBLIC_INVESTABLE_INVOICE_STATUSES);
+
+  const countRow = await baseQuery.clone().clearSelect().clearOrder().count('* as total').first();
+  const total = countRow && countRow.total ? parseInt(countRow.total, 10) : 0;
+
+  const rows = await baseQuery
+    .clone()
+    .select(
+      'id',
+      'yield_bps',
+      'funded_ratio',
+      'maturity_date'
+    )
+    .orderBy('created_at', 'desc')
+    .limit(limitSize)
+    .offset(start);
+
+  const paginatedData = rows.map(toOpportunityDto);
+
   return {
     data: paginatedData,
     meta: {
-      total: opportunities.length,
+      total,
       page: pageNum,
       limit: limitSize,
-      totalPages: Math.ceil(opportunities.length / limitSize),
+      totalPages: Math.ceil(total / limitSize),
     },
   };
 }
@@ -88,23 +98,38 @@ async function getOpportunities({ page = 1, limit = 10 } = {}) {
  * Retrieves paginated list of investment opportunities using cursor-based
  * pagination and enriches them with fresh on-chain data via batched reads.
  *
- * @param {Object} [options={}] - Pagination options.
+ * @param {Object} [options={}] - Tenant context + pagination options.
+ * @param {string} options.tenantId - The resolved tenant identifier (server-side).
  * @param {string} [options.cursor] - The invoiceId cursor to start after.
  * @param {number} [options.limit=10] - Number of items to retrieve.
  * @returns {Promise<{data: Object[], meta: Object}>}
  */
-async function listInvestments({ cursor, limit = 10 } = {}) {
+async function listInvestments({ tenantId, cursor, limit = 10 } = {}) {
+  if (!tenantId || typeof tenantId !== 'string') {
+    throw new Error('Missing tenant context');
+  }
+
   const limitSize = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
   
-  let startIndex = 0;
+  let query = db('invoices')
+    .whereNull('deleted_at')
+    .where('tenant_id', tenantId)
+    .whereIn('status', PUBLIC_INVESTABLE_INVOICE_STATUSES)
+    .orderBy('id', 'asc')
+    .limit(limitSize);
+
   if (cursor) {
-    const index = opportunities.findIndex(o => o.invoiceId === cursor);
-    if (index !== -1) {
-      startIndex = index + 1;
-    }
+    query = query.andWhere('id', '>', cursor);
   }
-  
-  const paginatedItems = opportunities.slice(startIndex, startIndex + limitSize);
+
+  const rows = await query.select(
+    'id',
+    'yield_bps',
+    'funded_ratio',
+    'maturity_date'
+  );
+
+  const paginatedItems = rows.map(toOpportunityDto);
   const invoiceIds = paginatedItems.map(o => o.invoiceId);
   
   // Batch read on-chain state for the current page
@@ -125,9 +150,7 @@ async function listInvestments({ cursor, limit = 10 } = {}) {
     };
   });
   
-  const nextCursor = data.length > 0 && (startIndex + data.length < opportunities.length)
-    ? data[data.length - 1].invoiceId
-    : null;
+  const nextCursor = data.length > 0 ? data[data.length - 1].invoiceId : null;
 
   return {
     data,
@@ -135,7 +158,8 @@ async function listInvestments({ cursor, limit = 10 } = {}) {
       limit: limitSize,
       next_cursor: nextCursor,
       count: data.length,
-      has_more: !!nextCursor,
+      // Cursor-based endpoints cannot know total cheaply; "has_more" is best-effort.
+      has_more: data.length === limitSize,
     },
   };
 }
@@ -143,5 +167,5 @@ async function listInvestments({ cursor, limit = 10 } = {}) {
 module.exports = {
   getOpportunities,
   listInvestments,
-  opportunities, // Export for tests
+  PUBLIC_INVESTABLE_INVOICE_STATUSES,
 };

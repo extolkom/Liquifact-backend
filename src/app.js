@@ -146,6 +146,8 @@ function createApp() {
         ready: 'GET /ready',
         invoices: 'GET/POST /api/invoices',
         escrow: 'GET /api/escrow/:invoiceId',
+        marketplace: 'GET /api/marketplace',
+        invest: 'GET /api/invest/opportunities, GET /api/invest/list',
       },
     });
   });

@@ -10,6 +10,7 @@ jest.mock('../src/db/knex', () => {
   const mockQuery = {
     select: jest.fn().mockReturnThis(),
     where: jest.fn().mockReturnThis(),
+    whereIn: jest.fn().mockReturnThis(),
     whereNull: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
     limit: jest.fn().mockReturnThis(),
@@ -34,7 +35,10 @@ jest.mock('../src/db/knex', () => {
 });
 
 const TEST_SECRET = process.env.JWT_SECRET || 'test-secret';
-const validToken = jwt.sign({ id: 'user_investor', role: 'investor' }, TEST_SECRET, { expiresIn: '1h' });
+const tenantA = 'tenant-a';
+const tenantB = 'tenant-b';
+const tokenTenantA = jwt.sign({ id: 'user_investor_a', role: 'investor', tenantId: tenantA }, TEST_SECRET, { expiresIn: '1h' });
+const tokenTenantB = jwt.sign({ id: 'user_investor_b', role: 'investor', tenantId: tenantB }, TEST_SECRET, { expiresIn: '1h' });
 
 describe('Marketplace API', () => {
   let app;
@@ -63,19 +67,20 @@ describe('Marketplace API', () => {
     it('should return 200 with marketplace invoices when authenticated', async () => {
       const response = await request(app)
         .get('/api/marketplace')
-        .set('Authorization', `Bearer ${validToken}`);
+        .set('Authorization', `Bearer ${tokenTenantA}`);
 
       expect(response.status).toBe(200);
       expect(response.body.data).toBeDefined();
       expect(Array.isArray(response.body.data)).toBe(true);
       expect(response.body.meta.total).toBe(1);
       expect(response.body.message).toBe('Marketplace invoices retrieved successfully.');
+      expect(mockQuery.where).toHaveBeenCalledWith('tenant_id', tenantA);
     });
 
     it('should apply filters correctly', async () => {
       const response = await request(app)
         .get('/api/marketplace?yieldBpsMin=400&yieldBpsMax=600&fundedRatioMin=20&fundedRatioMax=80&maturityDateFrom=2024-01-01&maturityDateTo=2024-12-31&status=verified')
-        .set('Authorization', `Bearer ${validToken}`);
+        .set('Authorization', `Bearer ${tokenTenantA}`);
 
       expect(response.status).toBe(200);
       
@@ -91,7 +96,7 @@ describe('Marketplace API', () => {
     it('should apply sorting correctly', async () => {
       const response = await request(app)
         .get('/api/marketplace?sortBy=yield_bps&order=asc')
-        .set('Authorization', `Bearer ${validToken}`);
+        .set('Authorization', `Bearer ${tokenTenantA}`);
 
       expect(response.status).toBe(200);
       expect(mockQuery.orderBy).toHaveBeenCalledWith('yield_bps', 'asc');
@@ -100,7 +105,7 @@ describe('Marketplace API', () => {
     it('should handle pagination correctly', async () => {
       const response = await request(app)
         .get('/api/marketplace?page=2&limit=5')
-        .set('Authorization', `Bearer ${validToken}`);
+        .set('Authorization', `Bearer ${tokenTenantA}`);
 
       expect(response.status).toBe(200);
       expect(mockQuery.limit).toHaveBeenCalledWith(5);
@@ -112,7 +117,7 @@ describe('Marketplace API', () => {
     it('should return 400 for invalid query parameters', async () => {
       const response = await request(app)
         .get('/api/marketplace?yieldBpsMin=-100&fundedRatioMin=150&maturityDateFrom=invalid')
-        .set('Authorization', `Bearer ${validToken}`);
+        .set('Authorization', `Bearer ${tokenTenantA}`);
 
       expect(response.status).toBe(400);
       expect(response.body.errors).toBeDefined();
@@ -130,10 +135,29 @@ describe('Marketplace API', () => {
 
       const response = await request(app)
         .get('/api/marketplace')
-        .set('Authorization', `Bearer ${validToken}`);
+        .set('Authorization', `Bearer ${tokenTenantA}`);
 
       expect(response.status).toBe(500);
       expect(response.body.error).toBeDefined();
+    });
+
+    it('should reject non-public statuses (tenant-private) even when supplied as a filter', async () => {
+      const response = await request(app)
+        .get('/api/marketplace?status=pending_verification')
+        .set('Authorization', `Bearer ${tokenTenantA}`);
+
+      expect(response.status).toBe(400);
+      expect(response.body.errors).toBeDefined();
+    });
+
+    it('should scope by x-tenant-id when provided', async () => {
+      await request(app)
+        .get('/api/marketplace')
+        .set('Authorization', `Bearer ${tokenTenantA}`)
+        .set('x-tenant-id', tenantB)
+        .expect(200);
+
+      expect(mockQuery.where).toHaveBeenCalledWith('tenant_id', tenantB);
     });
   });
 });

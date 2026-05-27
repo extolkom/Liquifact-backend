@@ -5,6 +5,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 
 // Set DB path before requiring the middleware so it uses the test DB.
 const testDbPath = path.join(__dirname, 'test_api_keys.db');
@@ -15,6 +16,10 @@ const sqlite3 = require('sqlite3').verbose();
 
 describe('API Key Middleware', () => {
   beforeAll(async () => {
+    if (fs.existsSync(testDbPath)) {
+      try { fs.unlinkSync(testDbPath); } catch (_e) { /* best-effort */ }
+    }
+
     // Create test DB and insert a test key
     const db = new sqlite3.Database(testDbPath);
     await new Promise((resolve, reject) => {
@@ -45,9 +50,19 @@ describe('API Key Middleware', () => {
     db.close();
   });
 
-  afterAll(() => {
-    // Clean up test DB
-    require('fs').unlinkSync(testDbPath);
+  afterAll(async () => {
+    // Clean up test DB (retry to avoid Windows EBUSY locks)
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        if (fs.existsSync(testDbPath)) {
+          fs.unlinkSync(testDbPath);
+        }
+        break;
+      } catch (e) {
+        if (attempt === 9) { throw e; }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
   });
 
   test('hashApiKey produces consistent hash', () => {

@@ -15,6 +15,13 @@ All protected endpoints require a Bearer token:
 export TOKEN="your-jwt-token-here"
 ```
 
+### Tenant Context (Multi-tenant)
+Marketplace and invest endpoints are tenant-scoped and require a tenant context resolved server-side:
+- Preferred: include a `tenantId` claim in the JWT (set by your auth provider).
+- Service-to-service/API-key flows may also supply `x-tenant-id`.
+
+Client-supplied `tenant_id` query/body fields are ignored; do not rely on them.
+
 ## Error Response Examples
 
 ### 1. Validation Error (400)

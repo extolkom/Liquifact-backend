@@ -67,14 +67,18 @@ function validateApiKey(apiKey) {
  * @param {string} action - Action performed.
  */
 function updateAudit(keyId, action) {
-  const db = initDb();
-  const now = new Date().toISOString();
-  const auditEntry = JSON.stringify({ timestamp: now, action });
-  db.run(
-    'UPDATE api_keys SET last_used_at = ?, audit_log = COALESCE(audit_log || ?, ?) WHERE id = ?',
-    [now, ',' + auditEntry, auditEntry, keyId]
-  );
-  db.close();
+  return new Promise((resolve) => {
+    const db = initDb();
+    const now = new Date().toISOString();
+    const auditEntry = JSON.stringify({ timestamp: now, action });
+    db.run(
+      'UPDATE api_keys SET last_used_at = ?, audit_log = COALESCE(audit_log || ?, ?) WHERE id = ?',
+      [now, ',' + auditEntry, auditEntry, keyId],
+      () => {
+        db.close(() => resolve());
+      }
+    );
+  });
 }
 
 /**
@@ -103,7 +107,7 @@ async function apiKeyAuth(req, res, next) {
     }
 
     req.apiKey = { id: keyData.id, name: keyData.name };
-    updateAudit(keyData.id, `${req.method} ${req.path}`);
+    await updateAudit(keyData.id, `${req.method} ${req.path}`);
     next();
   } catch (err) {
     logger.error(err, 'API key validation error');
