@@ -72,7 +72,6 @@
       "<rootDir>/tests/investor.locks.test.js",
       "<rootDir>/tests/invoice-correlation.test.js",
       "<rootDir>/tests/invoices.test.js",
-      "<rootDir>/tests/kyc.gating.test.js",
       "<rootDir>/tests/marketplace.test.js",
       "<rootDir>/tests/maturityReminders.test.js",
       "<rootDir>/tests/metrics.test.js",

@@ -9,6 +9,7 @@
  */
 
 const logger = require('../logger');
+const appConfig = require('../config');
 
 const KYC_STATUSES = {
   PENDING: 'pending',
@@ -21,15 +22,24 @@ const KYC_STATUSES = {
 const mockKycRecords = new Map();
 
 /**
- * Configuration for external KYC provider
- * Loaded from environment variables
+ * Configuration for external KYC provider.
+ * Reads from validated config when available, falls back to process.env in test.
  */
 const getKycProviderConfig = () => {
+  let cfg;
+  try {
+    cfg = appConfig.get();
+  } catch {
+    // config not yet validated (e.g. unit tests that don't call validate())
+    cfg = process.env;
+  }
+  const apiKey = cfg.KYC_PROVIDER_API_KEY || null;
+  const baseUrl = cfg.KYC_PROVIDER_URL || null;
   return {
-    enabled: !!(process.env.KYC_PROVIDER_API_KEY && process.env.KYC_PROVIDER_URL),
-    apiKey: process.env.KYC_PROVIDER_API_KEY || null,
-    baseUrl: process.env.KYC_PROVIDER_URL || null,
-    apiSecret: process.env.KYC_PROVIDER_SECRET || null, // optional secondary key
+    enabled: !!(apiKey && baseUrl),
+    apiKey,
+    baseUrl,
+    apiSecret: cfg.KYC_PROVIDER_SECRET || null,
   };
 };
 

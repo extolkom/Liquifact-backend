@@ -11,16 +11,34 @@ const z = require('zod');
  * Secrets have no defaults - must be provided.
  * @type {z.ZodObject<any>}
  */
-const ConfigSchema = z.object({
-  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-  PORT: z.coerce.number().min(1).max(65535).default(3001),
-  JWT_SECRET: z.string().min(32), // No default for security
-  CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
-  SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
-  NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
-  SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
-  SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
-});
+const ConfigSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+    PORT: z.coerce.number().min(1).max(65535).default(3001),
+    JWT_SECRET: z.string().min(32), // No default for security
+    CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
+    SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
+    NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
+    SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
+    SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
+    // KYC provider — all optional, but URL+key must be provided together in non-test envs
+    KYC_PROVIDER_URL: z.string().url().optional(),
+    KYC_PROVIDER_API_KEY: z.string().min(1).optional(),
+    KYC_PROVIDER_SECRET: z.string().min(1).optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.NODE_ENV === 'test') return;
+    const hasUrl = Boolean(data.KYC_PROVIDER_URL);
+    const hasKey = Boolean(data.KYC_PROVIDER_API_KEY);
+    if (hasUrl !== hasKey) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'KYC_PROVIDER_URL and KYC_PROVIDER_API_KEY must both be set or both be absent.',
+        path: hasUrl ? ['KYC_PROVIDER_API_KEY'] : ['KYC_PROVIDER_URL'],
+      });
+    }
+  });
 
 /**
  * Runtime validated configuration object.
