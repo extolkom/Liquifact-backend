@@ -273,6 +273,21 @@ describe('Invoice State Machine', () => {
       expect(logs[0].metadata.reason).toBe('Invoice verified');
     });
 
+    it('should persist terminal transition reason in audit metadata', () => {
+      const result = executeTransition({
+        invoiceId: 'inv-001',
+        currentState: 'pending',
+        targetState: 'rejected',
+        actor: 'user-123',
+        reason: 'Failed KYC checks',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.newState).toBe('rejected');
+      const logs = getAuditLogs({ resourceId: 'inv-001' });
+      expect(logs[0].metadata.reason).toBe('Failed KYC checks');
+    });
+
     it('should throw error for invalid transition', () => {
       expect(() => {
         executeTransition({
@@ -461,6 +476,18 @@ describe('Invoice State API Routes', () => {
       expect(res.body.code).toBe('TERMINAL_STATE');
     });
 
+    it('should require reason for terminal rejected transition', async () => {
+      const res = await request(app)
+        .post('/api/invoices/inv-001/transition')
+        .send({
+          targetState: 'rejected',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('MISSING_TRANSITION_REASON');
+      expect(res.body.error).toContain('Reason is required');
+    });
+
     it('should reject missing target state', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/transition')
@@ -569,7 +596,7 @@ describe('Invoice State API Routes', () => {
         .send({});
 
       expect(res.status).toBe(400);
-      expect(res.body.code).toBe('MISSING_REASON');
+      expect(res.body.code).toBe('MISSING_TRANSITION_REASON');
     });
 
     it('should not allow rejecting approved invoice', async () => {

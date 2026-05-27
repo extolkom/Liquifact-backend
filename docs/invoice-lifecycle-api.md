@@ -33,8 +33,9 @@ cancelled → (none - terminal)
 
 1. **No Silent Jumps**: Cannot skip states (e.g., pending → linked_escrow is forbidden)
 2. **Terminal States**: Once in a terminal state, no further transitions are allowed
-3. **Audit Trail**: Every transition is logged with actor, timestamp, and reason
-4. **Authorization**: All transitions require authenticated user
+3. **Terminal Transition Reason**: Transitions to `rejected` or `cancelled` require a non-empty, sanitized reason that is recorded in the audit trail.
+4. **Audit Trail**: Every transition is logged with actor, timestamp, and reason
+5. **Authorization**: All transitions require authenticated user
 
 ## API Endpoints
 
@@ -112,6 +113,14 @@ curl -X POST http://localhost:3001/api/invoices/inv-001/transition \
   "error": "Invalid state transition from pending to linked_escrow. Allowed transitions: approved, rejected, cancelled",
   "code": "INVALID_TRANSITION",
   "allowedTransitions": ["approved", "rejected", "cancelled"]
+}
+```
+
+**Error Response** (Missing terminal transition reason):
+```json
+{
+  "error": "Reason is required for terminal transition to rejected",
+  "code": "MISSING_TRANSITION_REASON"
 }
 ```
 
@@ -304,7 +313,7 @@ curl -X GET http://localhost:3001/api/invoices/inv-001/history \
 | `ALREADY_IN_TARGET_STATE` | Invoice is already in the target state | 400 |
 | `TERMINAL_STATE` | Cannot transition from terminal state | 400 |
 | `CANNOT_LINK_TO_ESCROW` | Business rules prevent escrow linking | 400 |
-| `MISSING_REASON` | Reason required but not provided | 400 |
+| `MISSING_TRANSITION_REASON` | Reason required for terminal transition | 400 |
 
 ---
 

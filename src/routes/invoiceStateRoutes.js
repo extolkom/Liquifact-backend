@@ -341,10 +341,10 @@ router.post('/:id/reject', (req, res, next) => {
   const { reason } = req.body;
 
   try {
-    if (!reason) {
+    if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
       return res.status(400).json({
         error: 'Reason is required for rejection',
-        code: 'MISSING_REASON',
+        code: 'MISSING_TRANSITION_REASON',
       });
     }
 

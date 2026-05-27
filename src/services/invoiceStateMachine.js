@@ -41,6 +41,23 @@ const TERMINAL_STATES = [
   INVOICE_STATES.CANCELLED,
 ];
 
+const TERMINAL_REASON_REQUIRED_STATES = [
+  INVOICE_STATES.REJECTED,
+  INVOICE_STATES.CANCELLED,
+];
+
+const MAX_TRANSITION_REASON_LENGTH = 1024;
+
+function normalizeTransitionReason(reason) {
+  if (reason === null || reason === undefined) {
+    return null;
+  }
+
+  const value = typeof reason === 'string' ? reason : String(reason);
+  const sanitized = value.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim();
+  return sanitized.length === 0 ? null : sanitized;
+}
+
 /**
  * Validates if a state is a valid invoice state
  * 
@@ -98,7 +115,7 @@ function getAllowedTransitions(fromState) {
  * @param {string} options.currentState Current invoice state
  * @param {string} options.targetState Desired target state
  * @param {string} options.actor User performing the transition
- * @param {string} [options.reason] Reason for transition (unused in validation)
+ * @param {string} [options.reason] Reason for transition. Required for terminal transitions.
  * @returns {Object} Validation result with isValid and error
  */
 function validateTransition({ invoiceId, currentState, targetState, actor, reason: _reason }) {
@@ -161,6 +178,8 @@ function validateTransition({ invoiceId, currentState, targetState, actor, reaso
     };
   }
 
+  const reason = normalizeTransitionReason(_reason);
+
   // Check if current state is terminal (must be before transition check)
   if (isTerminalState(currentState)) {
     return {
@@ -168,6 +187,25 @@ function validateTransition({ invoiceId, currentState, targetState, actor, reaso
       error: `Cannot transition from terminal state: ${currentState}`,
       code: 'TERMINAL_STATE',
     };
+  }
+
+  // Require a validated reason for terminal target states
+  if (TERMINAL_REASON_REQUIRED_STATES.includes(targetState)) {
+    if (!reason) {
+      return {
+        isValid: false,
+        error: `Reason is required for terminal transition to ${targetState}`,
+        code: 'MISSING_TRANSITION_REASON',
+      };
+    }
+
+    if (reason.length > MAX_TRANSITION_REASON_LENGTH) {
+      return {
+        isValid: false,
+        error: `Transition reason must be ${MAX_TRANSITION_REASON_LENGTH} characters or fewer`,
+        code: 'TRANSITION_REASON_TOO_LONG',
+      };
+    }
   }
 
   // Check if transition is allowed
@@ -227,6 +265,8 @@ function executeTransition({
     throw error;
   }
 
+  const normalizedReason = normalizeTransitionReason(reason);
+
   // Create audit log for state transition
   const auditLog = createAuditLog({
     actor,
@@ -240,7 +280,7 @@ function executeTransition({
     userAgent,
     metadata: {
       ...metadata,
-      reason,
+      ...(normalizedReason ? { reason: normalizedReason } : {}),
       transitionType: `${currentState}_to_${targetState}`,
       timestamp: new Date().toISOString(),
     },
