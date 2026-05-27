@@ -15,6 +15,30 @@ All protected endpoints require a Bearer token:
 export TOKEN="your-jwt-token-here"
 ```
 
+## Mounted Feature Routes
+
+The live Express app factory mounts the feature routers before the 404 handler, so these prefixes are available from the running API:
+
+| Area | Prefix | Example |
+| --- | --- | --- |
+| Invest | `/api/invest` | `GET /api/invest/opportunities` |
+| Marketplace | `/api/marketplace` | `GET /api/marketplace?sortBy=yield_bps&order=desc` |
+| Retention | `/api/retention` | `GET /api/retention/policies` |
+| Invoice state | `/api/invoices` | `GET /api/invoices/inv-001/state` |
+| Admin escrow | `/api/admin/escrow` | `GET /api/admin/escrow/version` |
+| SME | `/api/sme` | `GET /api/sme/metrics` |
+| Versioned API | `/v1` | `GET /v1/health` |
+
+Protected routes continue to require the route-level authentication already defined by each router. Retention operations are tenant-scoped, so service callers should also provide tenant context where applicable:
+
+```bash
+curl "$BASE_URL/api/retention/policies" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-tenant-id: tenant_123"
+```
+
+Invoice state routes are mounted at `/api/invoices` because the router owns its `/:id/state`, `/:id/transition`, `/:id/approve`, `/:id/link-escrow`, `/:id/history`, and `/:id/reject` paths.
+
 ## Error Response Examples
 
 ### 1. Validation Error (400)
