@@ -1,11 +1,11 @@
-ï»¿'use strict';
+'use strict';
 
 /**
  * Idempotency middleware for POST /api/invest/fund-invoice and escrow
  * funding submissions.
  *
  * Accepts an `Idempotency-Key` header validated against the existing
- * IDEMPOTENCY_KEY_PATTERN from escrowSubmit.js.  Stores key â†’
+ * IDEMPOTENCY_KEY_PATTERN from escrowSubmit.js.  Stores key ?
  * (request fingerprint, status, response) with a TTL in a new
  * `idempotency_keys` table.  Returns the cached response on duplicate
  * keys; returns 409 when the same key is reused with a different request
@@ -13,7 +13,7 @@
  *
  * Security:
  *  - Keys are validated against a strict pattern before any DB access.
- *  - Request body is hashed (SHA-256) before storage â€” no raw payload
+ *  - Request body is hashed (SHA-256) before storage — no raw payload
  *    is persisted.
  *  - Keys expire after a configurable TTL (default 24 h) and are
  *    automatically purged.
@@ -48,12 +48,19 @@ function fingerprint(body) {
 /**
  * Express middleware that enforces idempotency on funding submissions.
  *
- * 1. Rejects missing / invalid `Idempotency-Key` header â†’ 400
+ * 1. Rejects missing / invalid `Idempotency-Key` header ? 400
  * 2. Looks up the key in the database
- *    a. Found + same fingerprint â†’ returns cached response (200/201)
- *    b. Found + different fingerprint â†’ 409 Conflict
- *    c. Not found â†’ stores the key + fingerprint, continues
+ *    a. Found + same fingerprint ? returns cached response (200/201)
+ *    b. Found + different fingerprint ? 409 Conflict
+ *    c. Not found ? stores the key + fingerprint, continues
  * 3. On response finish, stores the status + body for future replays
+ */
+/**
+ * Express middleware enforcing idempotency on funding submissions.
+ * @param {object} req - Express request
+ * @param {object} res - Express response
+ * @param {function} next - Express next callback
+ * @returns {void}
  */
 function idempotencyMiddleware(req, res, next) {
   const key = req.header('Idempotency-Key');
@@ -68,7 +75,7 @@ function idempotencyMiddleware(req, res, next) {
     return res.status(400).json({
       success: false,
       error:
-        'Idempotency-Key must be 8â€“128 URL-safe characters (A-Za-z0-9._:-).',
+        'Idempotency-Key must be 8–128 URL-safe characters (A-Za-z0-9._:-).',
     });
   }
 
@@ -82,7 +89,7 @@ function idempotencyMiddleware(req, res, next) {
       .first();
 
     if (existing) {
-      // Same key â€” check fingerprint
+      // Same key — check fingerprint
       if (existing.request_fingerprint !== bodyFingerprint) {
         return res.status(409).json({
           success: false,
@@ -91,7 +98,7 @@ function idempotencyMiddleware(req, res, next) {
         });
       }
 
-      // Replay â€” return the original cached response
+      // Replay — return the original cached response
       const cached = existing.response_body;
       const status = existing.response_status || 201;
       try {
@@ -102,7 +109,7 @@ function idempotencyMiddleware(req, res, next) {
       }
     }
 
-    // New key â€” insert placeholder
+    // New key — insert placeholder
     await trx('idempotency_keys').insert({
       idempotency_key: key,
       request_fingerprint: bodyFingerprint,
@@ -123,7 +130,7 @@ function idempotencyMiddleware(req, res, next) {
           updated_at: db.fn.now(),
         })
         .catch(() => {
-          // Best-effort â€” don't fail the request if storage fails
+          // Best-effort — don't fail the request if storage fails
         });
 
       return originalJson(body);
@@ -138,7 +145,7 @@ function idempotencyMiddleware(req, res, next) {
         error: 'Internal server error processing idempotency key.',
       });
     }
-    // If headers already sent, the error happened post-response â€” log only
+    // If headers already sent, the error happened post-response — log only
     console.error('[idempotency] Post-response storage error:', err.message);
   });
 }
