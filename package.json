@@ -106,7 +106,7 @@
     "@aws-sdk/client-s3": "^3.665.0",
     "@jadonamite/automata-core": "^1.0.1",
     "@aws-sdk/s3-request-presigner": "^3.665.0",
-    "@jadonamite/automata-sdk": "^1.0.1"
+    "@jadonamite/automata-sdk": "^1.0.1",
     "@sentry/node": "^8.0.0",
     "chessify-protocol": "^0.1.0",
     "cors": "^2.8.6",
