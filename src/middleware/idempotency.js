@@ -29,6 +29,8 @@ const DEFAULT_TTL_HOURS = 24;
  * Get TTL in hours from env or default.
  * @returns {number}
  */
+function getTTLHours() {
+  const raw = process.env.IDEMPOTENCY_KEY_TTL_HOURS;
   const parsed = parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TTL_HOURS;
 }
