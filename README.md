@@ -710,6 +710,10 @@ We welcome docs improvements, bug fixes, and new API endpoints aligned with Liqu
 
 ---
 
-## License
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, local checks, testing expectations, CI behavior, and pull request guidance.
+
+## License
 MIT (see root LiquiFact project for full license).
