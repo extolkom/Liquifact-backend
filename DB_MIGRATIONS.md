@@ -10,6 +10,43 @@ Key components
 - `migrations/*.sql` — canonical SQL migrations targeting Postgres features (JSONB, append-only triggers, indexes).
 - `migrations/001_create_invoices_table.js` — legacy JS migration (knex-style); kept for historical reasons. New schema changes should prefer SQL or node-pg-migrate JS format and be added to the Postgres runner.
 - `src/db/migrations/*.js` — helper migration scripts used by local tooling; they are not authoritative for production.
+
+### Migration inventory
+
+| File | Type | Runner | Notes |
+|------|------|--------|-------|
+| `001_create_invoices_table.js` | JS | **Knex** (legacy) | Historical migration, kept for backward compatibility |
+| `20240101000000_initial_schema.sql` | SQL | **node-pg-migrate** | Initial schema creation |
+| `20240425000000_create_invoices_table.sql` | SQL | **node-pg-migrate** | Creates invoices table |
+| `20240425000001_create_users_and_tenants.sql` | SQL | **node-pg-migrate** | User & tenant tables |
+| `20240425000002_add_tenant_to_invoices.sql` | SQL | **node-pg-migrate** | Adds tenant_id foreign key |
+| `20240425000003_create_escrow_operations.sql` | SQL | **node-pg-migrate** | Escrow operations schema |
+| `20240426000000_add_marketplace_fields_to_invoices.sql` | SQL | **node-pg-migrate** | Marketplace fields |
+| `20240426000000_create_audit_logs_table.sql` | SQL | **node-pg-migrate** | Audit log table |
+| `20250425000000_create_retention_system.sql` | SQL | **node-pg-migrate** | Retention system tables |
+| `202604260001_create_audit_log_events.sql` | SQL | **node-pg-migrate** | Audit log events |
+| `202604260002_enforce_audit_log_append_only.sql` | SQL | **node-pg-migrate** | Enforces append‑only audit log (trigger) |
+| `20260427123000_create_escrow_event_index_tables.sql` | SQL | **node-pg-migrate** | Index tables for escrow events |
+| `20260429000000_create_reconciliation_runs.js` | JS | **node-pg-migrate** | Reconciliation run logic |
+| `20260601000000_create_idempotency_keys.sql` | SQL | **node-pg-migrate** | Idempotency keys table |
+| `20260601000001_create_investor_commitments.js` | JS | **node-pg-migrate** | Investor commitments |
+| `20260602000000_create_webhook_dead_letters.sql` | SQL | **node-pg-migrate** | Dead‑letter queue for webhooks |
+
+**Authoritative scripts**
+- `npm run db:setup` → runs `node-pg-migrate up` (same as `db:migrate`).
+- `npm run db:migrate` → runs `node-pg-migrate up`.
+- `npm run db:migrate:down` → runs `node-pg-migrate down`.
+- `npm run db:rollback` → legacy `knex migrate:rollback` (only affects the old `001_create_invoices_table.js` if ever used).
+
+**Local setup walkthrough**
+```bash
+# Start PostgreSQL via Docker
+docker-compose -f docker-compose.dev.yml up -d
+# Export DATABASE_URL (or copy .env.example to .env and edit)
+cp .env.example .env
+# Run migrations
+npm run db:setup
+```
 - `db.sqlite3` — a developer convenience SQLite database used for quick local iteration. This file is not the source of truth for schema or production migrations.
 
 Authoritative migration runner
