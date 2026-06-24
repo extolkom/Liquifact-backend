@@ -37,48 +37,56 @@ All error responses follow this structure:
 The following problem types are defined:
 
 ### Validation Errors
+
 - **Type**: `https://liquifact.com/probs/validation-error`
 - **Status**: 400
 - **Title**: "Validation Error"
 - **Description**: Request validation failed
 
 ### Not Found Errors
+
 - **Type**: `https://liquifact.com/probs/not-found`
 - **Status**: 404
 - **Title**: "Resource Not Found"
 - **Description**: Requested resource does not exist
 
 ### Conflict Errors
+
 - **Type**: `https://liquifact.com/probs/conflict`
 - **Status**: 409
 - **Title**: "Conflict"
 - **Description**: Request conflicts with current state
 
 ### Service Unavailable
+
 - **Type**: `https://liquifact.com/probs/service-unavailable`
 - **Status**: 503
 - **Title**: "Service Unavailable"
 - **Description**: Service temporarily unavailable
 
 ### Unauthorized
+
 - **Type**: `https://liquifact.com/probs/unauthorized`
 - **Status**: 401
 - **Title**: "Unauthorized"
 - **Description**: Authentication required
 
 ### Forbidden
+
 - **Type**: `https://liquifact.com/probs/forbidden`
 - **Status**: 403
 - **Title**: "Forbidden"
 - **Description**: Access denied
 
 ### Rate Limited
+
 - **Type**: `https://liquifact.com/probs/rate-limited`
 - **Status**: 429
 - **Title**: "Too Many Requests"
 - **Description**: Rate limit exceeded
 
 ### Internal Server Error
+
 - **Type**: `https://liquifact.com/probs/internal-server-error`
 - **Status**: 500
 - **Title**: "Internal Server Error"
@@ -89,6 +97,7 @@ The following problem types are defined:
 ### 1. Validation Error
 
 **Request:**
+
 ```bash
 curl -X POST http://localhost:3001/api/invoices \
   -H "Content-Type: application/json" \
@@ -97,6 +106,7 @@ curl -X POST http://localhost:3001/api/invoices \
 ```
 
 **Response:**
+
 ```http
 HTTP/1.1 400 Bad Request
 Content-Type: application/problem+json
@@ -113,12 +123,14 @@ Content-Type: application/problem+json
 ### 2. Not Found Error
 
 **Request:**
+
 ```bash
 curl -X GET http://localhost:3001/api/invoices/nonexistent \
   -H "Authorization: Bearer your-token"
 ```
 
 **Response:**
+
 ```http
 HTTP/1.1 404 Not Found
 Content-Type: application/problem+json
@@ -135,12 +147,14 @@ Content-Type: application/problem+json
 ### 3. Conflict Error
 
 **Request:**
+
 ```bash
 curl -X DELETE http://localhost:3001/api/invoices/inv_123 \
   -H "Authorization: Bearer your-token"
 ```
 
 **Response:**
+
 ```http
 HTTP/1.1 400 Bad Request
 Content-Type: application/problem+json
@@ -157,12 +171,14 @@ Content-Type: application/problem+json
 ### 4. Service Unavailable Error
 
 **Request:**
+
 ```bash
 curl -X GET http://localhost:3001/api/escrow/inv_123 \
   -H "Authorization: Bearer your-token"
 ```
 
 **Response:**
+
 ```http
 HTTP/1.1 503 Service Unavailable
 Content-Type: application/problem+json
@@ -178,12 +194,33 @@ Content-Type: application/problem+json
 
 ## Implementation Details
 
+### Canonical Builder
+
+All RFC 7807 problem details objects are constructed via the canonical formatter builder in `src/utils/problemDetails.js` (`formatProblemDetails`):
+
+```javascript
+const formatProblemDetails = require("./utils/problemDetails");
+
+const problem = formatProblemDetails({
+  type: "https://liquifact.com/probs/validation-error",
+  title: "Validation Error",
+  status: 400,
+  detail: "Amount is required",
+  instance: "/api/invoices",
+  code: "VALIDATION_FAILED", // optional extension
+  retryable: false, // optional extension
+  retryHint: "Check field values", // optional extension
+});
+```
+
+Both `AppError` and the global `problemJsonHandler` middleware delegate field assembly and formatting to this canonical builder, ensuring standardized title, type, and status shapes across all endpoints.
+
 ### Middleware
 
 The problem+json middleware is implemented in `src/middleware/problemJson.js` and includes:
 
 - Error type mapping for common HTTP errors
-- Request correlation via instance URI
+- Request correlation via instance URI (defaults to request correlation ID `urn:uuid:${requestId}`)
 - Secure logging with pino logger
 - Production-safe error responses (no stack traces)
 
@@ -193,10 +230,10 @@ All route handlers now use the `AppError` class to throw structured errors:
 
 ```javascript
 throw new AppError({
-  type: 'https://liquifact.com/probs/validation-error',
-  title: 'Validation Error',
+  type: "https://liquifact.com/probs/validation-error",
+  title: "Validation Error",
   status: 400,
-  detail: 'Amount and customer are required fields',
+  detail: "Amount and customer are required fields",
   instance: req.originalUrl,
 });
 ```
@@ -225,18 +262,18 @@ Each error response includes an `instance` field that references the original re
 
 ```javascript
 try {
-  const response = await fetch('/api/invoices', {
-    method: 'POST',
+  const response = await fetch("/api/invoices", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({})
+    body: JSON.stringify({}),
   });
-  
+
   if (!response.ok) {
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('application/problem+json')) {
+    const contentType = response.headers.get("content-type");
+    if (contentType && contentType.includes("application/problem+json")) {
       const problem = await response.json();
       console.error(`Error: ${problem.title} - ${problem.detail}`);
       // Handle based on problem.type
@@ -244,11 +281,11 @@ try {
     }
     // Handle other error formats
   }
-  
+
   const data = await response.json();
   // Process successful response
 } catch (error) {
-  console.error('Network error:', error);
+  console.error("Network error:", error);
 }
 ```
 
