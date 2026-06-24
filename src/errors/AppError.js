@@ -1,11 +1,13 @@
+const formatProblemDetails = require("../utils/problemDetails");
+
 /**
  * Custom Error class for RFC 7807 compliant errors.
  * Extends the built-in Error class to include Problem Details fields.
  */
 class AppError extends Error {
   /**
-  * Creates a new AppError instance.
-  *
+   * Creates a new AppError instance.
+   *
    * @param {Object} params
    * @param {string} params.type - A URI reference [RFC3986] that identifies the problem type.
    * @param {string} params.title - A short, human-readable summary of the problem type.
@@ -17,14 +19,22 @@ class AppError extends Error {
    * @param params.retryHint
    * @returns {AppError}
    */
-  constructor({ type, title, status, detail, instance, code, retryable, retryHint }) {
+  constructor(params) {
+    const { title, code, retryable, retryHint } = params || {};
     super(title);
     this.name = this.constructor.name;
-    this.type = type || 'about:blank';
-    this.title = title;
-    this.status = status || 500;
-    this.detail = detail;
-    this.instance = instance;
+
+    // Delegate to canonical builder for assembly/defaulting
+    const problem = formatProblemDetails({
+      ...params,
+      stack: undefined, // Do not format stack within AppError construction
+    });
+
+    this.type = problem.type;
+    this.title = problem.title;
+    this.status = problem.status;
+    this.detail = problem.detail;
+    this.instance = problem.instance;
     this.code = code;
     this.retryable = retryable;
     this.retryHint = retryHint;
