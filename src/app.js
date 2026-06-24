@@ -20,7 +20,8 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const { callSorobanContract } = require('./services/soroban');
+const { createSecurityMiddleware } = require('./middleware/security');
+const { auditMiddleware } = require('./middleware/audit');
 const invoiceService = require('./services/invoiceService');
 const { resolveEscrowAddress } = require('./config/escrowMap');
 const { getEscrowStateWithProjection } = require('./services/escrowRead');
@@ -117,6 +118,10 @@ function createApp() {
   // ── 2 & 3. Body-size guardrails ──────────────────────────────────────────
   app.use(...jsonBodyLimit());
   app.use(...urlencodedBodyLimit());
+
+// Apply security headers middleware
+  app.use(createSecurityMiddleware());
+  app.use(auditMiddleware);
 
   // ── 4. Routes ────────────────────────────────────────────────────────────
 

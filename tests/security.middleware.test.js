@@ -43,11 +43,11 @@ describe('Security Middlewares Integration', () => {
     const response = await request(app)
       .post('/api/invoices')
       .set('Authorization', `Bearer ${token}`)
-      .send({ amount: 100, customer: 'Test Corp' });
+      .send({ amount: 100, buyer: 'Acme', seller: 'Seller', dueDate: '2026-12-31', currency: 'USD', invoiceNumber: 'INV-123' });
 
     expect(response.status).toBe(201);
 
-    const logs = getAuditLogs();
+    const logs = await getAuditLogs();
     const lastLog = logs[logs.length - 1];
     const logString = JSON.stringify(lastLog).toLowerCase();
 
