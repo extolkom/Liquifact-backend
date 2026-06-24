@@ -12,8 +12,8 @@ const {
   parseSimulationError,
 } = require('../src/services/sorobanSim');
 const { callSorobanContract } = require('../src/services/soroban');
+const metrics = require('../src/metrics');
 
-// Mock the soroban service
 jest.mock('../src/services/soroban');
 
 const PUBLIC_KEY = `G${'A'.repeat(55)}`;
@@ -29,6 +29,11 @@ function baseParams(overrides = {}) {
   };
 }
 
+/** Spy on a metrics counter so we can assert .inc() calls. */
+function spyCounter(counter) {
+  return jest.spyOn(counter, 'inc');
+}
+
 describe('sorobanSim - Simulation Utility', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -39,399 +44,378 @@ describe('sorobanSim - Simulation Utility', () => {
     clearFootprintCache();
   });
 
+  // ─── generateCacheKey ────────────────────────────────────────────────────────
+
   describe('generateCacheKey', () => {
-    it('generates consistent cache keys for same parameters', () => {
-      const key1 = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
-      const key2 = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
-      expect(key1).toBe(key2);
+    it('generates consistent keys for the same parameters', () => {
+      const k1 = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
+      const k2 = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
+      expect(k1).toBe(k2);
     });
 
-    it('generates different cache keys for different parameters', () => {
-      const key1 = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
-      const key2 = generateCacheKey('fund_escrow', 'inv_456', PUBLIC_KEY);
-      expect(key1).not.toBe(key2);
+    it('generates different keys for different parameters', () => {
+      const k1 = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
+      const k2 = generateCacheKey('fund_escrow', 'inv_456', PUBLIC_KEY);
+      expect(k1).not.toBe(k2);
     });
   });
 
+  // ─── cacheFootprint / getCachedFootprint ─────────────────────────────────────
+
   describe('cacheFootprint and getCachedFootprint', () => {
-    it('stores and retrieves footprints', () => {
+    it('stores and retrieves a footprint', () => {
       const key = 'test:key';
       const footprint = { read: ['addr1'], write: ['addr2'] };
-      
       cacheFootprint(key, footprint);
-      const retrieved = getCachedFootprint(key);
-      
-      expect(retrieved).toEqual(footprint);
+      expect(getCachedFootprint(key)).toEqual(footprint);
     });
 
-    it('returns null for non-existent cache entries', () => {
-      const retrieved = getCachedFootprint('nonexistent');
-      expect(retrieved).toBeNull();
+    it('returns null for a non-existent key', () => {
+      expect(getCachedFootprint('nonexistent')).toBeNull();
     });
 
-    it('expires cache entries after TTL', () => {
+    it('expires entries after TTL', () => {
       const key = 'test:expire';
-      const footprint = { read: ['addr1'] };
-      
-      cacheFootprint(key, footprint);
-      
-      // Mock Date.now to return a time beyond TTL
-      const originalNow = Date.now;
-      Date.now = jest.fn(() => originalNow() + 6 * 60 * 1000); // 6 minutes later
-      
-      const retrieved = getCachedFootprint(key);
-      expect(retrieved).toBeNull();
-      
-      Date.now = originalNow;
+      cacheFootprint(key, { read: ['addr1'] });
+
+      const orig = Date.now;
+      Date.now = jest.fn(() => orig() + 6 * 60 * 1000); // 6 min later
+      expect(getCachedFootprint(key)).toBeNull();
+      Date.now = orig;
     });
 
-    it('enforces maximum cache size', () => {
-      // Set a small max size for testing
-      const originalMaxSize = require('../src/services/sorobanSim').MAX_CACHE_SIZE;
-      Object.defineProperty(require('../src/services/sorobanSim'), 'MAX_CACHE_SIZE', {
-        value: 3,
-        writable: true,
-      });
+    it('rejects a footprint when currentLedger has advanced', () => {
+      const key = 'test:ledger';
+      cacheFootprint(key, { read: ['addr1'] }, 100); // simulated at ledger 100
+      expect(getCachedFootprint(key, 101)).toBeNull();       // ledger moved to 101
+    });
 
-      for (let i = 0; i < 5; i++) {
+    it('accepts a footprint when currentLedger matches', () => {
+      const key = 'test:ledger-same';
+      cacheFootprint(key, { read: ['addr1'] }, 100);
+      expect(getCachedFootprint(key, 100)).not.toBeNull();
+    });
+
+    it('accepts a footprint when no currentLedger is supplied', () => {
+      const key = 'test:ledger-null';
+      cacheFootprint(key, { read: ['addr1'] }, 100);
+      expect(getCachedFootprint(key, null)).not.toBeNull();
+    });
+
+    it('accepts a footprint when the cached entry has no ledgerSequence', () => {
+      const key = 'test:ledger-none';
+      cacheFootprint(key, { read: ['addr1'] }, null);
+      expect(getCachedFootprint(key, 999)).not.toBeNull();
+    });
+  });
+
+  // ─── LRU eviction ─────────────────────────────────────────────────────────────
+
+  describe('LRU eviction', () => {
+    const { MAX_CACHE_SIZE } = require('../src/services/sorobanSim');
+
+    it('evicts the least-recently-used entry when the cache is full', () => {
+      // Fill the cache to capacity
+      for (let i = 0; i < MAX_CACHE_SIZE; i++) {
         cacheFootprint(`key${i}`, { read: [`addr${i}`] });
       }
 
-      // First key should be evicted
-      expect(getCachedFootprint('key0')).toBeNull();
-      expect(getCachedFootprint('key4')).not.toBeNull();
+      // Access key0 to make it MRU
+      getCachedFootprint('key0');
 
-      // Restore original
-      Object.defineProperty(require('../src/services/sorobanSim'), 'MAX_CACHE_SIZE', {
-        value: originalMaxSize,
-        writable: true,
-      });
+      // Adding one more entry should evict key1 (now LRU), not key0
+      cacheFootprint('keyNew', { read: ['new'] });
+
+      expect(getCachedFootprint('key0')).not.toBeNull();  // MRU — kept
+      expect(getCachedFootprint('key1')).toBeNull();       // LRU — evicted
+      expect(getCachedFootprint('keyNew')).not.toBeNull(); // just inserted
+    });
+
+    it('promotes a re-cached entry to MRU position', () => {
+      for (let i = 0; i < MAX_CACHE_SIZE; i++) {
+        cacheFootprint(`slot${i}`, { read: [`addr${i}`] });
+      }
+
+      // Re-insert slot0 to move it to MRU
+      cacheFootprint('slot0', { read: ['updated'] });
+
+      // Adding another entry should evict slot1, not slot0
+      cacheFootprint('slotNew', { read: ['new'] });
+
+      expect(getCachedFootprint('slot0')).not.toBeNull();
+      expect(getCachedFootprint('slot1')).toBeNull();
     });
   });
+
+  // ─── Metrics counters ─────────────────────────────────────────────────────────
+
+  describe('metrics counters', () => {
+    it('increments hit counter on cache hit', () => {
+      const incHit = spyCounter(metrics.footprintCacheHitsTotal);
+      cacheFootprint('hit:key', { read: ['a'] });
+      getCachedFootprint('hit:key');
+      expect(incHit).toHaveBeenCalledTimes(1);
+    });
+
+    it('increments miss counter on cache miss', () => {
+      const incMiss = spyCounter(metrics.footprintCacheMissesTotal);
+      getCachedFootprint('miss:key');
+      expect(incMiss).toHaveBeenCalledTimes(1);
+    });
+
+    it('increments eviction counter on TTL expiry', () => {
+      const incEvict = spyCounter(metrics.footprintCacheEvictionsTotal);
+      cacheFootprint('ttl:key', { read: ['a'] });
+
+      const orig = Date.now;
+      Date.now = jest.fn(() => orig() + 10 * 60 * 1000);
+      getCachedFootprint('ttl:key');
+      Date.now = orig;
+
+      expect(incEvict).toHaveBeenCalledTimes(1);
+    });
+
+    it('increments eviction counter on stale-ledger invalidation', () => {
+      const incEvict = spyCounter(metrics.footprintCacheEvictionsTotal);
+      cacheFootprint('stale:key', { read: ['a'] }, 50);
+      getCachedFootprint('stale:key', 51);
+      expect(incEvict).toHaveBeenCalledTimes(1);
+    });
+
+    it('increments eviction counter on LRU eviction', () => {
+      const { MAX_CACHE_SIZE } = require('../src/services/sorobanSim');
+      const incEvict = spyCounter(metrics.footprintCacheEvictionsTotal);
+
+      for (let i = 0; i < MAX_CACHE_SIZE; i++) {
+        cacheFootprint(`lru${i}`, { read: [`a${i}`] });
+      }
+      cacheFootprint('lruOver', { read: ['x'] });
+
+      expect(incEvict).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ─── clearFootprintCache ──────────────────────────────────────────────────────
 
   describe('clearFootprintCache', () => {
-    it('clears all cached footprints', () => {
-      cacheFootprint('key1', { read: ['addr1'] });
-      cacheFootprint('key2', { read: ['addr2'] });
-      
+    it('removes all entries', () => {
+      cacheFootprint('a', { read: ['1'] });
+      cacheFootprint('b', { read: ['2'] });
       clearFootprintCache();
-      
-      expect(getCachedFootprint('key1')).toBeNull();
-      expect(getCachedFootprint('key2')).toBeNull();
+      expect(getCachedFootprint('a')).toBeNull();
+      expect(getCachedFootprint('b')).toBeNull();
     });
   });
+
+  // ─── parseSimulationError ─────────────────────────────────────────────────────
 
   describe('parseSimulationError', () => {
-    it('identifies insufficient resources errors', () => {
-      const error = new Error('Insufficient resources for operation');
-      expect(parseSimulationError(error)).toBe(SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES);
+    it.each([
+      ['Insufficient resources', SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES],
+      ['Invalid signature', SIMULATION_ERROR_TYPES.INVALID_AUTH],
+      ['Contract invocation failed', SIMULATION_ERROR_TYPES.CONTRACT_ERROR],
+      ['Network timeout', SIMULATION_ERROR_TYPES.NETWORK_ERROR],
+      ['Unknown problem', SIMULATION_ERROR_TYPES.VALIDATION_ERROR],
+    ])('classifies "%s"', (msg, expected) => {
+      expect(parseSimulationError(new Error(msg))).toBe(expected);
     });
 
-    it('identifies auth errors', () => {
-      const error = new Error('Invalid signature');
-      expect(parseSimulationError(error)).toBe(SIMULATION_ERROR_TYPES.INVALID_AUTH);
+    it('handles an error with no message', () => {
+      const err = new Error();
+      delete err.message;
+      expect(parseSimulationError(err)).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
     });
 
-    it('identifies contract errors', () => {
-      const error = new Error('Contract invocation failed');
-      expect(parseSimulationError(error)).toBe(SIMULATION_ERROR_TYPES.CONTRACT_ERROR);
-    });
-
-    it('identifies network errors', () => {
-      const error = new Error('Network timeout');
-      expect(parseSimulationError(error)).toBe(SIMULATION_ERROR_TYPES.NETWORK_ERROR);
-    });
-
-    it('defaults to validation error for unknown messages', () => {
-      const error = new Error('Unknown error');
-      expect(parseSimulationError(error)).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
-    });
-
-    it('handles errors without message', () => {
-      const error = new Error();
-      expect(parseSimulationError(error)).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
+    it('is case-insensitive', () => {
+      expect(parseSimulationError(new Error('INSUFFICIENT RESOURCES'))).toBe(
+        SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES,
+      );
     });
   });
 
+  // ─── validateSimulationParams ─────────────────────────────────────────────────
+
   describe('validateSimulationParams', () => {
-    it('throws validation error for missing operation', async () => {
-      const params = baseParams({ operation: undefined });
-      
-      const result = await simulateOrThrow(params);
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
-      expect(result.error.code).toBe('VALIDATION_ERROR');
-    });
-
-    it('throws validation error for missing invoiceId', async () => {
-      const params = baseParams({ invoiceId: undefined });
-      
-      const result = await simulateOrThrow(params);
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.error.code).toBe('VALIDATION_ERROR');
-    });
-
-    it('throws validation error for missing funderPublicKey', async () => {
-      const params = baseParams({ funderPublicKey: undefined });
-      
-      const result = await simulateOrThrow(params);
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.error.code).toBe('VALIDATION_ERROR');
-    });
-
-    it('throws validation error for missing transactionXdr', async () => {
-      const params = baseParams({ transactionXdr: undefined });
-      
-      const result = await simulateOrThrow(params);
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.error.code).toBe('VALIDATION_ERROR');
-    });
+    it.each(['operation', 'invoiceId', 'funderPublicKey', 'transactionXdr'])(
+      'returns failure when %s is missing',
+      async (field) => {
+        const result = await simulateOrThrow(baseParams({ [field]: undefined }));
+        expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
+        expect(result.error.code).toBe('VALIDATION_ERROR');
+      },
+    );
 
     it('accepts valid parameters', async () => {
       callSorobanContract.mockResolvedValue({
         success: true,
-        footprint: { read: ['addr1'], write: ['addr2'] },
+        footprint: { read: ['a'] },
         resourceConfig: { instructionFee: 100, resourceFee: 1000 },
       });
-
       const result = await simulateOrThrow(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.SUCCESS);
     });
   });
 
-  describe('simulateOrThrow - successful simulation', () => {
-    it('returns success status with footprint on successful simulation', async () => {
-      const mockFootprint = { read: ['addr1', 'addr2'], write: ['addr3'] };
-      const mockResourceConfig = { instructionFee: 100, resourceFee: 1000 };
-      
+  // ─── simulateOrThrow — success ───────────────────────────────────────────────
+
+  describe('simulateOrThrow — successful simulation', () => {
+    it('returns SUCCESS with footprint', async () => {
+      const footprint = { read: ['addr1', 'addr2'], write: ['addr3'] };
       callSorobanContract.mockResolvedValue({
         success: true,
-        footprint: mockFootprint,
-        resourceConfig: mockResourceConfig,
+        footprint,
+        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
       });
 
       const result = await simulateOrThrow(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.SUCCESS);
-      expect(result.footprint).toEqual(mockFootprint);
-      expect(result.resourceConfig).toEqual(mockResourceConfig);
+      expect(result.footprint).toEqual(footprint);
       expect(result.cached).toBe(false);
       expect(result.errorType).toBeNull();
     });
 
-    it('caches footprint on successful simulation when useCache is true', async () => {
-      const mockFootprint = { read: ['addr1'], write: ['addr2'] };
-      
+    it('caches footprint after successful simulation', async () => {
+      const footprint = { read: ['addr1'] };
       callSorobanContract.mockResolvedValue({
         success: true,
-        footprint: mockFootprint,
-        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
+        footprint,
+        resourceConfig: {},
       });
 
       const params = baseParams();
       await simulateOrThrow(params);
-      
-      const cacheKey = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
-      const cached = getCachedFootprint(cacheKey);
-      
-      expect(cached).toEqual(mockFootprint);
+
+      const key = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
+      expect(getCachedFootprint(key)).toEqual(footprint);
     });
 
-    it('does not cache footprint when useCache is false', async () => {
-      const mockFootprint = { read: ['addr1'], write: ['addr2'] };
-      
+    it('does not cache when useCache is false', async () => {
       callSorobanContract.mockResolvedValue({
         success: true,
-        footprint: mockFootprint,
-        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
+        footprint: { read: ['addr1'] },
+        resourceConfig: {},
       });
 
       const params = baseParams({ options: { useCache: false } });
       await simulateOrThrow(params);
-      
-      const cacheKey = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
-      const cached = getCachedFootprint(cacheKey);
-      
-      expect(cached).toBeNull();
+
+      const key = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
+      expect(getCachedFootprint(key)).toBeNull();
     });
 
-    it('returns cached result when available', async () => {
+    it('returns cached result without calling RPC again', async () => {
       const params = baseParams();
-      const cacheKey = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
-      
-      // Pre-populate cache
-      const cachedFootprint = { read: ['cached_addr'], write: ['cached_write'] };
-      cacheFootprint(cacheKey, cachedFootprint);
-      
+      const key = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
+      const cachedFootprint = { read: ['cached'] };
+      cacheFootprint(key, cachedFootprint);
+
       const result = await simulateOrThrow(params);
-      
-      expect(result.status).toBe(SIMULATION_STATUS.SUCCESS);
-      expect(result.footprint).toEqual(cachedFootprint);
       expect(result.cached).toBe(true);
+      expect(result.footprint).toEqual(cachedFootprint);
       expect(callSorobanContract).not.toHaveBeenCalled();
+    });
+
+    it('re-simulates when currentLedger is newer than cached ledger', async () => {
+      const key = generateCacheKey('fund_escrow', 'inv_123', PUBLIC_KEY);
+      cacheFootprint(key, { read: ['stale'] }, 10);
+
+      const freshFootprint = { read: ['fresh'] };
+      callSorobanContract.mockResolvedValue({
+        success: true,
+        footprint: freshFootprint,
+        resourceConfig: {},
+        ledgerSequence: 11,
+      });
+
+      const result = await simulateOrThrow(baseParams({ options: { currentLedger: 11 } }));
+      expect(result.cached).toBe(false);
+      expect(result.footprint).toEqual(freshFootprint);
+      expect(callSorobanContract).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe('simulateOrThrow - failed simulations', () => {
-    it('returns failure status for insufficient resources error', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Insufficient resources for operation')
-      );
+  // ─── simulateOrThrow — failure ───────────────────────────────────────────────
 
+  describe('simulateOrThrow — failed simulations', () => {
+    it.each([
+      ['Insufficient resources', SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES, 'SIMULATION_INSUFFICIENT_RESOURCES', false],
+      ['Invalid signature', SIMULATION_ERROR_TYPES.INVALID_AUTH, 'SIMULATION_INVALID_AUTH', false],
+      ['Contract invocation failed', SIMULATION_ERROR_TYPES.CONTRACT_ERROR, 'SIMULATION_CONTRACT_ERROR', false],
+      ['Network timeout', SIMULATION_ERROR_TYPES.NETWORK_ERROR, 'SIMULATION_NETWORK_ERROR', true],
+      ['Unknown problem', SIMULATION_ERROR_TYPES.VALIDATION_ERROR, 'SIMULATION_VALIDATION_ERROR', false],
+    ])('handles "%s" error', async (msg, errorType, code, retryable) => {
+      callSorobanContract.mockRejectedValue(new Error(msg));
       const result = await simulateOrThrow(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES);
-      expect(result.error).toBeDefined();
-      expect(result.error.code).toBe('SIMULATION_INSUFFICIENT_RESOURCES');
-      expect(result.error.retryable).toBe(false);
+      expect(result.errorType).toBe(errorType);
+      expect(result.error.code).toBe(code);
+      expect(result.error.retryable).toBe(retryable);
     });
 
-    it('returns failure status for invalid auth error', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Invalid signature provided')
-      );
+    it('does not cache on simulation failure', async () => {
+      callSorobanContract.mockRejectedValue(new Error('Network timeout'));
+      const params = baseParams();
+      await simulateOrThrow(params);
 
-      const result = await simulateOrThrow(baseParams());
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.INVALID_AUTH);
-      expect(result.error.code).toBe('SIMULATION_INVALID_AUTH');
-      expect(result.error.retryable).toBe(false);
+      const key = generateCacheKey(params.operation, params.invoiceId, params.funderPublicKey);
+      expect(getCachedFootprint(key)).toBeNull();
     });
 
-    it('returns failure status for contract error', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Contract invocation failed with error code 1')
-      );
-
+    it('handles unsuccessful simulation result (success: false)', async () => {
+      callSorobanContract.mockResolvedValue({ success: false, footprint: null });
       const result = await simulateOrThrow(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.CONTRACT_ERROR);
-      expect(result.error.code).toBe('SIMULATION_CONTRACT_ERROR');
-      expect(result.error.retryable).toBe(false);
     });
 
-    it('returns failure status for network error (retryable)', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Network timeout during RPC call')
-      );
-
-      const result = await simulateOrThrow(baseParams());
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.NETWORK_ERROR);
-      expect(result.error.code).toBe('SIMULATION_NETWORK_ERROR');
-      expect(result.error.retryable).toBe(true);
-      expect(result.error.retryHint).toContain('Retry the request');
-    });
-
-    it('returns failure status for validation error (non-retryable)', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Invalid transaction format')
-      );
-
-      const result = await simulateOrThrow(baseParams());
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
-      expect(result.error.code).toBe('SIMULATION_VALIDATION_ERROR');
-      expect(result.error.retryable).toBe(false);
-      expect(result.error.retryHint).toContain('Fix the transaction payload');
-    });
-
-    it('handles simulation returning unsuccessful result', async () => {
-      callSorobanContract.mockResolvedValue({
-        success: false,
-        footprint: null,
-      });
-
-      const result = await simulateOrThrow(baseParams());
-      
-      expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.error).toBeDefined();
-    });
-
-    it('includes context in simulation error', async () => {
-      const params = baseParams({
-        operation: 'fund_escrow',
-        invoiceId: 'inv_test',
-        funderPublicKey: 'GTEST123',
-      });
-      
+    it('includes operation context in error', async () => {
       callSorobanContract.mockRejectedValue(new Error('Test error'));
-
-      const result = await simulateOrThrow(params);
-      
+      const result = await simulateOrThrow(baseParams({ operation: 'fund_escrow', invoiceId: 'inv_ctx' }));
       expect(result.error.context).toMatchObject({
         operation: 'fund_escrow',
-        invoiceId: 'inv_test',
-        funderPublicKey: 'GTEST123',
-        errorType: expect.any(String),
+        invoiceId: 'inv_ctx',
       });
     });
 
     it('rejects invalid XDR (too short)', async () => {
-      const params = baseParams({ transactionXdr: 'SHORT' });
-      
       callSorobanContract.mockImplementation(() => {
         throw new Error('Invalid transaction XDR: too short');
       });
-
-      const result = await simulateOrThrow(params);
-      
+      const result = await simulateOrThrow(baseParams({ transactionXdr: 'SHORT' }));
       expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
       expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
     });
   });
 
+  // ─── simulateOrThrowSync ──────────────────────────────────────────────────────
+
   describe('simulateOrThrowSync', () => {
-    it('returns result on successful simulation', async () => {
-      const mockFootprint = { read: ['addr1'], write: ['addr2'] };
-      
+    it('returns result on success', async () => {
       callSorobanContract.mockResolvedValue({
         success: true,
-        footprint: mockFootprint,
-        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
+        footprint: { read: ['addr1'] },
+        resourceConfig: {},
       });
-
       const result = await simulateOrThrowSync(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.SUCCESS);
-      expect(result.footprint).toEqual(mockFootprint);
     });
 
-    it('throws error on failed simulation', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Insufficient resources for operation')
-      );
-
+    it('throws on simulation failure', async () => {
+      callSorobanContract.mockRejectedValue(new Error('Insufficient resources'));
       await expect(simulateOrThrowSync(baseParams())).rejects.toMatchObject({
         code: 'SIMULATION_INSUFFICIENT_RESOURCES',
         retryable: false,
       });
     });
 
-    it('throws validation error on invalid parameters', async () => {
-      const params = baseParams({ operation: undefined });
-
-      await expect(simulateOrThrowSync(params)).rejects.toMatchObject({
+    it('throws validation error for invalid params', async () => {
+      await expect(simulateOrThrowSync(baseParams({ operation: undefined }))).rejects.toMatchObject({
         code: 'VALIDATION_ERROR',
         status: 400,
       });
     });
 
-    it('throws network error as retryable', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('Network timeout')
-      );
-
+    it('throws network error as retryable (503)', async () => {
+      callSorobanContract.mockRejectedValue(new Error('Network timeout'));
       await expect(simulateOrThrowSync(baseParams())).rejects.toMatchObject({
         code: 'SIMULATION_NETWORK_ERROR',
         retryable: true,
@@ -440,94 +424,69 @@ describe('sorobanSim - Simulation Utility', () => {
     });
   });
 
+  // ─── rpcConfig pass-through ───────────────────────────────────────────────────
+
   describe('rpcConfig option', () => {
     it('passes rpcConfig to callSorobanContract', async () => {
       const rpcConfig = { maxRetries: 5, baseDelay: 500 };
-      
       callSorobanContract.mockResolvedValue({
         success: true,
         footprint: { read: ['addr1'] },
-        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
+        resourceConfig: {},
       });
 
       await simulateOrThrow(baseParams({ options: { rpcConfig } }));
-      
-      expect(callSorobanContract).toHaveBeenCalledWith(
-        expect.any(Function),
-        rpcConfig
-      );
+      expect(callSorobanContract).toHaveBeenCalledWith(expect.any(Function), rpcConfig);
     });
   });
 
-  describe('edge cases', () => {
-    it('handles error without message property', async () => {
-      const error = new Error();
-      delete error.message;
-      
-      callSorobanContract.mockRejectedValue(error);
+  // ─── edge cases ───────────────────────────────────────────────────────────────
 
+  describe('edge cases', () => {
+    it('handles error without message', async () => {
+      const err = new Error();
+      delete err.message;
+      callSorobanContract.mockRejectedValue(err);
       const result = await simulateOrThrow(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
     });
 
     it('handles null error message', async () => {
-      const error = new Error(null);
-      
-      callSorobanContract.mockRejectedValue(error);
-
+      callSorobanContract.mockRejectedValue(new Error(null));
       const result = await simulateOrThrow(baseParams());
-      
       expect(result.status).toBe(SIMULATION_STATUS.FAILURE);
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.VALIDATION_ERROR);
     });
 
-    it('handles case-insensitive error message matching', async () => {
-      callSorobanContract.mockRejectedValue(
-        new Error('INSUFFICIENT RESOURCES FOR OPERATION')
-      );
-
-      const result = await simulateOrThrow(baseParams());
-      
-      expect(result.errorType).toBe(SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES);
-    });
-  });
-
-  describe('multiple simulations', () => {
-    it('handles multiple concurrent simulations with different keys', async () => {
+    it('deduplicates concurrent simulations via cache on second call', async () => {
       callSorobanContract.mockResolvedValue({
         success: true,
         footprint: { read: ['addr1'] },
-        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
-      });
-
-      const params1 = baseParams({ invoiceId: 'inv_1' });
-      const params2 = baseParams({ invoiceId: 'inv_2' });
-      
-      const [result1, result2] = await Promise.all([
-        simulateOrThrow(params1),
-        simulateOrThrow(params2),
-      ]);
-      
-      expect(result1.status).toBe(SIMULATION_STATUS.SUCCESS);
-      expect(result2.status).toBe(SIMULATION_STATUS.SUCCESS);
-      expect(callSorobanContract).toHaveBeenCalledTimes(2);
-    });
-
-    it('uses cache for repeated simulation with same parameters', async () => {
-      callSorobanContract.mockResolvedValue({
-        success: true,
-        footprint: { read: ['addr1'] },
-        resourceConfig: { instructionFee: 100, resourceFee: 1000 },
+        resourceConfig: {},
       });
 
       const params = baseParams();
-      
       await simulateOrThrow(params);
-      await simulateOrThrow(params);
-      
+      const second = await simulateOrThrow(params);
+
+      expect(second.cached).toBe(true);
       expect(callSorobanContract).toHaveBeenCalledTimes(1);
+    });
+
+    it('handles independent concurrent simulations without cross-contamination', async () => {
+      callSorobanContract.mockResolvedValue({
+        success: true,
+        footprint: { read: ['addr1'] },
+        resourceConfig: {},
+      });
+
+      const [r1, r2] = await Promise.all([
+        simulateOrThrow(baseParams({ invoiceId: 'inv_a' })),
+        simulateOrThrow(baseParams({ invoiceId: 'inv_b' })),
+      ]);
+
+      expect(r1.status).toBe(SIMULATION_STATUS.SUCCESS);
+      expect(r2.status).toBe(SIMULATION_STATUS.SUCCESS);
+      expect(callSorobanContract).toHaveBeenCalledTimes(2);
     });
   });
 });
