@@ -259,49 +259,27 @@ async function exportAuditLogs({ limit = Infinity, format = 'json' } = {}) {
 }
 
 /**
- * Exports audit logs for a specific invoice as JSON or CSV.
+ * Exports audit logs for a specific invoice as JSON.
  * Secrets are redacted via sanitizeSensitiveData.
+ *
+ * CSV export is handled by the route layer via streaming (see
+ * `streamAuditEvents` + `createCsvTransform` in `auditLogStore`).
  *
  * @param {Object} options
  * @param {string} options.invoiceId Invoice resource ID
  * @param {number} [options.limit=100] Maximum records to export
- * @param {string} [options.format='json'] 'json' or 'csv'
+ * @param {string} [options.format='json'] 'json' (CSV is ignored; use streaming route)
  * @param {string} [options.tenantId] Tenant ID for isolation
- * @returns {string} Formatted audit log output
+ * @returns {Promise<string>} Formatted audit log output
  */
-function exportInvoiceAuditLogs({ invoiceId, limit = 100, format = 'json', tenantId = null } = {}) {
-  const logs = getAuditLogs({
+async function exportInvoiceAuditLogs({ invoiceId, limit = 100, format = 'json', tenantId = null } = {}) {
+  const logs = await getAuditLogs({
     resourceId: invoiceId,
     resourceType: 'invoice',
     limit,
     offset: 0,
     tenantId,
   });
-
-  if (format === 'csv') {
-    const escapeCsv = (val) => {
-      const str = val == null ? '' : String(val);
-      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
-    };
-    const headers = 'id,timestamp,actor,action,resourceType,resourceId,statusCode,ipAddress,userAgent';
-    const rows = logs.map((log) =>
-      [
-        escapeCsv(log.id),
-        escapeCsv(log.timestamp),
-        escapeCsv(log.actor),
-        escapeCsv(log.action),
-        escapeCsv(log.resourceType),
-        escapeCsv(log.resourceId),
-        log.statusCode,
-        escapeCsv(log.ipAddress),
-        escapeCsv(log.userAgent),
-      ].join(',')
-    );
-    return rows.length > 0 ? `${headers}\n${rows.join('\n')}` : headers;
-  }
 
   return JSON.stringify(logs, null, 2);
 }
