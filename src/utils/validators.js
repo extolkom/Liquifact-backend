@@ -1,33 +1,42 @@
-/**
- * Input Validation Utilities
- * 
- * Provides functions to validate incoming query parameters.
- */
+'use strict';
 
 /**
- * Validates invoice query parameters.
- * 
- * @param {Object} query - The Express query object.
- * @returns {Object} { isValid, errors, validatedParams }
+ * Input Validation Utilities
+ *
+ * Provides helpers to validate incoming query parameters.
+ * Invoice *payload* validation is delegated to the canonical Zod schema in
+ * `src/schemas/invoice.js`; `validateInvoicePayload` is re-exported from
+ * there so all callers continue to work without modification.
+ */
+
+// ── Zod-backed invoice payload validator (re-export) ─────────────────────────
+
+const {
+  validateInvoicePayload,
+  SUPPORTED_CURRENCIES,
+} = require('../schemas/invoice');
+
+/**
+ * Supported ISO 4217 currency codes (Set for O(1) look-up).
+ * Kept for backward-compat; derives from the Zod schema list.
+ * @type {Set<string>}
+ */
+const VALID_CURRENCIES = new Set(SUPPORTED_CURRENCIES);
+
+// ── Invoice query-param validator ─────────────────────────────────────────────
+
+/**
+ * Validates `GET /api/invoices` query parameters.
+ *
+ * @param {Object} query - The Express `req.query` object.
+ * @returns {{ isValid: boolean, errors: string[], validatedParams: Object }}
  */
 function validateInvoiceQueryParams(query) {
   const errors = [];
-  const validatedParams = {
-    filters: {},
-    sorting: {}
-  };
+  const validatedParams = { filters: {}, sorting: {} };
 
-  const {
-    status,
-    smeId,
-    buyerId,
-    dateFrom,
-    dateTo,
-    sortBy,
-    order
-  } = query;
+  const { status, smeId, buyerId, dateFrom, dateTo, sortBy, order } = query;
 
-  // Validate status
   if (status !== undefined) {
     const validStatuses = ['paid', 'pending', 'overdue'];
     if (validStatuses.includes(status)) {
@@ -37,7 +46,6 @@ function validateInvoiceQueryParams(query) {
     }
   }
 
-  // Validate SME ID (assuming non-empty string)
   if (smeId !== undefined) {
     if (typeof smeId === 'string' && smeId.trim().length > 0) {
       validatedParams.filters.smeId = smeId;
@@ -46,7 +54,6 @@ function validateInvoiceQueryParams(query) {
     }
   }
 
-  // Validate Buyer ID (assuming non-empty string)
   if (buyerId !== undefined) {
     if (typeof buyerId === 'string' && buyerId.trim().length > 0) {
       validatedParams.filters.buyerId = buyerId;
@@ -55,7 +62,6 @@ function validateInvoiceQueryParams(query) {
     }
   }
 
-  // Validate Dates
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
   if (dateFrom !== undefined) {
     if (dateRegex.test(dateFrom) && !isNaN(Date.parse(dateFrom))) {
@@ -73,7 +79,6 @@ function validateInvoiceQueryParams(query) {
     }
   }
 
-  // Validate sortBy
   if (sortBy !== undefined) {
     const validSortFields = ['amount', 'date'];
     if (validSortFields.includes(sortBy)) {
@@ -83,7 +88,6 @@ function validateInvoiceQueryParams(query) {
     }
   }
 
-  // Validate order
   if (order !== undefined) {
     const lowerOrder = order.toLowerCase();
     if (['asc', 'desc'].includes(lowerOrder)) {
@@ -93,42 +97,29 @@ function validateInvoiceQueryParams(query) {
     }
   }
 
-  return {
-    isValid: errors.length === 0,
-    errors,
-    validatedParams
-  };
+  return { isValid: errors.length === 0, errors, validatedParams };
 }
 
+// ── Marketplace query-param validator ────────────────────────────────────────
+
 /**
- * Validates marketplace query parameters.
- * 
- * @param {Object} query - The Express query object.
- * @returns {Object} { isValid, errors, validatedParams }
+ * Validates `GET /api/marketplace` query parameters.
+ *
+ * @param {Object} query - The Express `req.query` object.
+ * @returns {{ isValid: boolean, errors: string[], validatedParams: Object }}
  */
 function validateMarketplaceQueryParams(query) {
   const errors = [];
-  const validatedParams = {
-    filters: {},
-    sorting: {},
-    pagination: {}
-  };
+  const validatedParams = { filters: {}, sorting: {}, pagination: {} };
 
   const {
     status,
-    yieldBpsMin,
-    yieldBpsMax,
-    maturityDateFrom,
-    maturityDateTo,
-    fundedRatioMin,
-    fundedRatioMax,
-    sortBy,
-    order,
-    page,
-    limit
+    yieldBpsMin, yieldBpsMax,
+    maturityDateFrom, maturityDateTo,
+    fundedRatioMin, fundedRatioMax,
+    sortBy, order, page, limit,
   } = query;
 
-  // Validate status
   if (status !== undefined) {
     const validStatuses = ['pending_verification', 'verified', 'funded', 'partially_funded', 'completed', 'defaulted'];
     if (validStatuses.includes(status)) {
@@ -138,25 +129,17 @@ function validateMarketplaceQueryParams(query) {
     }
   }
 
-  // Validate Yield BPS
   if (yieldBpsMin !== undefined) {
-    const val = parseInt(yieldBpsMin);
-    if (!isNaN(val) && val >= 0) {
-      validatedParams.filters.yieldBpsMin = val;
-    } else {
-      errors.push('yieldBpsMin must be a non-negative integer');
-    }
+    const val = parseInt(yieldBpsMin, 10);
+    if (!isNaN(val) && val >= 0) { validatedParams.filters.yieldBpsMin = val; }
+    else { errors.push('yieldBpsMin must be a non-negative integer'); }
   }
   if (yieldBpsMax !== undefined) {
-    const val = parseInt(yieldBpsMax);
-    if (!isNaN(val) && val >= 0) {
-      validatedParams.filters.yieldBpsMax = val;
-    } else {
-      errors.push('yieldBpsMax must be a non-negative integer');
-    }
+    const val = parseInt(yieldBpsMax, 10);
+    if (!isNaN(val) && val >= 0) { validatedParams.filters.yieldBpsMax = val; }
+    else { errors.push('yieldBpsMax must be a non-negative integer'); }
   }
 
-  // Validate Dates
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
   if (maturityDateFrom !== undefined) {
     if (dateRegex.test(maturityDateFrom) && !isNaN(Date.parse(maturityDateFrom))) {
@@ -173,167 +156,44 @@ function validateMarketplaceQueryParams(query) {
     }
   }
 
-  // Validate Funded Ratio
   if (fundedRatioMin !== undefined) {
     const val = parseFloat(fundedRatioMin);
-    if (!isNaN(val) && val >= 0 && val <= 100) {
-      validatedParams.filters.fundedRatioMin = val;
-    } else {
-      errors.push('fundedRatioMin must be a number between 0 and 100');
-    }
+    if (!isNaN(val) && val >= 0 && val <= 100) { validatedParams.filters.fundedRatioMin = val; }
+    else { errors.push('fundedRatioMin must be a number between 0 and 100'); }
   }
   if (fundedRatioMax !== undefined) {
     const val = parseFloat(fundedRatioMax);
-    if (!isNaN(val) && val >= 0 && val <= 100) {
-      validatedParams.filters.fundedRatioMax = val;
-    } else {
-      errors.push('fundedRatioMax must be a number between 0 and 100');
-    }
+    if (!isNaN(val) && val >= 0 && val <= 100) { validatedParams.filters.fundedRatioMax = val; }
+    else { errors.push('fundedRatioMax must be a number between 0 and 100'); }
   }
 
-  // Validate sortBy
   if (sortBy !== undefined) {
     const validSortFields = ['yield_bps', 'maturity_date', 'funded_ratio', 'amount', 'created_at'];
-    if (validSortFields.includes(sortBy)) {
-      validatedParams.sorting.sortBy = sortBy;
-    } else {
-      errors.push(`Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`);
-    }
+    if (validSortFields.includes(sortBy)) { validatedParams.sorting.sortBy = sortBy; }
+    else { errors.push(`Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`); }
   }
 
-  // Validate order
   if (order !== undefined) {
     const lowerOrder = order.toLowerCase();
-    if (['asc', 'desc'].includes(lowerOrder)) {
-      validatedParams.sorting.order = lowerOrder;
-    } else {
-      errors.push('Invalid order. Must be "asc" or "desc"');
-    }
+    if (['asc', 'desc'].includes(lowerOrder)) { validatedParams.sorting.order = lowerOrder; }
+    else { errors.push('Invalid order. Must be "asc" or "desc"'); }
   }
 
-  // Validate pagination
   if (page !== undefined) {
-    const val = parseInt(page);
-    if (!isNaN(val) && val >= 1) {
-      validatedParams.pagination.page = val;
-    } else {
-      errors.push('page must be an integer >= 1');
-    }
+    const val = parseInt(page, 10);
+    if (!isNaN(val) && val >= 1) { validatedParams.pagination.page = val; }
+    else { errors.push('page must be an integer >= 1'); }
   }
   if (limit !== undefined) {
-    const val = parseInt(limit);
-    if (!isNaN(val) && val >= 1 && val <= 100) {
-      validatedParams.pagination.limit = val;
-    } else {
-      errors.push('limit must be an integer between 1 and 100');
-    }
+    const val = parseInt(limit, 10);
+    if (!isNaN(val) && val >= 1 && val <= 100) { validatedParams.pagination.limit = val; }
+    else { errors.push('limit must be an integer between 1 and 100'); }
   }
 
-  return {
-    isValid: errors.length === 0,
-    errors,
-    validatedParams
-  };
+  return { isValid: errors.length === 0, errors, validatedParams };
 }
 
-/**
- * Supported ISO 4217 currency codes accepted by the invoice API.
- *
- * @constant {Set<string>}
- */
-const VALID_CURRENCIES = new Set([
-  'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'CNY', 'HKD',
-  'SGD', 'SEK', 'NOK', 'DKK', 'MXN', 'BRL', 'INR', 'KRW', 'ZAR', 'NGN',
-  'GHS', 'KES', 'TZS', 'UGX', 'XOF', 'XAF', 'MAD', 'EGP', 'AED', 'SAR',
-]);
-
-/**
- * Validates invoice creation payload fields.
- *
- * Performs strict type and format checks on all required invoice fields:
- * amount, dueDate, buyer, seller, and currency. Collects all validation
- * errors in a single pass so the caller can surface them together.
- *
- * @param {Object} body - The raw request body object.
- * @param {number}  body.amount   - Invoice amount (must be a positive finite number).
- * @param {string}  body.dueDate  - Due date in YYYY-MM-DD format.
- * @param {string}  body.buyer    - Buyer name (non-empty string).
- * @param {string}  body.seller   - Seller name (non-empty string).
- * @param {string}  body.currency - ISO 4217 currency code (e.g. USD, EUR).
- * @returns {{ isValid: boolean, errors: string[], validatedPayload: Object }}
- *   - `isValid`          — true when all fields pass validation.
- *   - `errors`           — list of human-readable error messages.
- *   - `validatedPayload` — sanitised copy of accepted fields.
- */
-function validateInvoicePayload(body) {
-  const errors = [];
-  const validatedPayload = {};
-  const safeBody = body && typeof body === 'object' ? body : {};
-
-  // ── amount ───────────────────────────────────────────────────────────────
-  const { amount } = safeBody;
-  if (amount === undefined || amount === null) {
-    errors.push('amount is required');
-  } else if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
-    errors.push('amount must be a positive number');
-  } else {
-    validatedPayload.amount = amount;
-  }
-
-  // ── dueDate ──────────────────────────────────────────────────────────────
-  const { dueDate } = safeBody;
-  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-  if (dueDate === undefined || dueDate === null) {
-    errors.push('dueDate is required');
-  } else if (
-    typeof dueDate !== 'string' ||
-    !dateRegex.test(dueDate) ||
-    isNaN(Date.parse(dueDate))
-  ) {
-    errors.push('dueDate must be a valid date in YYYY-MM-DD format');
-  } else {
-    validatedPayload.dueDate = dueDate;
-  }
-
-  // ── buyer ────────────────────────────────────────────────────────────────
-  const { buyer } = safeBody;
-  if (buyer === undefined || buyer === null) {
-    errors.push('buyer is required');
-  } else if (typeof buyer !== 'string' || buyer.trim().length === 0) {
-    errors.push('buyer must be a non-empty string');
-  } else {
-    validatedPayload.buyer = buyer.trim();
-  }
-
-  // ── seller ───────────────────────────────────────────────────────────────
-  const { seller } = safeBody;
-  if (seller === undefined || seller === null) {
-    errors.push('seller is required');
-  } else if (typeof seller !== 'string' || seller.trim().length === 0) {
-    errors.push('seller must be a non-empty string');
-  } else {
-    validatedPayload.seller = seller.trim();
-  }
-
-  // ── currency ─────────────────────────────────────────────────────────────
-  const { currency } = safeBody;
-  if (currency === undefined || currency === null) {
-    errors.push('currency is required');
-  } else if (
-    typeof currency !== 'string' ||
-    !VALID_CURRENCIES.has(currency.toUpperCase())
-  ) {
-    errors.push('currency must be a supported ISO 4217 code (e.g. USD, EUR, GBP)');
-  } else {
-    validatedPayload.currency = currency.toUpperCase();
-  }
-
-  return {
-    isValid: errors.length === 0,
-    errors,
-    validatedPayload,
-  };
-}
+// ── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = {
   validateInvoiceQueryParams,

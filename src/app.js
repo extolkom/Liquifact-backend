@@ -25,7 +25,8 @@ const invoiceService = require('./services/invoiceService');
 const { resolveEscrowAddress } = require('./config/escrowMap');
 const { getEscrowStateWithProjection } = require('./services/escrowRead');
 const { createCorsOptions, isCorsOriginRejectedError } = require('./config/cors');
-const { validateInvoiceQueryParams, validateInvoicePayload } = require('./utils/validators');
+const { validateInvoiceQueryParams } = require('./utils/validators');
+const { invoiceCreateSchema, parseValidationErrors } = require('./schemas/invoice');
 const {
   invoiceBodyLimit,
   jsonBodyLimit,
@@ -183,11 +184,17 @@ function createApp() {
 
   // Invoices — POST (create) with strict payload validation and 512 KB body limit
   app.post('/api/invoices', ...invoiceBodyLimit(), (req, res) => {
-    const { isValid, errors } = validateInvoicePayload(req.body);
+    const result = invoiceCreateSchema.safeParse(req.body);
 
-    if (!isValid) {
-      res.status(400).json({ errors });
-      return;
+    if (!result.success) {
+      const fieldErrors = parseValidationErrors(result.error);
+      return res.status(400).json({
+        type: 'https://liquifact.io/problems/validation-error',
+        title: 'Validation Error',
+        status: 400,
+        detail: 'Invoice payload contains invalid or missing fields.',
+        fieldErrors,
+      });
     }
 
     res.status(201).json({
