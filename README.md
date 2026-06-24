@@ -674,6 +674,22 @@ Unexpected error:
 
 ---
 
+## Idempotency
+
+The backend supports durable idempotency keys for funding operations to safely retry requests without risking double-funding. 
+
+### Headers and Behavior
+- Send an `Idempotency-Key` header with each distinct funding request. The key must be an 8-128 character URL-safe string.
+- First use: The backend processes the request and persists the key along with a SHA-256 hash of the payload and the resulting response.
+- Identical retries: Resending the same key with the same payload will short-circuit and instantly replay the cached response.
+- Conflicting payload: Resending the same key with a different payload body results in a `409 Conflict` containing an RFC 7807 `application/problem+json` error envelope.
+
+### TTL and Purging
+- Keys expire after a configurable TTL (default is 24 hours, overridable via `IDEMPOTENCY_KEY_TTL_HOURS`).
+- Expired keys are automatically purged to save database space, governed by the `expires_at` index.
+
+---
+
 ## Security audit log (Issue #116)
 
 The backend now supports a database-backed append-only audit log for:

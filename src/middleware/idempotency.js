@@ -13,7 +13,7 @@
  *
  * Security:
  *  - Keys are validated against a strict pattern before any DB access.
- *  - Request body is hashed (SHA-256) before storage — no raw payload
+ *  - Request body is hashed (SHA-256) before storage ï¿½ no raw payload
  *    is persisted.
  *  - Keys expire after a configurable TTL (default 24 h) and are
  *    automatically purged.
@@ -22,6 +22,7 @@
 const crypto = require('crypto');
 const { IDEMPOTENCY_KEY_PATTERN } = require('../services/escrowSubmit');
 const db = require('../db/knex');
+const { createProblemDetails, LIQUifact_PROBLEM_BASE } = require('./problemJson');
 
 const DEFAULT_TTL_HOURS = 24;
 
@@ -77,7 +78,7 @@ function idempotencyMiddleware(req, res, next) {
     return res.status(400).json({
       success: false,
       error:
-        'Idempotency-Key must be 8–128 URL-safe characters (A-Za-z0-9._:-).',
+        'Idempotency-Key must be 8ï¿½128 URL-safe characters (A-Za-z0-9._:-).',
     });
   }
 
@@ -91,16 +92,20 @@ function idempotencyMiddleware(req, res, next) {
       .first();
 
     if (existing) {
-      // Same key — check fingerprint
+      // Same key ï¿½ check fingerprint
       if (existing.request_fingerprint !== bodyFingerprint) {
-        return res.status(409).json({
-          success: false,
-          error:
-            'Idempotency-Key reused with a different request body. Use a unique key for each distinct payload.',
+        const problem = createProblemDetails({
+          type: `${LIQUifact_PROBLEM_BASE || 'https://liquifact.com/probs'}/conflict`,
+          title: 'Conflict',
+          status: 409,
+          detail: 'Idempotency-Key reused with a different request body. Use a unique key for each distinct payload.',
+          requestId: req.id || req.headers['x-request-id'] || 'unknown'
         });
+        res.setHeader('Content-Type', 'application/problem+json');
+        return res.status(409).json(problem);
       }
 
-      // Replay — return the original cached response
+      // Replay ï¿½ return the original cached response
       const cached = existing.response_body;
       const status = existing.response_status || 201;
       try {
@@ -111,7 +116,7 @@ function idempotencyMiddleware(req, res, next) {
       }
     }
 
-    // New key — insert placeholder
+    // New key ï¿½ insert placeholder
     await trx('idempotency_keys').insert({
       idempotency_key: key,
       request_fingerprint: bodyFingerprint,
@@ -132,7 +137,7 @@ function idempotencyMiddleware(req, res, next) {
           updated_at: db.fn.now(),
         })
         .catch(() => {
-          // Best-effort — don't fail the request if storage fails
+          // Best-effort ï¿½ don't fail the request if storage fails
         });
 
       return originalJson(body);
@@ -147,7 +152,7 @@ function idempotencyMiddleware(req, res, next) {
         error: 'Internal server error processing idempotency key.',
       });
     }
-    // If headers already sent, the error happened post-response — log only
+    // If headers already sent, the error happened post-response ï¿½ log only
     console.error('[idempotency] Post-response storage error:', err.message);
   });
 }

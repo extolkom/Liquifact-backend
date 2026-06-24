@@ -25,7 +25,7 @@ const { requireKycForFunding } = require('../middleware/kycGating');
 const { resolveEscrowAddress, EscrowNotFoundError } = require('../config/escrowMap');
 const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmit');
 const { persistCommitment } = require('../services/investorCommitment');
-const { listOpportunities } = require('../services/investService');
+const idempotencyMiddleware = require('../middleware/idempotency');
 
 const router = express.Router();
 
@@ -222,6 +222,7 @@ router.get(
 router.post(
   '/fund-invoice',
   requireKycForFunding,
+  idempotencyMiddleware,
   asyncHandler(async (req, res) => {
     // 1. Input validation
     const validationErrors = validateFundInvoiceBody(req.body);
