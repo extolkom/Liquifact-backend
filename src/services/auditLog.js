@@ -12,6 +12,8 @@ const db = require('../db/knex');
 /**
  * Generates a unique audit log ID using timestamp and random suffix.
  * Kept for backward compatibility.
+ *
+ * @returns {string} The generated audit log ID.
  */
 function generateAuditLogId() {
   const timestamp = Date.now();
@@ -21,6 +23,9 @@ function generateAuditLogId() {
 
 /**
  * Sanitizes sensitive data from objects to prevent logging secrets.
+ *
+ * @param {*} obj The object or value to sanitize.
+ * @returns {*} The sanitized object or value.
  */
 function sanitizeSensitiveData(obj) {
   return redactValue(obj);
@@ -28,6 +33,10 @@ function sanitizeSensitiveData(obj) {
 
 /**
  * Calculates the differences between two objects.
+ *
+ * @param {object|null} before The state before the change.
+ * @param {object|null} after The state after the change.
+ * @returns {object} The before and after differences.
  */
 function calculateChanges(before, after) {
   if (!before || !after) {
@@ -42,8 +51,8 @@ function calculateChanges(before, after) {
     const afterVal = after[key];
 
     if (JSON.stringify(beforeVal) !== JSON.stringify(afterVal)) {
-      if (!changes.before) changes.before = {};
-      if (!changes.after) changes.after = {};
+      if (!changes.before) { changes.before = {}; }
+      if (!changes.after) { changes.after = {}; }
       changes.before[key] = beforeVal;
       changes.after[key] = afterVal;
     }
@@ -57,6 +66,19 @@ function calculateChanges(before, after) {
 
 /**
  * Creates an immutable audit log entry in the database.
+ *
+ * @param {object} root0 Audit log event data.
+ * @param {string} root0.actor The actor performing the action.
+ * @param {string} root0.action The action performed.
+ * @param {string} root0.resourceType The type of resource.
+ * @param {string} root0.resourceId The ID of the resource.
+ * @param {object|null} [root0.before=null] The state before the action.
+ * @param {object|null} [root0.after=null] The state after the action.
+ * @param {number} [root0.statusCode=200] The HTTP status code.
+ * @param {string} [root0.ipAddress='unknown'] The IP address of the actor.
+ * @param {string} [root0.userAgent='unknown'] The user agent of the actor.
+ * @param {object} [root0.metadata={}] Additional metadata.
+ * @returns {Promise<object>} The created audit log entry.
  */
 async function createAuditLog({
   actor,
@@ -70,10 +92,10 @@ async function createAuditLog({
   userAgent = 'unknown',
   metadata = {},
 } = {}) {
-  if (!actor) throw new Error('Audit log actor is required');
-  if (!action) throw new Error('Audit log action is required');
-  if (!resourceType) throw new Error('Audit log resourceType is required');
-  if (!resourceId) throw new Error('Audit log resourceId is required');
+  if (!actor) { throw new Error('Audit log actor is required'); }
+  if (!action) { throw new Error('Audit log action is required'); }
+  if (!resourceType) { throw new Error('Audit log resourceType is required'); }
+  if (!resourceId) { throw new Error('Audit log resourceId is required'); }
 
   const validActions = ['CREATE', 'UPDATE', 'DELETE', 'READ', 'STATE_TRANSITION'];
   if (!validActions.includes(action)) {
@@ -116,6 +138,12 @@ async function createAuditLog({
   });
 }
 
+/**
+ * Maps a database row to an audit log object.
+ *
+ * @param {object} row The database row.
+ * @returns {object} The mapped audit log object.
+ */
 function mapDbRowToAuditLog(row) {
   const metadata = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
   return Object.freeze({
@@ -160,10 +188,10 @@ async function getAuditLogs({
 } = {}) {
   let query = db('audit_log_events').select('*').orderBy('created_at', 'desc');
 
-  if (resourceId) query = query.where('target_id', resourceId);
-  if (resourceType) query = query.where('target_type', resourceType);
-  if (actor) query = query.where('actor_id', actor);
-  if (action) query = query.where('action', action);
+  if (resourceId) { query = query.where('target_id', resourceId); }
+  if (resourceType) { query = query.where('target_type', resourceType); }
+  if (actor) { query = query.where('actor_id', actor); }
+  if (action) { query = query.where('action', action); }
 
   if (limit !== Infinity) {
     query = query.limit(limit).offset(offset);
@@ -200,6 +228,9 @@ function getInvoiceAuditTrail(invoiceId, limit = 100, offset = 0, tenantId = nul
 
 /**
  * Counts total audit logs matching criteria.
+ *
+ * @param {object} [options={}] Filter options.
+ * @returns {number} The count of matching audit logs.
  */
 function countAuditLogs(options = {}) {
   const logs = getAuditLogs({ ...options, limit: Infinity, offset: 0 });
@@ -227,6 +258,11 @@ async function clearAuditLogs() {
 
 /**
  * Exports audit logs.
+ *
+ * @param {object} [root0={}] Options.
+ * @param {number} [root0.limit=Infinity] Maximum logs to export.
+ * @param {string} [root0.format='json'] Export format.
+ * @returns {Promise<string>} The exported audit logs.
  */
 async function exportAuditLogs({ limit = Infinity, format = 'json' } = {}) {
   const logs = await getAuditLogs({ limit });
@@ -259,49 +295,27 @@ async function exportAuditLogs({ limit = Infinity, format = 'json' } = {}) {
 }
 
 /**
- * Exports audit logs for a specific invoice as JSON or CSV.
+ * Exports audit logs for a specific invoice as JSON.
  * Secrets are redacted via sanitizeSensitiveData.
+ *
+ * CSV export is handled by the route layer via streaming (see
+ * `streamAuditEvents` + `createCsvTransform` in `auditLogStore`).
  *
  * @param {Object} options
  * @param {string} options.invoiceId Invoice resource ID
  * @param {number} [options.limit=100] Maximum records to export
- * @param {string} [options.format='json'] 'json' or 'csv'
+ * @param {string} [options._format='json'] 'json' (CSV is ignored; use streaming route)
  * @param {string} [options.tenantId] Tenant ID for isolation
- * @returns {string} Formatted audit log output
+ * @returns {Promise<string>} Formatted audit log output
  */
-function exportInvoiceAuditLogs({ invoiceId, limit = 100, format = 'json', tenantId = null } = {}) {
-  const logs = getAuditLogs({
+async function exportInvoiceAuditLogs({ invoiceId, limit = 100, _format = 'json', tenantId = null } = {}) {
+  const logs = await getAuditLogs({
     resourceId: invoiceId,
     resourceType: 'invoice',
     limit,
     offset: 0,
     tenantId,
   });
-
-  if (format === 'csv') {
-    const escapeCsv = (val) => {
-      const str = val == null ? '' : String(val);
-      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
-    };
-    const headers = 'id,timestamp,actor,action,resourceType,resourceId,statusCode,ipAddress,userAgent';
-    const rows = logs.map((log) =>
-      [
-        escapeCsv(log.id),
-        escapeCsv(log.timestamp),
-        escapeCsv(log.actor),
-        escapeCsv(log.action),
-        escapeCsv(log.resourceType),
-        escapeCsv(log.resourceId),
-        log.statusCode,
-        escapeCsv(log.ipAddress),
-        escapeCsv(log.userAgent),
-      ].join(',')
-    );
-    return rows.length > 0 ? `${headers}\n${rows.join('\n')}` : headers;
-  }
 
   return JSON.stringify(logs, null, 2);
 }

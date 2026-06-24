@@ -23,7 +23,31 @@ try {
       metrics() { return ''; }
     },
     collectDefaultMetrics: () => { },
+    Counter: class {
+      constructor() {}
+      inc() {}
+    },
+    Gauge: class {
+      constructor() {}
+      set() {}
+      setToCurrentTime() {}
+    },
   };
+}
+
+/**
+ * Constant-time string comparison to prevent timing attacks.
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function safeEqual(a, b) {
+  if (a.length !== b.length) { return false; }
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -81,6 +105,48 @@ const escrowIndexerLastCursorAdvanceTimestampSeconds = new client.Gauge({
 });
 
 /**
+ * Counter: Escrow reconciliation mismatches.
+ * Incremented each time a reconcileInvoice call detects a discrepancy
+ * between the DB funded total and the on-chain funded amount.
+ * @type {import('prom-client').Counter}
+ */
+const escrowReconciliationMismatches = new client.Counter({
+  name: 'escrow_reconciliation_mismatches_total',
+  help: 'Total number of escrow reconciliation mismatches detected',
+  registers: [registry],
+});
+
+/**
+ * Counter: Footprint cache hits.
+ * @type {import('prom-client').Counter}
+ */
+const footprintCacheHitsTotal = new client.Counter({
+  name: 'soroban_footprint_cache_hits_total',
+  help: 'Total number of Soroban footprint cache hits',
+  registers: [registry],
+});
+
+/**
+ * Counter: Footprint cache misses.
+ * @type {import('prom-client').Counter}
+ */
+const footprintCacheMissesTotal = new client.Counter({
+  name: 'soroban_footprint_cache_misses_total',
+  help: 'Total number of Soroban footprint cache misses',
+  registers: [registry],
+});
+
+/**
+ * Counter: Footprint cache evictions (LRU or TTL).
+ * @type {import('prom-client').Counter}
+ */
+const footprintCacheEvictionsTotal = new client.Counter({
+  name: 'soroban_footprint_cache_evictions_total',
+  help: 'Total number of Soroban footprint cache evictions (LRU or TTL expiry)',
+  registers: [registry],
+});
+
+/**
  * Express middleware that enforces metrics auth.
  *
  * @param {import('express').Request} req
@@ -124,4 +190,8 @@ module.exports = {
   escrowIndexerEventsSkippedTotal,
   escrowIndexerCycleFailuresTotal,
   escrowIndexerLastCursorAdvanceTimestampSeconds,
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+  escrowReconciliationMismatches,
 };

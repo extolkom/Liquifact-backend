@@ -142,3 +142,4 @@ tests/load/reports/
 # Scratch / one-off scripts
 fix-invoice.js
 parse-ast.js
+contracts/target/

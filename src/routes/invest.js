@@ -19,11 +19,13 @@
 const express = require('express');
 const crypto = require('crypto');
 const asyncHandler = require('../utils/asyncHandler');
+const responseHelper = require('../utils/responseHelper');
 const { authenticatedTenantStack } = require('../middleware/stacks');
 const { requireKycForFunding } = require('../middleware/kycGating');
 const { resolveEscrowAddress, EscrowNotFoundError } = require('../config/escrowMap');
 const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmit');
 const { persistCommitment } = require('../services/investorCommitment');
+const idempotencyMiddleware = require('../middleware/idempotency');
 
 const router = express.Router();
 
@@ -66,15 +68,151 @@ function validateFundInvoiceBody(body) {
   return errors;
 }
 
-// ─── GET /api/invest/opportunities ───────────────────────────────────────────
+/**
+ * GET /api/invest/opportunities — list open investment opportunities
+ *
+ * Returns a paginated list of publicly investable invoices enriched with
+ * on-chain escrow state. Protected by authenticatedTenantStack (JWT auth +
+ * tenant resolution).
+ *
+ * @param {import('express').Request} req - Express request.
+ * @param {string} [req.query.page=1] - Page number (1-based).
+ * @param {string} [req.query.limit=20] - Items per page (capped at 100).
+ * @param {import('express').Response} res - Express response.
+ * @returns {Promise<void>}
+ *
+ * @swagger
+ * /api/invest/opportunities:
+ *   get:
+ *     summary: List open investment opportunities
+ *     description: >
+ *       Retrieve a paginated list of publicly investable invoices enriched
+ *       with on-chain escrow state (status, funded amount, legal hold flag).
+ *       Only invoices with a status of `verified` or `partially_funded` are
+ *       exposed. On-chain reads that fail for individual invoices are silently
+ *       skipped — the endpoint never fails as a whole.
+ *     tags: [Invest]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           default: 1
+ *         description: Page number (1-based)
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 20
+ *         description: Items per page
+ *     responses:
+ *       200:
+ *         description: Investment opportunities retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               required:
+ *                 - data
+ *                 - meta
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     required:
+ *                       - invoiceId
+ *                       - fundedBpsOfTarget
+ *                       - maturityAt
+ *                       - yieldBpsDisplay
+ *                       - onChain
+ *                     properties:
+ *                       invoiceId:
+ *                         type: string
+ *                         description: Unique identifier of the underlying invoice
+ *                       fundedBpsOfTarget:
+ *                         type: integer
+ *                         description: Progress towards funding target in basis points (10000 = 100%)
+ *                       maturityAt:
+ *                         type: string
+ *                         format: date-time
+ *                         nullable: true
+ *                         description: ISO timestamp when the investment matures
+ *                       yieldBpsDisplay:
+ *                         type: integer
+ *                         nullable: true
+ *                         description: Expected return in basis points (e.g. 500 = 5%)
+ *                       onChain:
+ *                         type: object
+ *                         required:
+ *                           - escrowAddress
+ *                           - ledgerIndex
+ *                         properties:
+ *                           escrowAddress:
+ *                             type: string
+ *                             description: Stellar/Soroban escrow contract address
+ *                           ledgerIndex:
+ *                             type: string
+ *                             nullable: true
+ *                             description: Last ledger index synchronized for this opportunity
+ *                           status:
+ *                             type: string
+ *                             description: On-chain escrow status
+ *                           fundedAmount:
+ *                             type: integer
+ *                             description: Amount currently held in escrow
+ *                           legal_hold:
+ *                             type: boolean
+ *                             description: Whether the escrow is under legal hold
+ *                 meta:
+ *                   type: object
+ *                   required:
+ *                     - total
+ *                     - page
+ *                     - limit
+ *                     - totalPages
+ *                   properties:
+ *                     total:
+ *                       type: integer
+ *                       description: Total number of matching opportunities
+ *                     page:
+ *                       type: integer
+ *                       description: Current page number
+ *                     limit:
+ *                       type: integer
+ *                       description: Items per page
+ *                     totalPages:
+ *                       type: integer
+ *                       description: Total number of pages
+ *                 message:
+ *                   type: string
+ *                   description: Human-readable status message
+ *       400:
+ *         $ref: '#/components/responses/Problem400'
+ *       401:
+ *         $ref: '#/components/responses/Problem401'
+ */
 
 router.get(
   '/opportunities',
   asyncHandler(async (req, res) => {
-    // Placeholder — replace with real marketplace query in a future issue
-    res.json({
-      opportunities: [],
-      meta: { total: 0, page: 1 },
+    const page = req.query.page ? parseInt(req.query.page, 10) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
+
+    const result = await listOpportunities({
+      tenantId: req.tenantId,
+      page,
+      limit,
+    });
+
+    return res.json({
+      ...responseHelper.success(result.data, result.meta),
+      message: 'Investment opportunities retrieved successfully.',
     });
   })
 );
@@ -84,6 +222,7 @@ router.get(
 router.post(
   '/fund-invoice',
   requireKycForFunding,
+  idempotencyMiddleware,
   asyncHandler(async (req, res) => {
     // 1. Input validation
     const validationErrors = validateFundInvoiceBody(req.body);

@@ -16,6 +16,7 @@ const express = require('express');
 const router = express.Router();
 const { adminStack } = require('../middleware/stacks');
 const { getInvoiceAuditTrail, countAuditLogs, exportInvoiceAuditLogs, getAuditLogs } = require('../services/auditLog');
+const { streamAuditEvents, createCsvTransform } = require('../services/auditLogStore');
 const { getTransitionHistory } = require('../services/invoiceStateMachine');
 const AppError = require('../errors/AppError');
 
@@ -103,36 +104,73 @@ router.get('/invoices/:invoiceId/transitions', (req, res, next) => {
 
 /**
  * GET /api/admin/audit/invoices/:invoiceId/export
- * Exports audit trail as JSON or CSV.
- * Query params: format=json|csv, limit, offset
+ * Exports audit trail as JSON or streaming CSV.
+ *
+ * Query params:
+ *   format  - 'json' (default) | 'csv'
+ *   limit   - max rows for JSON export (ignored for CSV streaming)
+ *
+ * CSV export behaviour:
+ *   - Rows are streamed from the database cursor and piped directly into
+ *     the HTTP response; the full result set is never buffered in memory.
+ *   - Each field is formula-injection-safe (cells beginning with =, +,
+ *     -, @ are prefixed with a single quote).
+ *   - Tenant isolation is enforced at the database level via the JSONB
+ *     `metadata->>'tenantId'` filter on every streamed row.
  */
 router.get('/invoices/:invoiceId/export', (req, res, next) => {
-  try {
-    const { invoiceId } = req.params;
-    if (!isValidInvoiceId(invoiceId)) {
-      return next(new AppError({
-        type: 'https://liquifact.com/probs/validation-error',
-        title: 'Validation Error',
-        status: 400,
-        detail: 'Invalid invoiceId.',
-      }));
-    }
-
-    const format = req.query.format === 'csv' ? 'csv' : 'json';
-    const { limit } = parsePagination(req.query);
-    const output = exportInvoiceAuditLogs({ invoiceId, limit, format, tenantId: req.tenantId });
-
-    if (format === 'csv') {
-      res.set('Content-Type', 'text/csv');
-      res.set('Content-Disposition', `attachment; filename="audit-${invoiceId}.csv"`);
-      return res.send(output);
-    }
-
-    res.set('Content-Type', 'application/json');
-    return res.send(output);
-  } catch (err) {
-    return next(err);
+  const { invoiceId } = req.params;
+  if (!isValidInvoiceId(invoiceId)) {
+    return next(new AppError({
+      type: 'https://liquifact.com/probs/validation-error',
+      title: 'Validation Error',
+      status: 400,
+      detail: 'Invalid invoiceId.',
+    }));
   }
+
+  const format = req.query.format === 'csv' ? 'csv' : 'json';
+
+  // ── JSON export (unchanged, buffered) ────────────────────────────────────
+  if (format !== 'csv') {
+    const { limit } = parsePagination(req.query);
+    return exportInvoiceAuditLogs({ invoiceId, limit, format: 'json', tenantId: req.tenantId })
+      .then((output) => {
+        res.set('Content-Type', 'application/json');
+        res.send(output);
+      })
+      .catch(next);
+  }
+
+  // ── CSV streaming export ─────────────────────────────────────────────────
+  res.set('Content-Type', 'text/csv');
+  res.set(
+    'Content-Disposition',
+    `attachment; filename="audit-${invoiceId}.csv"`
+  );
+
+  const dbStream = streamAuditEvents({
+    targetId: invoiceId,
+    targetType: 'invoice',
+    tenantId: req.tenantId,
+  });
+
+  const csvTransform = createCsvTransform();
+
+  // Forward any stream errors to Express so the error handler can log
+  // them; by this point headers may already be flushed, but we at least
+  // abort cleanly and avoid leaving the response hanging.
+  dbStream.on('error', (err) => {
+    csvTransform.destroy(err);
+    next(err);
+  });
+
+  csvTransform.on('error', (err) => {
+    res.destroy();
+    next(err);
+  });
+
+  dbStream.pipe(csvTransform).pipe(res);
 });
 
 module.exports = router;

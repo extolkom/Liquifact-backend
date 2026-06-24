@@ -11,10 +11,46 @@
  * @module middleware/apiKeyAuth
  */
 
+const crypto = require('crypto');
 const { loadApiKeyRegistry } = require('../config/apiKeys');
 
 /** Name of the HTTP request header that carries the API key. */
 const API_KEY_HEADER = 'x-api-key';
+
+/**
+ * Compares two strings in constant time to prevent timing attacks.
+ *
+ * Both strings are hashed with SHA-256 before comparison so that
+ * `crypto.timingSafeEqual` always receives equal-length buffers, regardless
+ * of the input lengths.
+ *
+ * @param {string} a - First string (e.g. the candidate key from the request).
+ * @param {string} b - Second string (e.g. a key from the registry).
+ * @returns {boolean} `true` when both strings are identical.
+ */
+function timingSafeStringEqual(a, b) {
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+/**
+ * Looks up a key in the registry using constant-time comparison for every
+ * candidate, preventing timing-based enumeration of valid keys.
+ *
+ * @param {Map<string, import('../config/apiKeys').ApiKeyEntry>} registry
+ * @param {string} candidate - The trimmed key from the request header.
+ * @returns {import('../config/apiKeys').ApiKeyEntry | undefined}
+ */
+function findEntry(registry, candidate) {
+  let matched;
+  for (const [registryKey, entry] of registry) {
+    if (timingSafeStringEqual(candidate, registryKey)) {
+      matched = entry;
+    }
+  }
+  return matched;
+}
 
 /**
  * @typedef {Object} ApiClient
@@ -29,7 +65,8 @@ const API_KEY_HEADER = 'x-api-key';
  * The middleware operates in three stages:
  * 1. **Presence check** — rejects with `401` when the header is missing.
  * 2. **Registry lookup + revocation check** — rejects with `401` when the key
- *    is unknown or has been revoked.
+ *    is unknown or has been revoked. The lookup uses constant-time comparison
+ *    to prevent timing-based side-channel attacks.
  * 3. **Scope check** (optional) — when `requiredScope` is supplied the key must
  *    include that scope, otherwise the request is rejected with `403`.
  *
@@ -44,7 +81,6 @@ function authenticateApiKey(options = {}) {
   const { requiredScope, env = process.env } = options;
 
   return (req, res, next) => {
-     
     const rawKey = req.headers[API_KEY_HEADER];
 
     if (!rawKey || typeof rawKey !== 'string' || rawKey.trim() === '') {
@@ -55,7 +91,7 @@ function authenticateApiKey(options = {}) {
 
     // Load registry fresh on each call so env changes in tests are respected.
     const registry = loadApiKeyRegistry(env);
-    const entry = registry.get(rawKey.trim());
+    const entry = findEntry(registry, rawKey.trim());
 
     if (!entry) {
       return res.status(401).json({ error: 'Invalid API key.' });
@@ -84,4 +120,5 @@ function authenticateApiKey(options = {}) {
 module.exports = {
   authenticateApiKey,
   API_KEY_HEADER,
+  timingSafeStringEqual,
 };

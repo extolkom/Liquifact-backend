@@ -188,6 +188,137 @@ curl -H "Authorization: Bearer <token>" \
 
 ---
 
+## Invoice Upload Security
+
+LiquiFact uses tenant-scoped object storage and strict validation controls for invoice uploads.
+
+### Storage Key Scoping
+
+Invoice files are stored using tenant and invoice scoped object keys:
+
+```text
+tenants/{tenantId}/invoices/{invoiceId}/{uuid}-{filename}
+```
+
+Example:
+
+```text
+tenants/tenant-123/invoices/inv-456/550e8400-e29b-41d4-a716-446655440000-invoice.pdf
+```
+
+Security benefits:
+
+- Tenant isolation
+- Invoice isolation
+- UUID-based object naming
+- Protection against object enumeration
+- Prevention of cross-tenant object access
+
+### Filename Validation
+
+Uploaded filenames are sanitized before storage.
+
+The storage layer:
+
+- Rejects path traversal attempts (`../`)
+- Rejects invalid filenames
+- Removes null bytes
+- Sanitizes special characters
+- Truncates excessively long filenames
+
+Examples:
+
+```text
+../../etc/passwd        -> rejected
+..\..\windows\system32 -> rejected
+invoice.pdf            -> accepted
+```
+
+### Tenant and Invoice Validation
+
+Tenant IDs and invoice IDs are validated before key generation.
+
+Allowed characters:
+
+```text
+a-z
+A-Z
+0-9
+_
+-
+```
+
+Rejected examples:
+
+```text
+../../admin
+tenant/admin
+inv/123
+```
+
+### MIME Type Validation
+
+Supported invoice file types:
+
+- application/pdf
+- image/jpeg
+- image/png
+- image/tiff
+
+Validation occurs during:
+
+- Direct uploads
+- Presigned URL generation
+
+Unsupported MIME types are rejected before any storage operation occurs.
+
+### File Size Limits
+
+Invoice uploads are limited by:
+
+```bash
+BODY_LIMIT_INVOICE
+```
+
+Default:
+
+```text
+512 KB
+```
+
+Files exceeding the configured limit are rejected.
+
+### Presigned URL Expiry Limits
+
+Upload URLs:
+
+```text
+15 minutes
+```
+
+Download URLs:
+
+```text
+Default: 1 hour
+Maximum: 24 hours
+```
+
+Requests outside the allowed expiry range are rejected.
+
+### Security Controls
+
+The invoice upload subsystem includes:
+
+- Path traversal protection
+- MIME type allow-listing
+- File size enforcement
+- Tenant isolation
+- Invoice isolation
+- UUID object naming
+- Presigned URL expiry limits
+- AWS credential non-disclosure
+- Server-side validation before S3 operations
+
 Core routes currently covered:
 
 - Health: `GET /health`
@@ -543,6 +674,22 @@ Unexpected error:
 
 ---
 
+## Idempotency
+
+The backend supports durable idempotency keys for funding operations to safely retry requests without risking double-funding. 
+
+### Headers and Behavior
+- Send an `Idempotency-Key` header with each distinct funding request. The key must be an 8-128 character URL-safe string.
+- First use: The backend processes the request and persists the key along with a SHA-256 hash of the payload and the resulting response.
+- Identical retries: Resending the same key with the same payload will short-circuit and instantly replay the cached response.
+- Conflicting payload: Resending the same key with a different payload body results in a `409 Conflict` containing an RFC 7807 `application/problem+json` error envelope.
+
+### TTL and Purging
+- Keys expire after a configurable TTL (default is 24 hours, overridable via `IDEMPOTENCY_KEY_TTL_HOURS`).
+- Expired keys are automatically purged to save database space, governed by the `expires_at` index.
+
+---
+
 ## Security audit log (Issue #116)
 
 The backend now supports a database-backed append-only audit log for:
@@ -567,9 +714,58 @@ Run SQL migrations in order:
 - successful `POST|PUT|PATCH|DELETE` requests under `/api/admin/*` are auto-logged
 - sensitive fields are redacted before persistence (`password`, `token`, `secret`, `apiKey`, `privateKey`, etc.)
 
+### Audit trail export
+
+`GET /api/admin/audit/invoices/:invoiceId/export` accepts a `format` query parameter:
+
+| `format` | Behaviour |
+| --- | --- |
+| `json` (default) | Returns a paginated JSON array. The `limit` query param (default 50, max 500) controls the page size. |
+| `csv` | **Streaming**: rows are emitted directly from the database cursor and piped to the HTTP response. The full result set is **never** buffered in memory, making this safe for arbitrarily large audit trails. |
+
+#### CSV streaming pipeline
+
+```
+PostgreSQL cursor (Knex .stream())
+  → createCsvTransform()   ← object-mode Transform, writes header on first row
+  → res (HTTP response)
+```
+
+Both ends of the pipeline attach `error` listeners. If the database stream or the transform errors after headers have been flushed, the socket is destroyed cleanly to avoid a hanging client connection.
+
+#### Formula-injection safety
+
+Every CSV field is processed by `escapeCsvField()` in `src/services/auditLogStore.js`:
+
+1. **Leading-character neutralisation** — cells beginning with `=`, `+`, `-`, `@`, TAB, or CR are prefixed with a single quote (`'`). This prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or a DDE command.
+2. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
+
+#### Tenant isolation
+
+Tenant scoping is enforced **at the database level** using a `whereRaw` filter on the JSONB `metadata` column:
+
+```sql
+WHERE metadata->>'tenantId' = ?
+```
+
+No cross-tenant row is ever loaded into application memory.
+
+#### Response headers
+
+```
+Content-Type: text/csv
+Content-Disposition: attachment; filename="audit-<invoiceId>.csv"
+```
+
+#### Column order
+
+```
+id, timestamp, actor, action, resourceType, resourceId, statusCode, ipAddress, userAgent
+```
+
 ### Example API usage
 
-Admin action example:
+Admin action logging:
 
 ```bash
 curl -X POST http://localhost:3001/api/admin/kyc/cus_42/approve \
@@ -581,9 +777,25 @@ curl -X POST http://localhost:3001/api/admin/kyc/cus_42/approve \
   -d '{"reason":"manual review","privateKey":"redacted-at-write-time"}'
 ```
 
-Webhook delivery logging is typically called internally from delivery workers/routes via `req.audit.logWebhookDelivery(...)`.
+Streaming CSV export:
+
+```bash
+curl -H "Authorization: Bearer <admin-jwt>" \
+     -H "x-tenant-id: tenant-alpha" \
+     "http://localhost:3001/api/admin/audit/invoices/inv-001/export?format=csv" \
+     -o audit-inv-001.csv
+```
+
+JSON export (paginated):
+
+```bash
+curl -H "Authorization: Bearer <admin-jwt>" \
+     -H "x-tenant-id: tenant-alpha" \
+     "http://localhost:3001/api/admin/audit/invoices/inv-001/export?format=json&limit=100"
+```
 
 ---
+
 
 ## Load baseline suite
 
@@ -715,6 +927,114 @@ We welcome docs improvements, bug fixes, and new API endpoints aligned with Liqu
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, local checks, testing expectations, CI behavior, and pull request guidance.
+
+---
+
+## Webhooks
+
+LiquiFact delivers signed webhook callbacks to tenant-configured endpoints whenever an invoice transitions between states (e.g. `pending → approved`, `approved → linked_escrow`).
+
+### How it works
+
+1. **State transition** — `invoiceStateMachine.executeTransition` completes successfully.
+2. **Job enqueue** — `enqueueWebhookDelivery` looks up the tenant's `webhook_url` / `webhook_secret` from the database and enqueues a `webhook_delivery` job via the shared `BackgroundWorker`.
+3. **Signed delivery** — the `webhookDelivery` job handler constructs a deterministically-sorted JSON payload, signs it with HMAC-SHA256 (`v1` scheme), and POSTs it with an `X-Signature` header.
+4. **Retry** — transient failures (network errors, HTTP 5xx) are retried with bounded exponential backoff. Non-retriable failures (HTTP 4xx) are not retried.
+5. **Dead-letter** — after exhausting all retry attempts the delivery is written to `webhook_dead_letters` and a Prometheus counter is incremented.
+
+### Signature verification
+
+Every webhook request carries an `X-Signature` header in the format:
+
+```
+t=<unix_timestamp>,v1=<hmac_sha256_hex>
+```
+
+To verify on the receiving end:
+
+1. Extract `t` (timestamp, seconds since epoch) and `v1` (hex signature) from the header.
+2. Reject if `|now_ms − t × 1000| > 300000` (5-minute tolerance window).
+3. Compute the expected signature:
+   ```
+   HMAC-SHA256(secret, "<t>.<raw_body>")
+   ```
+4. Compare using a **constant-time** function (e.g. `crypto.timingSafeEqual`) to prevent timing attacks.
+5. Reject if the signatures do not match.
+
+**Example (Node.js receiver):**
+
+```js
+const crypto = require('crypto');
+
+function verifyWebhook(secret, rawBody, signatureHeader) {
+  const parts = Object.fromEntries(
+    signatureHeader.split(',').map((p) => p.split('='))
+  );
+  const ts = parseInt(parts.t, 10);
+  if (Math.abs(Date.now() - ts * 1000) > 5 * 60 * 1000) {
+    return false; // replay / clock-skew rejected
+  }
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(`${ts}.${rawBody}`)
+    .digest('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(parts.v1, 'hex'),
+    Buffer.from(expected, 'hex')
+  );
+}
+```
+
+### Payload shape
+
+```jsonc
+{
+  "event": "invoice.pending_to_approved",
+  "invoiceId": "inv_abc123",
+  "tenantId": "tenant_xyz",
+  "timestamp": "2025-01-15T12:00:00.000Z",
+  "transition": {
+    "actor": "usr_admin",
+    "from": "pending",
+    "reason": null,
+    "to": "approved",
+    "transitionedAt": "2025-01-15T12:00:00.000Z"
+  }
+}
+```
+
+Keys are always sorted alphabetically (deterministic) to simplify signature verification on any platform.
+
+### Environment variables
+
+| Variable              | Default | Description                                    |
+|-----------------------|---------|------------------------------------------------|
+| `WEBHOOK_MAX_RETRIES` | `3`     | Max retry attempts after the first failure     |
+| `WEBHOOK_BASE_DELAY`  | `500`   | Base exponential-backoff delay (ms)            |
+| `WEBHOOK_MAX_DELAY`   | `10000` | Maximum backoff delay cap (ms)                 |
+| `WEBHOOK_TIMEOUT_MS`  | `5000`  | Per-request HTTP timeout (ms)                  |
+
+### Tenant configuration
+
+Configure per-tenant webhook delivery by storing `webhook_url` and `webhook_secret` in the `tenants.settings` JSONB column:
+
+```sql
+UPDATE tenants
+SET settings = settings || '{"webhook_url":"https://your.endpoint/cb","webhook_secret":"<strong-random-secret>"}'
+WHERE id = 'your-tenant-id';
+```
+
+> **Security**: Generate `webhook_secret` with at least 32 bytes of cryptographic randomness (e.g. `openssl rand -hex 32`). Rotate secrets by updating the column — in-flight jobs will fail safe and dead-letter, then delivery resumes automatically on the next enqueue.
+
+### Security notes
+
+- Secrets and full target URLs are **never** logged at `info` level.
+- Signature comparison uses `crypto.timingSafeEqual` — no timing side-channels.
+- The 5-minute timestamp tolerance prevents replay attacks.
+- Webhook delivery failures never affect the outcome of a state transition.
+- Dead-lettered deliveries are stored in `webhook_dead_letters` for ops inspection.
+
+---
 
 ## License
 MIT (see root LiquiFact project for full license).

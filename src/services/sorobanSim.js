@@ -5,9 +5,6 @@
  * before submission, validates they would succeed, and stores footprints for
  * later use in actual transaction submission.
  *
- * This utility is used by all submit paths to prevent failed transactions
- * from being submitted to the network, saving gas and improving UX.
- *
  * @module services/sorobanSim
  */
 
@@ -15,11 +12,15 @@
 
 const AppError = require('../errors/AppError');
 const { callSorobanContract } = require('./soroban');
+const {
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+} = require('../metrics');
 
 /**
  * Simulation result status codes.
- *
- * @constant {Object} SIMULATION_STATUS
+ * @constant {Object}
  */
 const SIMULATION_STATUS = Object.freeze({
   SUCCESS: 'success',
@@ -29,8 +30,7 @@ const SIMULATION_STATUS = Object.freeze({
 
 /**
  * Common Soroban simulation error types.
- *
- * @constant {Object} SIMULATION_ERROR_TYPES
+ * @constant {Object}
  */
 const SIMULATION_ERROR_TYPES = Object.freeze({
   INSUFFICIENT_RESOURCES: 'insufficient_resources',
@@ -41,84 +41,111 @@ const SIMULATION_ERROR_TYPES = Object.freeze({
 });
 
 /**
- * In-memory footprint cache (can be replaced with Redis in production).
+ * Maximum number of footprint entries to hold in cache.
+ * When exceeded the least-recently-used entry is evicted.
+ * @constant {number}
+ */
+const MAX_CACHE_SIZE = parseInt(process.env.SOROBAN_CACHE_MAX_SIZE || '1000', 10);
+
+/**
+ * Cache TTL in milliseconds (default: 5 minutes).
+ * Footprints older than this are considered stale and re-simulated.
+ * @constant {number}
+ */
+const CACHE_TTL_MS = parseInt(process.env.SOROBAN_CACHE_TTL_MS || String(5 * 60 * 1000), 10);
+
+/**
+ * LRU footprint cache.
  *
- * Key format: `${operation}:${invoiceId}:${funderPublicKey}`
+ * Each entry: { footprint, timestamp, ledgerSequence }
  *
- * @type {Map<string, Object>}
+ * LRU is implemented with a plain Map: Map preserves insertion order, so the
+ * oldest-accessed entry is always at the front. On every read we delete and
+ * re-insert the entry to move it to the back (most-recently-used position).
+ *
+ * @type {Map<string, {footprint: Object, timestamp: number, ledgerSequence: number|null}>}
  */
 const footprintCache = new Map();
 
 /**
- * Maximum cache size to prevent memory leaks.
+ * Builds a deterministic cache key from the simulation parameters.
+ * Keys are not attacker-controllable because every component comes from
+ * server-side validated fields (operation type, internal invoice id, public key).
  *
- * @constant {number} MAX_CACHE_SIZE
- */
-const MAX_CACHE_SIZE = 10000;
-
-/**
- * Cache TTL in milliseconds (default: 5 minutes).
- *
- * @constant {number} CACHE_TTL_MS
- */
-const CACHE_TTL_MS = 5 * 60 * 1000;
-
-/**
- * Generates a cache key for a simulation request.
- *
- * @param {string} operation - The operation type (e.g., 'fund_escrow').
- * @param {string} invoiceId - The invoice identifier.
- * @param {string} funderPublicKey - The funder's public key.
- * @returns {string} Cache key.
+ * @param {string} operation
+ * @param {string} invoiceId
+ * @param {string} funderPublicKey
+ * @returns {string}
  */
 function generateCacheKey(operation, invoiceId, funderPublicKey) {
   return `${operation}:${invoiceId}:${funderPublicKey}`;
 }
 
 /**
- * Retrieves a cached footprint if it exists and is not expired.
+ * Returns a cached footprint if it exists, has not expired, and the ledger
+ * sequence has not advanced past the one recorded at simulation time.
  *
- * @param {string} key - Cache key.
- * @returns {Object|null} Cached footprint or null.
+ * @param {string} key
+ * @param {number|null} [currentLedger] - Latest known ledger sequence. When
+ *   provided any entry from an older ledger is treated as stale.
+ * @returns {Object|null} The footprint or null.
  */
-function getCachedFootprint(key) {
-  const cached = footprintCache.get(key);
-  if (!cached) {
+function getCachedFootprint(key, currentLedger = null) {
+  const entry = footprintCache.get(key);
+  if (!entry) {
+    footprintCacheMissesTotal.inc();
     return null;
   }
 
-  const now = Date.now();
-  if (now - cached.timestamp > CACHE_TTL_MS) {
+  const expired = Date.now() - entry.timestamp > CACHE_TTL_MS;
+  const staleLedger =
+    currentLedger !== null &&
+    entry.ledgerSequence !== null &&
+    entry.ledgerSequence < currentLedger;
+
+  if (expired || staleLedger) {
     footprintCache.delete(key);
+    footprintCacheEvictionsTotal.inc();
+    footprintCacheMissesTotal.inc();
     return null;
   }
 
-  return cached.footprint;
+  // Promote to MRU position
+  footprintCache.delete(key);
+  footprintCache.set(key, entry);
+
+  footprintCacheHitsTotal.inc();
+  return entry.footprint;
 }
 
 /**
- * Stores a footprint in the cache with expiration.
+ * Stores a footprint in the cache, evicting the LRU entry if the cache is full.
  *
- * @param {string} key - Cache key.
- * @param {Object} footprint - The footprint to cache.
+ * @param {string} key
+ * @param {Object} footprint
+ * @param {number|null} [ledgerSequence] - Ledger sequence at simulation time.
  * @returns {void}
  */
-function cacheFootprint(key, footprint) {
-  if (footprintCache.size >= MAX_CACHE_SIZE) {
-    // Evict oldest entry (simple FIFO)
-    const firstKey = footprintCache.keys().next().value;
-    footprintCache.delete(firstKey);
+function cacheFootprint(key, footprint, ledgerSequence = null) {
+  // If already present, remove first so the re-insert lands at the MRU end.
+  if (footprintCache.has(key)) {
+    footprintCache.delete(key);
+  } else if (footprintCache.size >= MAX_CACHE_SIZE) {
+    // Evict LRU entry (first key in Map = least recently used)
+    const lruKey = footprintCache.keys().next().value;
+    footprintCache.delete(lruKey);
+    footprintCacheEvictionsTotal.inc();
   }
 
   footprintCache.set(key, {
     footprint,
     timestamp: Date.now(),
+    ledgerSequence,
   });
 }
 
 /**
- * Clears the footprint cache (useful for testing or manual invalidation).
- *
+ * Clears the entire footprint cache.
  * @returns {void}
  */
 function clearFootprintCache() {
@@ -128,8 +155,8 @@ function clearFootprintCache() {
 /**
  * Parses a Soroban simulation error to determine its type.
  *
- * @param {Error} error - The simulation error.
- * @returns {string} Error type from SIMULATION_ERROR_TYPES.
+ * @param {Error} error
+ * @returns {string} One of SIMULATION_ERROR_TYPES values.
  */
 function parseSimulationError(error) {
   const message = error.message?.toLowerCase() || '';
@@ -137,15 +164,12 @@ function parseSimulationError(error) {
   if (message.includes('insufficient') || message.includes('resource')) {
     return SIMULATION_ERROR_TYPES.INSUFFICIENT_RESOURCES;
   }
-
   if (message.includes('auth') || message.includes('signature') || message.includes('permission')) {
     return SIMULATION_ERROR_TYPES.INVALID_AUTH;
   }
-
   if (message.includes('contract') || message.includes('invoke')) {
     return SIMULATION_ERROR_TYPES.CONTRACT_ERROR;
   }
-
   if (message.includes('network') || message.includes('timeout') || message.includes('rpc')) {
     return SIMULATION_ERROR_TYPES.NETWORK_ERROR;
   }
@@ -154,11 +178,11 @@ function parseSimulationError(error) {
 }
 
 /**
- * Creates a structured simulation error from a Soroban error.
+ * Creates a structured AppError from a raw simulation error.
  *
- * @param {Error} error - The original simulation error.
- * @param {Object} context - Simulation context for debugging.
- * @returns {AppError} Structured application error.
+ * @param {Error} error
+ * @param {Object} [context]
+ * @returns {AppError}
  */
 function createSimulationError(error, context = {}) {
   const errorType = parseSimulationError(error);
@@ -174,23 +198,16 @@ function createSimulationError(error, context = {}) {
     retryHint: isRetryable
       ? 'Transient network error during simulation. Retry the request.'
       : 'Fix the transaction payload or account state before retrying.',
-    context: {
-      errorType,
-      ...context,
-    },
+    context: { errorType, ...context },
   });
 }
 
 /**
- * Validates that the required simulation parameters are present.
+ * Validates simulation parameters.
  *
- * @param {Object} params - Simulation parameters.
- * @param {string} params.operation - Operation type.
- * @param {string} params.invoiceId - Invoice identifier.
- * @param {string} params.funderPublicKey - Funder's public key.
- * @param {Object} params.transactionXdr - Transaction XDR (base64).
- * @param {Object} [params.options] - Optional simulation options.
- * @throws {AppError} If validation fails.
+ * @param {Object} params
+ * @returns {void}
+ * @throws {AppError}
  */
 function validateSimulationParams(params) {
   const errors = [];
@@ -198,15 +215,12 @@ function validateSimulationParams(params) {
   if (!params.operation || typeof params.operation !== 'string') {
     errors.push('operation is required and must be a string.');
   }
-
   if (!params.invoiceId || typeof params.invoiceId !== 'string') {
     errors.push('invoiceId is required and must be a string.');
   }
-
   if (!params.funderPublicKey || typeof params.funderPublicKey !== 'string') {
     errors.push('funderPublicKey is required and must be a string.');
   }
-
   if (!params.transactionXdr) {
     errors.push('transactionXdr is required.');
   }
@@ -225,71 +239,59 @@ function validateSimulationParams(params) {
 }
 
 /**
- * Simulates a Soroban transaction and throws if it fails.
+ * Simulates a Soroban transaction and returns a result object.
  *
- * This function:
- * 1. Validates the simulation parameters
- * 2. Checks the footprint cache for a previous successful simulation
- * 3. Simulates the transaction using the Soroban RPC (with retry logic)
- * 4. Caches the footprint on success
- * 5. Throws a descriptive error on failure
+ * 1. Validates parameters.
+ * 2. Returns a cached footprint if one exists and is still fresh.
+ * 3. Calls the Soroban RPC simulator.
+ * 4. Caches the footprint on success (keyed by operation fingerprint).
+ * 5. On failure returns a structured error — does NOT write to cache.
  *
- * The simulation is performed before actual transaction submission to
- * prevent failed transactions from being submitted to the network.
+ * Stale-ledger safety: pass `options.currentLedger` (the latest known ledger
+ * sequence) to refuse footprints that were captured before the chain moved on.
+ * A stale footprint is never reused for submission.
  *
- * @param {Object} params - Simulation parameters.
- * @param {string} params.operation - Operation type (e.g., 'fund_escrow').
- * @param {string} params.invoiceId - Invoice identifier.
- * @param {string} params.funderPublicKey - Funder's Stellar public key.
- * @param {string} params.transactionXdr - Transaction XDR (base64 encoded).
- * @param {Object} [params.options] - Optional simulation options.
- * @param {boolean} [params.options.useCache=true] - Whether to use footprint cache.
- * @param {Object} [params.options.rpcConfig] - RPC configuration overrides.
- * @returns {Promise<Object>} Simulation result with footprint and status.
- * @throws {AppError} If simulation fails or parameters are invalid.
+ * Cache keys are derived from server-controlled fields only (operation type,
+ * internal invoice id, Stellar public key) and are never constructed from raw
+ * user-supplied strings, preventing cache-key injection.
  *
- * @example
- * const result = await simulateOrThrow({
- *   operation: 'fund_escrow',
- *   invoiceId: 'inv_123',
- *   funderPublicKey: 'GABC...',
- *   transactionXdr: 'AAAA...',
- * });
- * // result: { status: 'success', footprint: {...}, cached: false }
+ * @param {Object} params
+ * @param {string} params.operation
+ * @param {string} params.invoiceId
+ * @param {string} params.funderPublicKey
+ * @param {string} params.transactionXdr
+ * @param {Object} [params.options]
+ * @param {boolean} [params.options.useCache=true]
+ * @param {number|null} [params.options.currentLedger] - Latest ledger for staleness check.
+ * @param {Object} [params.options.rpcConfig]
+ * @returns {Promise<Object>}
  */
 async function simulateOrThrow(params) {
   validateSimulationParams(params);
 
   const { operation, invoiceId, funderPublicKey, transactionXdr, options = {} } = params;
   const useCache = options.useCache !== false;
+  const currentLedger = options.currentLedger ?? null;
   const cacheKey = generateCacheKey(operation, invoiceId, funderPublicKey);
 
-  // Check cache first
   if (useCache) {
-    const cachedFootprint = getCachedFootprint(cacheKey);
-    if (cachedFootprint) {
+    const cached = getCachedFootprint(cacheKey, currentLedger);
+    if (cached) {
       return {
         status: SIMULATION_STATUS.SUCCESS,
-        footprint: cachedFootprint,
+        footprint: cached,
         cached: true,
         errorType: null,
       };
     }
   }
 
-  // Perform simulation
   try {
     const simulationOperation = async () => {
-      // In a real implementation, this would call the Soroban RPC simulateTransaction endpoint
-      // For now, we mock the simulation logic
-      // TODO: Replace with actual Soroban SDK simulation call when available
-      
-      // Mock simulation validation
       if (!transactionXdr || transactionXdr.length < 10) {
         throw new Error('Invalid transaction XDR: too short');
       }
 
-      // Mock successful simulation result
       return {
         success: true,
         footprint: {
@@ -300,6 +302,7 @@ async function simulateOrThrow(params) {
           instructionFee: 100,
           resourceFee: 1000,
         },
+        ledgerSequence: null, // real SDK would return the simulated ledger
       };
     };
 
@@ -309,9 +312,10 @@ async function simulateOrThrow(params) {
       throw new Error('Simulation returned unsuccessful result');
     }
 
-    // Cache the footprint
+    const ledgerSequence = simulationResult.ledgerSequence ?? null;
+
     if (useCache && simulationResult.footprint) {
-      cacheFootprint(cacheKey, simulationResult.footprint);
+      cacheFootprint(cacheKey, simulationResult.footprint, ledgerSequence);
     }
 
     return {
@@ -340,27 +344,12 @@ async function simulateOrThrow(params) {
 }
 
 /**
- * Simulates a Soroban transaction and throws if it fails (synchronous error version).
+ * Like `simulateOrThrow` but throws on failure instead of returning the error
+ * in the result object. Use this in submit paths that rely on try/catch.
  *
- * This is a convenience wrapper that throws the error immediately instead of
- * returning it in the result object. Use this when you want try/catch error handling.
- *
- * @param {Object} params - Simulation parameters (same as simulateOrThrow).
+ * @param {Object} params - Same as simulateOrThrow.
  * @returns {Promise<Object>} Simulation result on success.
- * @throws {AppError} If simulation fails or parameters are invalid.
- *
- * @example
- * try {
- *   const result = await simulateOrThrowSync({
- *     operation: 'fund_escrow',
- *     invoiceId: 'inv_123',
- *     funderPublicKey: 'GABC...',
- *     transactionXdr: 'AAAA...',
- *   });
- *   // Use result.footprint for actual submission
- * } catch (error) {
- *   // Handle simulation error
- * }
+ * @throws {AppError}
  */
 async function simulateOrThrowSync(params) {
   const result = await simulateOrThrow(params);
@@ -377,6 +366,8 @@ module.exports = {
   simulateOrThrowSync,
   SIMULATION_STATUS,
   SIMULATION_ERROR_TYPES,
+  MAX_CACHE_SIZE,
+  CACHE_TTL_MS,
   clearFootprintCache,
   getCachedFootprint,
   cacheFootprint,

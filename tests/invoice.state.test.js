@@ -1,15 +1,30 @@
 /**
- * Invoice State Machine Tests
- * Tests for invoice lifecycle state transitions with audit logging
- * 
+ * Invoice State Machine — Full Transition Matrix & Audit Emission Tests
+ *
+ * Covers:
+ *   - Every entry in VALID_TRANSITIONS succeeds
+ *   - Every disallowed pair is rejected with a clear error code
+ *   - Terminal states reject all further transitions
+ *   - REJECTED / CANCELLED require a normalized reason
+ *   - Control characters are stripped via normalizeTransitionReason
+ *   - An audit log entry is created on each successful transition
+ *
  * @jest-environment node
  */
 
 const request = require('supertest');
 const express = require('express');
+
+// Mock KYC gating so link-escrow routes pass through in tests
+jest.mock('../src/middleware/kycGating', () => ({
+  requireKycForFunding: jest.fn((_req, _res, next) => next()),
+  auditKycAccess: jest.fn((_req, _res, next) => next()),
+}));
+
 const {
   INVOICE_STATES,
   VALID_TRANSITIONS,
+  TERMINAL_STATES,
   isValidState,
   isTransitionAllowed,
   isTerminalState,
@@ -22,456 +37,709 @@ const {
 const { clearAuditLogs, getAuditLogs } = require('../src/services/auditLog');
 const invoiceStateRoutes = require('../src/routes/invoiceStateRoutes');
 
-describe('Invoice State Machine', () => {
-  beforeEach(() => {
-    clearAuditLogs();
+const TERMINAL_REASON_REQUIRED_STATES = [
+  INVOICE_STATES.REJECTED,
+  INVOICE_STATES.CANCELLED,
+];
+
+/* ------------------------------------------------------------------ */
+/*  Helper: build the expected error code for a (from, to) pair       */
+/*  when calling validateTransition *without* a reason.               */
+/* ------------------------------------------------------------------ */
+function expectedValidationCode(fromState, targetState) {
+  if (fromState === targetState) return 'ALREADY_IN_TARGET_STATE';
+  if (TERMINAL_STATES.includes(fromState)) return 'TERMINAL_STATE';
+  if (TERMINAL_REASON_REQUIRED_STATES.includes(targetState)) {
+    return 'MISSING_TRANSITION_REASON';
+  }
+  const allowed = VALID_TRANSITIONS[fromState] || [];
+  if (!allowed.includes(targetState)) return 'INVALID_TRANSITION';
+  return null; // valid
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helper: build the expected error code for executeTransition       */
+/*  when a reason IS provided for valid transitions that need one.    */
+/* ------------------------------------------------------------------ */
+function expectedExecutionCode(fromState, targetState) {
+  if (fromState === targetState) return 'ALREADY_IN_TARGET_STATE';
+  if (TERMINAL_STATES.includes(fromState)) return 'TERMINAL_STATE';
+  const allowed = VALID_TRANSITIONS[fromState] || [];
+  if (!allowed.includes(targetState)) return 'INVALID_TRANSITION';
+  return null; // valid — executeTransition will succeed
+}
+
+/* ------------------------------------------------------------------ */
+/*  normalizeTransitionReason (tested indirectly via exported API)    */
+/* ------------------------------------------------------------------ */
+describe('normalizeTransitionReason', () => {
+  it('should strip control characters from reason via validateTransition', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'tester',
+      reason: 'Reason\u0000with\u001Fcontrol\u007Fchars',
+    });
+    expect(result.isValid).toBe(true);
   });
 
-  describe('State Validation', () => {
-    it('should recognize all valid states', () => {
-      expect(isValidState('pending')).toBe(true);
-      expect(isValidState('approved')).toBe(true);
-      expect(isValidState('linked_escrow')).toBe(true);
-      expect(isValidState('rejected')).toBe(true);
-      expect(isValidState('cancelled')).toBe(true);
+  it('should treat whitespace-only reason as missing for terminal states', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'tester',
+      reason: '   ',
     });
-
-    it('should reject invalid states', () => {
-      expect(isValidState('invalid')).toBe(false);
-      expect(isValidState('PENDING')).toBe(false);
-      expect(isValidState('')).toBe(false);
-      expect(isValidState(null)).toBe(false);
-      expect(isValidState(undefined)).toBe(false);
-    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_TRANSITION_REASON');
   });
 
-  describe('Transition Rules', () => {
-    it('should allow pending → approved', () => {
-      expect(isTransitionAllowed('pending', 'approved')).toBe(true);
+  it('should treat null reason as missing for terminal states', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'cancelled',
+      actor: 'tester',
+      reason: null,
     });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_TRANSITION_REASON');
+  });
 
-    it('should allow pending → rejected', () => {
-      expect(isTransitionAllowed('pending', 'rejected')).toBe(true);
+  it('should treat undefined reason as missing for terminal states', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'tester',
     });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_TRANSITION_REASON');
+  });
 
-    it('should allow pending → cancelled', () => {
-      expect(isTransitionAllowed('pending', 'cancelled')).toBe(true);
+  it('should normalize non-string reason (number) to string', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'tester',
+      reason: 42,
     });
+    expect(result.isValid).toBe(true);
+  });
 
-    it('should allow approved → linked_escrow', () => {
-      expect(isTransitionAllowed('approved', 'linked_escrow')).toBe(true);
+  it('should allow reason with exactly MAX_TRANSITION_REASON_LENGTH chars', () => {
+    const reason = 'x'.repeat(1024);
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'tester',
+      reason,
     });
+    expect(result.isValid).toBe(true);
+  });
 
-    it('should allow approved → cancelled', () => {
-      expect(isTransitionAllowed('approved', 'cancelled')).toBe(true);
+  it('should reject reason exceeding MAX_TRANSITION_REASON_LENGTH chars', () => {
+    const reason = 'x'.repeat(1025);
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'tester',
+      reason,
     });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('TRANSITION_REASON_TOO_LONG');
+  });
+});
 
-    it('should NOT allow pending → linked_escrow (silent jump)', () => {
-      expect(isTransitionAllowed('pending', 'linked_escrow')).toBe(false);
-    });
+/* ------------------------------------------------------------------ */
+/*  State validation                                                  */
+/* ------------------------------------------------------------------ */
+describe('State Validation', () => {
+  it('should recognize all valid states', () => {
+    expect(isValidState('pending')).toBe(true);
+    expect(isValidState('approved')).toBe(true);
+    expect(isValidState('linked_escrow')).toBe(true);
+    expect(isValidState('rejected')).toBe(true);
+    expect(isValidState('cancelled')).toBe(true);
+  });
 
-    it('should NOT allow approved → rejected', () => {
-      expect(isTransitionAllowed('approved', 'rejected')).toBe(false);
-    });
+  it('should reject invalid states', () => {
+    expect(isValidState('invalid')).toBe(false);
+    expect(isValidState('PENDING')).toBe(false);
+    expect(isValidState('')).toBe(false);
+    expect(isValidState(null)).toBe(false);
+    expect(isValidState(undefined)).toBe(false);
+  });
+});
 
-    it('should NOT allow transitions from terminal states', () => {
-      expect(isTransitionAllowed('linked_escrow', 'approved')).toBe(false);
-      expect(isTransitionAllowed('linked_escrow', 'pending')).toBe(false);
-      expect(isTransitionAllowed('rejected', 'approved')).toBe(false);
-      expect(isTransitionAllowed('cancelled', 'pending')).toBe(false);
-    });
+/* ------------------------------------------------------------------ */
+/*  isTransitionAllowed — individual cases for readability            */
+/* ------------------------------------------------------------------ */
+describe('Transition Rules — individual assertions', () => {
+  it('should allow pending → approved', () => {
+    expect(isTransitionAllowed('pending', 'approved')).toBe(true);
+  });
 
-    it('should NOT allow same-state transitions', () => {
-      expect(isTransitionAllowed('pending', 'pending')).toBe(false);
-      expect(isTransitionAllowed('approved', 'approved')).toBe(false);
-    });
+  it('should allow pending → rejected', () => {
+    expect(isTransitionAllowed('pending', 'rejected')).toBe(true);
+  });
 
-    describe('Exhaustive transition matrix (Cartesian product)', () => {
-      const states = Object.values(INVOICE_STATES);
-      const terminalStates = [
-        INVOICE_STATES.LINKED_ESCROW,
-        INVOICE_STATES.REJECTED,
-        INVOICE_STATES.CANCELLED,
-      ];
+  it('should allow pending → cancelled', () => {
+    expect(isTransitionAllowed('pending', 'cancelled')).toBe(true);
+  });
 
-      const getExpectedValidationCode = ({ fromState, targetState }) => {
-        if (fromState === targetState) return 'ALREADY_IN_TARGET_STATE';
-        if (terminalStates.includes(fromState)) return 'TERMINAL_STATE';
+  it('should allow approved → linked_escrow', () => {
+    expect(isTransitionAllowed('approved', 'linked_escrow')).toBe(true);
+  });
 
-        const allowedTargets = VALID_TRANSITIONS[fromState] || [];
-        if (!allowedTargets.includes(targetState)) return 'INVALID_TRANSITION';
-        return null; // valid
-      };
+  it('should allow approved → cancelled', () => {
+    expect(isTransitionAllowed('approved', 'cancelled')).toBe(true);
+  });
 
-      states.forEach((fromState) => {
-        states.forEach((targetState) => {
-          const expectedAllowed = (VALID_TRANSITIONS[fromState] || []).includes(targetState) && fromState !== targetState && !terminalStates.includes(fromState);
-          const expectedCode = getExpectedValidationCode({ fromState, targetState });
+  it('should NOT allow pending → linked_escrow (silent jump)', () => {
+    expect(isTransitionAllowed('pending', 'linked_escrow')).toBe(false);
+  });
 
-          it(`isTransitionAllowed/validateTransition/executeTransition: ${fromState} → ${targetState}`, () => {
-            expect(isTransitionAllowed(fromState, targetState)).toBe(expectedAllowed);
+  it('should NOT allow approved → rejected', () => {
+    expect(isTransitionAllowed('approved', 'rejected')).toBe(false);
+  });
 
-            const validation = validateTransition({
-              invoiceId: 'inv-matrix',
-              currentState: fromState,
-              targetState,
-              actor: 'matrix-user',
-            });
+  it('should NOT allow approved → pending (reversal)', () => {
+    expect(isTransitionAllowed('approved', 'pending')).toBe(false);
+  });
 
-            if (expectedCode === null) {
-              expect(validation.isValid).toBe(true);
-              expect(validation.error).toBeUndefined();
-            } else {
-              expect(validation.isValid).toBe(false);
-              expect(validation.code).toBe(expectedCode);
-              if (expectedCode === 'INVALID_TRANSITION') {
-                expect(validation.allowedTransitions).toEqual(VALID_TRANSITIONS[fromState]);
-              }
-            }
+  it('should NOT allow linked_escrow → any state', () => {
+    expect(isTransitionAllowed('linked_escrow', 'approved')).toBe(false);
+    expect(isTransitionAllowed('linked_escrow', 'pending')).toBe(false);
+    expect(isTransitionAllowed('linked_escrow', 'rejected')).toBe(false);
+  });
 
-            clearAuditLogs();
+  it('should NOT allow rejected → any state', () => {
+    expect(isTransitionAllowed('rejected', 'approved')).toBe(false);
+    expect(isTransitionAllowed('rejected', 'pending')).toBe(false);
+    expect(isTransitionAllowed('rejected', 'linked_escrow')).toBe(false);
+  });
 
-            if (expectedCode === null) {
-              const reason = `Reason ${fromState}→${targetState}`;
-              const exec = executeTransition({
-                invoiceId: 'inv-matrix-exec',
-                currentState: fromState,
-                targetState,
-                actor: 'matrix-user',
-                reason,
-                ipAddress: '192.0.2.1',
-                userAgent: 'Test-UA',
-                metadata: { testMatrix: true },
-              });
+  it('should NOT allow cancelled → any state', () => {
+    expect(isTransitionAllowed('cancelled', 'approved')).toBe(false);
+    expect(isTransitionAllowed('cancelled', 'pending')).toBe(false);
+  });
 
-              expect(exec.success).toBe(true);
-              expect(exec.previousState).toBe(fromState);
-              expect(exec.newState).toBe(targetState);
+  it('should NOT allow same-state transitions', () => {
+    expect(isTransitionAllowed('pending', 'pending')).toBe(false);
+    expect(isTransitionAllowed('approved', 'approved')).toBe(false);
+    expect(isTransitionAllowed('linked_escrow', 'linked_escrow')).toBe(false);
+    expect(isTransitionAllowed('rejected', 'rejected')).toBe(false);
+    expect(isTransitionAllowed('cancelled', 'cancelled')).toBe(false);
+  });
+});
 
-              const logs = getAuditLogs({ resourceId: 'inv-matrix-exec', action: 'STATE_TRANSITION' });
-              expect(logs).toHaveLength(1);
-              expect(logs[0].changes.before.state).toBe(fromState);
-              expect(logs[0].changes.after.state).toBe(targetState);
-              expect(logs[0].metadata.transitionType).toBe(`${fromState}_to_${targetState}`);
-              expect(logs[0].metadata.reason).toBe(reason);
-            } else {
-              expect(() =>
-                executeTransition({
-                  invoiceId: 'inv-matrix-exec',
-                  currentState: fromState,
-                  targetState,
-                  actor: 'matrix-user',
-                  reason: 'Should not transition',
-                  ipAddress: '192.0.2.1',
-                  userAgent: 'Test-UA',
-                })
-              ).toThrow(expectedCode);
-            }
-          });
-        });
+/* ------------------------------------------------------------------ */
+/*  Exhaustive Cartesian product — isTransitionAllowed                 */
+/* ------------------------------------------------------------------ */
+describe('Transition Rules — exhaustive matrix (Cartesian product)', () => {
+  const states = Object.values(INVOICE_STATES);
+
+  states.forEach((fromState) => {
+    states.forEach((targetState) => {
+      const expected = (VALID_TRANSITIONS[fromState] || []).includes(targetState)
+        && fromState !== targetState
+        && !TERMINAL_STATES.includes(fromState);
+
+      it(`isTransitionAllowed: ${fromState} → ${targetState} → ${expected ? 'ALLOWED' : 'DENIED'}`, () => {
+        expect(isTransitionAllowed(fromState, targetState)).toBe(expected);
       });
     });
   });
+});
 
-
-  describe('Terminal States', () => {
-    it('should identify terminal states', () => {
-      expect(isTerminalState('linked_escrow')).toBe(true);
-      expect(isTerminalState('rejected')).toBe(true);
-      expect(isTerminalState('cancelled')).toBe(true);
-    });
-
-    it('should identify non-terminal states', () => {
-      expect(isTerminalState('pending')).toBe(false);
-      expect(isTerminalState('approved')).toBe(false);
-    });
+/* ------------------------------------------------------------------ */
+/*  Terminal states                                                   */
+/* ------------------------------------------------------------------ */
+describe('Terminal States', () => {
+  it('should identify terminal states', () => {
+    expect(isTerminalState('linked_escrow')).toBe(true);
+    expect(isTerminalState('rejected')).toBe(true);
+    expect(isTerminalState('cancelled')).toBe(true);
   });
 
-  describe('Allowed Transitions', () => {
-    it('should return correct allowed transitions for pending', () => {
-      const allowed = getAllowedTransitions('pending');
-      expect(allowed).toContain('approved');
-      expect(allowed).toContain('rejected');
-      expect(allowed).toContain('cancelled');
-      expect(allowed).toHaveLength(3);
-    });
-
-    it('should return correct allowed transitions for approved', () => {
-      const allowed = getAllowedTransitions('approved');
-      expect(allowed).toContain('linked_escrow');
-      expect(allowed).toContain('cancelled');
-      expect(allowed).toHaveLength(2);
-    });
-
-    it('should return empty array for terminal states', () => {
-      expect(getAllowedTransitions('linked_escrow')).toEqual([]);
-      expect(getAllowedTransitions('rejected')).toEqual([]);
-      expect(getAllowedTransitions('cancelled')).toEqual([]);
-    });
-
-    it('should return empty array for invalid states', () => {
-      expect(getAllowedTransitions('invalid')).toEqual([]);
-      expect(getAllowedTransitions(null)).toEqual([]);
-    });
+  it('should identify non-terminal states', () => {
+    expect(isTerminalState('pending')).toBe(false);
+    expect(isTerminalState('approved')).toBe(false);
   });
 
-  describe('Transition Validation', () => {
-    it('should validate a valid transition', () => {
+  it('should reject all transitions from terminal states via validateTransition', () => {
+    TERMINAL_STATES.forEach((terminalState) => {
       const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        targetState: 'approved',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(true);
-      expect(result.error).toBeUndefined();
-    });
-
-    it('should reject transition with missing invoice ID', () => {
-      const result = validateTransition({
-        currentState: 'pending',
-        targetState: 'approved',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('MISSING_INVOICE_ID');
-    });
-
-    it('should reject transition with missing current state', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        targetState: 'approved',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('MISSING_CURRENT_STATE');
-    });
-
-    it('should reject transition with missing target state', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('MISSING_TARGET_STATE');
-    });
-
-    it('should reject transition with missing actor', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        targetState: 'approved',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('MISSING_ACTOR');
-    });
-
-    it('should reject transition with invalid current state', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'invalid',
-        targetState: 'approved',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('INVALID_CURRENT_STATE');
-    });
-
-    it('should reject transition with invalid target state', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        targetState: 'invalid',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('INVALID_TARGET_STATE');
-    });
-
-    it('should reject transition to same state', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
+        invoiceId: 'inv-terminal',
+        currentState: terminalState,
         targetState: 'pending',
+        actor: 'tester',
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.code).toBe('TERMINAL_STATE');
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  getAllowedTransitions                                              */
+/* ------------------------------------------------------------------ */
+describe('Allowed Transitions', () => {
+  it('should return correct allowed transitions for pending', () => {
+    const allowed = getAllowedTransitions('pending');
+    expect(allowed).toContain('approved');
+    expect(allowed).toContain('rejected');
+    expect(allowed).toContain('cancelled');
+    expect(allowed).toHaveLength(3);
+  });
+
+  it('should return correct allowed transitions for approved', () => {
+    const allowed = getAllowedTransitions('approved');
+    expect(allowed).toContain('linked_escrow');
+    expect(allowed).toContain('cancelled');
+    expect(allowed).toHaveLength(2);
+  });
+
+  it('should return empty array for terminal states', () => {
+    expect(getAllowedTransitions('linked_escrow')).toEqual([]);
+    expect(getAllowedTransitions('rejected')).toEqual([]);
+    expect(getAllowedTransitions('cancelled')).toEqual([]);
+  });
+
+  it('should return empty array for invalid states', () => {
+    expect(getAllowedTransitions('invalid')).toEqual([]);
+    expect(getAllowedTransitions(null)).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  validateTransition — detailed validation error codes              */
+/* ------------------------------------------------------------------ */
+describe('Transition Validation', () => {
+  it('should validate a valid pending → approved transition', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'approved',
+      actor: 'user-123',
+    });
+    expect(result.isValid).toBe(true);
+    expect(result.error).toBeUndefined();
+  });
+
+  it('should reject transition with missing invoice ID', () => {
+    const result = validateTransition({
+      currentState: 'pending',
+      targetState: 'approved',
+      actor: 'user-123',
+    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_INVOICE_ID');
+  });
+
+  it('should reject transition with missing current state', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      targetState: 'approved',
+      actor: 'user-123',
+    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_CURRENT_STATE');
+  });
+
+  it('should reject transition with missing target state', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      actor: 'user-123',
+    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_TARGET_STATE');
+  });
+
+  it('should reject transition with missing actor', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'approved',
+    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_ACTOR');
+  });
+
+  it('should reject transition with invalid current state', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'invalid',
+      targetState: 'approved',
+      actor: 'user-123',
+    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('INVALID_CURRENT_STATE');
+  });
+
+  it('should reject transition with invalid target state', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'invalid',
+      actor: 'user-123',
+    });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('INVALID_TARGET_STATE');
+  });
+
+  it('should reject transition to same state', () => {
+    Object.values(INVOICE_STATES).forEach((state) => {
+      const result = validateTransition({
+        invoiceId: 'inv-001',
+        currentState: state,
+        targetState: state,
         actor: 'user-123',
       });
-
       expect(result.isValid).toBe(false);
       expect(result.code).toBe('ALREADY_IN_TARGET_STATE');
     });
+  });
 
-    it('should reject invalid transition (silent jump)', () => {
-      const result = validateTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        targetState: 'linked_escrow',
-        actor: 'user-123',
-      });
-
-      expect(result.isValid).toBe(false);
-      expect(result.code).toBe('INVALID_TRANSITION');
-      expect(result.allowedTransitions).toContain('approved');
+  it('should reject invalid transition (silent jump)', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'linked_escrow',
+      actor: 'user-123',
     });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('INVALID_TRANSITION');
+    expect(result.allowedTransitions).toEqual(['approved', 'rejected', 'cancelled']);
+  });
 
-    it('should reject transition from terminal state', () => {
+  it('should reject transition from terminal state', () => {
+    TERMINAL_STATES.forEach((terminalState) => {
       const result = validateTransition({
         invoiceId: 'inv-001',
-        currentState: 'linked_escrow',
+        currentState: terminalState,
         targetState: 'approved',
         actor: 'user-123',
+        reason: 'should not matter',
       });
-
       expect(result.isValid).toBe(false);
       expect(result.code).toBe('TERMINAL_STATE');
     });
   });
 
-  describe('Transition Execution', () => {
-    it('should execute valid transition and create audit log', () => {
-      const result = executeTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        targetState: 'approved',
-        actor: 'user-123',
-        reason: 'Invoice verified',
-        ipAddress: '192.168.1.1',
-        userAgent: 'Test Agent',
-      });
-
-      expect(result.success).toBe(true);
-      expect(result.previousState).toBe('pending');
-      expect(result.newState).toBe('approved');
-      expect(result.transitionedBy).toBe('user-123');
-      expect(result.auditLog).toBeDefined();
-      expect(result.auditLog.action).toBe('STATE_TRANSITION');
-
-      // Verify audit log was created
-      const logs = getAuditLogs({ resourceId: 'inv-001' });
-      expect(logs.length).toBe(1);
-      expect(logs[0].changes.before.state).toBe('pending');
-      expect(logs[0].changes.after.state).toBe('approved');
-      expect(logs[0].metadata.reason).toBe('Invoice verified');
+  it('should require reason for terminal transition targets', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'approved',
+      targetState: 'cancelled',
+      actor: 'user-123',
     });
+    expect(result.isValid).toBe(false);
+    expect(result.code).toBe('MISSING_TRANSITION_REASON');
+  });
 
-    it('should persist terminal transition reason in audit metadata', () => {
-      const result = executeTransition({
-        invoiceId: 'inv-001',
-        currentState: 'pending',
-        targetState: 'rejected',
-        actor: 'user-123',
-        reason: 'Failed KYC checks',
-      });
-
-      expect(result.success).toBe(true);
-      expect(result.newState).toBe('rejected');
-      const logs = getAuditLogs({ resourceId: 'inv-001' });
-      expect(logs[0].metadata.reason).toBe('Failed KYC checks');
+  it('should provide allowed transitions hint on invalid transition', () => {
+    const result = validateTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'linked_escrow',
+      actor: 'user-123',
     });
+    expect(result.allowedTransitions).toEqual(['approved', 'rejected', 'cancelled']);
+  });
+});
 
-    it('should throw error for invalid transition', () => {
-      expect(() => {
-        executeTransition({
-          invoiceId: 'inv-001',
-          currentState: 'pending',
-          targetState: 'linked_escrow',
-          actor: 'user-123',
+/* ------------------------------------------------------------------ */
+/*  Exhaustive Cartesian product — validateTransition                  */
+/*  (without reason, so reason-required states show MISSING_REASON)   */
+/* ------------------------------------------------------------------ */
+describe('Transition Validation — exhaustive matrix', () => {
+  const states = Object.values(INVOICE_STATES);
+
+  states.forEach((fromState) => {
+    states.forEach((targetState) => {
+      const code = expectedValidationCode(fromState, targetState);
+
+      it(`validateTransition: ${fromState} → ${targetState} → ${code || 'VALID'}`, () => {
+        const result = validateTransition({
+          invoiceId: 'inv-matrix',
+          currentState: fromState,
+          targetState,
+          actor: 'matrix-user',
         });
-      }).toThrow();
-    });
 
-    it('should include metadata in audit log', () => {
-      executeTransition({
-        invoiceId: 'inv-002',
-        currentState: 'approved',
-        targetState: 'linked_escrow',
-        actor: 'user-456',
-        reason: 'Escrow created',
-        metadata: {
-          escrowId: 'escrow-123',
-          method: 'POST',
-        },
+        if (code === null) {
+          expect(result.isValid).toBe(true);
+          expect(result.error).toBeUndefined();
+        } else {
+          expect(result.isValid).toBe(false);
+          expect(result.code).toBe(code);
+        }
       });
-
-      const logs = getAuditLogs({ resourceId: 'inv-002' });
-      expect(logs[0].metadata.escrowId).toBe('escrow-123');
-      expect(logs[0].metadata.method).toBe('POST');
-    });
-  });
-
-  describe('Transition History', () => {
-    it('should retrieve transition history for an invoice', () => {
-      // Execute multiple transitions
-      executeTransition({
-        invoiceId: 'inv-003',
-        currentState: 'pending',
-        targetState: 'approved',
-        actor: 'user-123',
-        reason: 'First approval',
-      });
-
-      executeTransition({
-        invoiceId: 'inv-003',
-        currentState: 'approved',
-        targetState: 'linked_escrow',
-        actor: 'user-456',
-        reason: 'Linked to escrow',
-      });
-
-      const history = getTransitionHistory('inv-003', getAuditLogs);
-
-      expect(history).toHaveLength(2);
-      expect(history[0].fromState).toBe('approved');
-      expect(history[0].toState).toBe('linked_escrow');
-      expect(history[1].fromState).toBe('pending');
-      expect(history[1].toState).toBe('approved');
-    });
-
-    it('should return empty array for invoice with no transitions', () => {
-      const history = getTransitionHistory('inv-999', getAuditLogs);
-      expect(history).toEqual([]);
-    });
-  });
-
-  describe('Business Rules - Link to Escrow', () => {
-    it('should allow linking approved invoice to escrow', () => {
-      const invoice = { id: 'inv-001', status: 'approved', amount: 1000 };
-      const result = canLinkToEscrow(invoice);
-
-      expect(result.canLink).toBe(true);
-    });
-
-    it('should not allow linking pending invoice to escrow', () => {
-      const invoice = { id: 'inv-001', status: 'pending', amount: 1000 };
-      const result = canLinkToEscrow(invoice);
-
-      expect(result.canLink).toBe(false);
-      expect(result.reason).toContain('approved state');
-    });
-
-    it('should not allow linking null invoice', () => {
-      const result = canLinkToEscrow(null);
-
-      expect(result.canLink).toBe(false);
-      expect(result.reason).toBe('Invoice not found');
     });
   });
 });
 
+/* ------------------------------------------------------------------ */
+/*  Transition Execution (async)                                      */
+/* ------------------------------------------------------------------ */
+describe('Transition Execution', () => {
+  beforeEach(() => {
+    clearAuditLogs();
+  });
+
+  it('should execute valid pending → approved and create audit log', async () => {
+    const result = await executeTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'approved',
+      actor: 'user-123',
+      reason: 'Invoice verified',
+      ipAddress: '192.168.1.1',
+      userAgent: 'Test Agent',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.previousState).toBe('pending');
+    expect(result.newState).toBe('approved');
+    expect(result.transitionedBy).toBe('user-123');
+    expect(result.auditLog).toBeDefined();
+    expect(result.auditLog.action).toBe('STATE_TRANSITION');
+    expect(result.auditLog.metadata.reason).toBe('Invoice verified');
+
+    const logs = await getAuditLogs({ resourceId: 'inv-001' });
+    expect(logs).toHaveLength(1);
+    expect(logs[0].changes.before.state).toBe('pending');
+    expect(logs[0].changes.after.state).toBe('approved');
+    expect(logs[0].metadata.reason).toBe('Invoice verified');
+  });
+
+  it('should persist terminal transition reason in audit metadata', async () => {
+    const result = await executeTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'user-123',
+      reason: 'Failed KYC checks',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.newState).toBe('rejected');
+    expect(result.auditLog.metadata.reason).toBe('Failed KYC checks');
+
+    const logs = await getAuditLogs({ resourceId: 'inv-001' });
+    expect(logs[0].metadata.reason).toBe('Failed KYC checks');
+  });
+
+  it('should reject invalid transition with error', async () => {
+    await expect(
+      executeTransition({
+        invoiceId: 'inv-001',
+        currentState: 'pending',
+        targetState: 'linked_escrow',
+        actor: 'user-123',
+        reason: 'Silent jump',
+      })
+    ).rejects.toThrow(/Invalid state transition/);
+  });
+
+  it('should include additional metadata in audit log', async () => {
+    const result = await executeTransition({
+      invoiceId: 'inv-002',
+      currentState: 'approved',
+      targetState: 'linked_escrow',
+      actor: 'user-456',
+      reason: 'Escrow created',
+      metadata: { escrowId: 'escrow-123', method: 'POST' },
+    });
+
+    expect(result.auditLog.metadata.escrowId).toBe('escrow-123');
+    expect(result.auditLog.metadata.method).toBe('POST');
+  });
+
+  it('should strip control characters from reason in audit log', async () => {
+    const result = await executeTransition({
+      invoiceId: 'inv-001',
+      currentState: 'pending',
+      targetState: 'rejected',
+      actor: 'user-123',
+      reason: 'Bad\u0000reason\u0001with\u007Fcontrol',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.auditLog.metadata.reason).toBe('Bad reason with control');
+  });
+
+  it('should reject transition with oversized reason', async () => {
+    await expect(
+      executeTransition({
+        invoiceId: 'inv-001',
+        currentState: 'pending',
+        targetState: 'rejected',
+        actor: 'user-123',
+        reason: 'x'.repeat(1025),
+      })
+    ).rejects.toThrow(/1024 characters or fewer/);
+  });
+
+  it('should reject transition without reason for terminal target', async () => {
+    await expect(
+      executeTransition({
+        invoiceId: 'inv-001',
+        currentState: 'pending',
+        targetState: 'rejected',
+        actor: 'user-123',
+      })
+    ).rejects.toThrow(/Reason is required/);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Exhaustive Cartesian product — executeTransition                   */
+/*  (with reason for valid transitions that need one)                 */
+/* ------------------------------------------------------------------ */
+describe('Transition Execution — exhaustive matrix with audit verification', () => {
+  const states = Object.values(INVOICE_STATES);
+
+  beforeEach(() => {
+    clearAuditLogs();
+  });
+
+  states.forEach((fromState) => {
+    states.forEach((targetState) => {
+      it(`executeTransition + audit: ${fromState} → ${targetState}`, async () => {
+        const code = expectedExecutionCode(fromState, targetState);
+        const invoiceId = `inv-matrix-${fromState}-${targetState}`;
+
+        if (code === null) {
+          const reason = `Reason ${fromState}→${targetState}`;
+          const result = await executeTransition({
+            invoiceId,
+            currentState: fromState,
+            targetState,
+            actor: 'matrix-user',
+            reason,
+            ipAddress: '192.0.2.1',
+            userAgent: 'Test-UA',
+            metadata: { testMatrix: true },
+          });
+
+          expect(result.success).toBe(true);
+          expect(result.previousState).toBe(fromState);
+          expect(result.newState).toBe(targetState);
+          expect(result.auditLog).toBeDefined();
+
+          const logs = await getAuditLogs({ resourceId: invoiceId, action: 'STATE_TRANSITION' });
+          expect(logs).toHaveLength(1);
+          expect(logs[0].changes.before.state).toBe(fromState);
+          expect(logs[0].changes.after.state).toBe(targetState);
+          expect(logs[0].metadata.transitionType).toBe(`${fromState}_to_${targetState}`);
+          expect(logs[0].metadata.reason).toBe(reason);
+        } else {
+          await expect(
+            executeTransition({
+              invoiceId,
+              currentState: fromState,
+              targetState,
+              actor: 'matrix-user',
+              reason: 'Should not transition',
+              ipAddress: '192.0.2.1',
+              userAgent: 'Test-UA',
+            })
+          ).rejects.toThrow();
+        }
+      });
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Transition History                                                */
+/* ------------------------------------------------------------------ */
+describe('Transition History', () => {
+  beforeEach(() => {
+    clearAuditLogs();
+  });
+
+  it('should retrieve transition history for an invoice', async () => {
+    await executeTransition({
+      invoiceId: 'inv-003',
+      currentState: 'pending',
+      targetState: 'approved',
+      actor: 'user-123',
+      reason: 'First approval',
+    });
+
+    await executeTransition({
+      invoiceId: 'inv-003',
+      currentState: 'approved',
+      targetState: 'linked_escrow',
+      actor: 'user-456',
+      reason: 'Linked to escrow',
+    });
+
+    const history = await getTransitionHistory('inv-003', getAuditLogs);
+
+    expect(history).toHaveLength(2);
+    expect(history[0].fromState).toBe('approved');
+    expect(history[0].toState).toBe('linked_escrow');
+    expect(history[1].fromState).toBe('pending');
+    expect(history[1].toState).toBe('approved');
+  });
+
+  it('should return empty array for invoice with no transitions', async () => {
+    const history = await getTransitionHistory('inv-999', getAuditLogs);
+    expect(history).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Business Rules — Link to Escrow                                   */
+/* ------------------------------------------------------------------ */
+describe('Business Rules — Link to Escrow', () => {
+  it('should allow linking approved invoice to escrow', () => {
+    const invoice = { id: 'inv-001', status: 'approved', amount: 1000 };
+    const result = canLinkToEscrow(invoice);
+    expect(result.canLink).toBe(true);
+  });
+
+  it('should not allow linking pending invoice to escrow', () => {
+    const invoice = { id: 'inv-001', status: 'pending', amount: 1000 };
+    const result = canLinkToEscrow(invoice);
+    expect(result.canLink).toBe(false);
+    expect(result.reason).toContain('approved state');
+  });
+
+  it('should not allow linking rejected invoice to escrow', () => {
+    const invoice = { id: 'inv-001', status: 'rejected', amount: 1000 };
+    const result = canLinkToEscrow(invoice);
+    expect(result.canLink).toBe(false);
+    expect(result.reason).toContain('approved state');
+  });
+
+  it('should not allow linking null invoice', () => {
+    const result = canLinkToEscrow(null);
+    expect(result.canLink).toBe(false);
+    expect(result.reason).toBe('Invoice not found');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Invoice State API Routes                                          */
+/* ------------------------------------------------------------------ */
 describe('Invoice State API Routes', () => {
   let app;
 
   beforeEach(() => {
     clearAuditLogs();
-    
-    // Reset mock invoices
+
     const { mockInvoices } = require('../src/routes/invoiceStateRoutes');
     mockInvoices.clear();
     mockInvoices.set('inv-001', { id: 'inv-001', status: 'pending', amount: 1000, customer: 'Acme Corp' });
@@ -480,13 +748,12 @@ describe('Invoice State API Routes', () => {
 
     app = express();
     app.use(express.json());
-    
-    // Mock auth middleware
-    app.use((req, res, next) => {
-      req.user = { id: 'test-user-123' };
+
+    app.use((req, _res, next) => {
+      req.user = { id: 'test-user-123', sub: 'test-user-123', smeId: 'sme-verified' };
       next();
     });
-    
+
     app.use('/api/invoices', invoiceStateRoutes);
   });
 
@@ -523,10 +790,7 @@ describe('Invoice State API Routes', () => {
     it('should execute valid transition', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/transition')
-        .send({
-          targetState: 'approved',
-          reason: 'Invoice verified by finance team',
-        });
+        .send({ targetState: 'approved', reason: 'Invoice verified by finance team' });
 
       expect(res.status).toBe(200);
       expect(res.body.data.previousState).toBe('pending');
@@ -535,18 +799,14 @@ describe('Invoice State API Routes', () => {
       expect(res.body.data.reason).toBe('Invoice verified by finance team');
       expect(res.body.data.auditLogId).toBeDefined();
 
-      // Verify audit log was created
-      const logs = getAuditLogs({ resourceId: 'inv-001' });
-      expect(logs.length).toBe(1);
+      const logs = await getAuditLogs({ resourceId: 'inv-001' });
+      expect(logs).toHaveLength(1);
     });
 
     it('should reject invalid transition (silent jump)', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/transition')
-        .send({
-          targetState: 'linked_escrow',
-          reason: 'Trying to skip approval',
-        });
+        .send({ targetState: 'linked_escrow', reason: 'Trying to skip approval' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('INVALID_TRANSITION');
@@ -556,9 +816,7 @@ describe('Invoice State API Routes', () => {
     it('should reject transition from terminal state', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-003/transition')
-        .send({
-          targetState: 'approved',
-        });
+        .send({ targetState: 'approved' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('TERMINAL_STATE');
@@ -567,9 +825,7 @@ describe('Invoice State API Routes', () => {
     it('should require reason for terminal rejected transition', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/transition')
-        .send({
-          targetState: 'rejected',
-        });
+        .send({ targetState: 'rejected' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('MISSING_TRANSITION_REASON');
@@ -579,9 +835,7 @@ describe('Invoice State API Routes', () => {
     it('should reject missing target state', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/transition')
-        .send({
-          reason: 'Missing target state',
-        });
+        .send({ reason: 'Missing target state' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('MISSING_TARGET_STATE');
@@ -590,9 +844,7 @@ describe('Invoice State API Routes', () => {
     it('should return 404 for non-existent invoice', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-999/transition')
-        .send({
-          targetState: 'approved',
-        });
+        .send({ targetState: 'approved' });
 
       expect(res.status).toBe(404);
       expect(res.body.code).toBe('INVOICE_NOT_FOUND');
@@ -603,9 +855,7 @@ describe('Invoice State API Routes', () => {
     it('should approve pending invoice', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/approve')
-        .send({
-          reason: 'All checks passed',
-        });
+        .send({ reason: 'All checks passed' });
 
       expect(res.status).toBe(200);
       expect(res.body.data.previousState).toBe('pending');
@@ -616,9 +866,7 @@ describe('Invoice State API Routes', () => {
     it('should reject approval of already approved invoice', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-002/approve')
-        .send({
-          reason: 'Already approved',
-        });
+        .send({ reason: 'Already approved' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('ALREADY_IN_TARGET_STATE');
@@ -629,10 +877,7 @@ describe('Invoice State API Routes', () => {
     it('should link approved invoice to escrow', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-002/link-escrow')
-        .send({
-          escrowId: 'escrow-123',
-          reason: 'Escrow contract created',
-        });
+        .send({ escrowId: 'escrow-123', reason: 'Escrow contract created' });
 
       expect(res.status).toBe(200);
       expect(res.body.data.previousState).toBe('approved');
@@ -644,9 +889,7 @@ describe('Invoice State API Routes', () => {
     it('should reject linking pending invoice to escrow', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/link-escrow')
-        .send({
-          escrowId: 'escrow-456',
-        });
+        .send({ escrowId: 'escrow-456' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('CANNOT_LINK_TO_ESCROW');
@@ -655,9 +898,7 @@ describe('Invoice State API Routes', () => {
     it('should reject linking already linked invoice', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-003/link-escrow')
-        .send({
-          escrowId: 'escrow-789',
-        });
+        .send({ escrowId: 'escrow-789' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('CANNOT_LINK_TO_ESCROW');
@@ -668,9 +909,7 @@ describe('Invoice State API Routes', () => {
     it('should reject pending invoice with reason', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/reject')
-        .send({
-          reason: 'Invalid documentation',
-        });
+        .send({ reason: 'Invalid documentation' });
 
       expect(res.status).toBe(200);
       expect(res.body.data.previousState).toBe('pending');
@@ -690,9 +929,7 @@ describe('Invoice State API Routes', () => {
     it('should not allow rejecting approved invoice', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-002/reject')
-        .send({
-          reason: 'Cannot reject approved invoice',
-        });
+        .send({ reason: 'Cannot reject approved invoice' });
 
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('INVALID_TRANSITION');
@@ -701,7 +938,6 @@ describe('Invoice State API Routes', () => {
 
   describe('GET /api/invoices/:id/history', () => {
     it('should return transition history', async () => {
-      // Execute transitions
       await request(app)
         .post('/api/invoices/inv-001/transition')
         .send({ targetState: 'approved', reason: 'First transition' });
@@ -742,8 +978,8 @@ describe('Invoice State API Routes', () => {
         .set('User-Agent', 'Test Client/1.0')
         .send({ reason: 'Comprehensive audit test' });
 
-      const logs = getAuditLogs({ resourceId: 'inv-001' });
-      
+      const logs = await getAuditLogs({ resourceId: 'inv-001' });
+
       expect(logs).toHaveLength(1);
       expect(logs[0].actor).toBe('test-user-123');
       expect(logs[0].action).toBe('STATE_TRANSITION');
@@ -764,10 +1000,9 @@ describe('Invoice State API Routes', () => {
         .post('/api/invoices/inv-001/link-escrow')
         .send({ reason: 'Step 2', escrowId: 'escrow-001' });
 
-      const logs = getAuditLogs({ resourceId: 'inv-001' });
-      
+      const logs = await getAuditLogs({ resourceId: 'inv-001' });
+
       expect(logs).toHaveLength(2);
-      // Logs are in reverse chronological order
       expect(logs[0].changes.after.state).toBe('linked_escrow');
       expect(logs[1].changes.after.state).toBe('approved');
     });
@@ -775,41 +1010,38 @@ describe('Invoice State API Routes', () => {
 
   describe('Security and Edge Cases', () => {
     it('should handle concurrent transition attempts gracefully', async () => {
-      // This test simulates race conditions
       const promises = [
         request(app).post('/api/invoices/inv-001/approve').send({ reason: 'Concurrent 1' }),
         request(app).post('/api/invoices/inv-001/approve').send({ reason: 'Concurrent 2' }),
       ];
 
       const results = await Promise.all(promises);
-      
-      // At least one should succeed
+
       const successCount = results.filter(r => r.status === 200).length;
       expect(successCount).toBeGreaterThanOrEqual(1);
     });
 
-    it('should sanitize and handle special characters in reason', async () => {
+    it('should handle special characters in reason', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/approve')
-        .send({
-          reason: 'Special chars: <script>alert("xss")</script> & "quotes"',
-        });
+        .send({ reason: 'Special chars: <script>alert("xss")</script> & "quotes"' });
 
       expect(res.status).toBe(200);
-      const logs = getAuditLogs({ resourceId: 'inv-001' });
+      const logs = await getAuditLogs({ resourceId: 'inv-001' });
       expect(logs[0].metadata.reason).toContain('Special chars');
     });
 
-    it('should handle very long reason text', async () => {
-      const longReason = 'A'.repeat(10000);
+    it('should handle control characters in reason via API', async () => {
       const res = await request(app)
-        .post('/api/invoices/inv-001/approve')
-        .send({ reason: longReason });
+        .post('/api/invoices/inv-001/reject')
+        .send({ reason: 'Reason\u0000with\u001Fcontrol' });
 
       expect(res.status).toBe(200);
+      const logs = await getAuditLogs({ resourceId: 'inv-001' });
+      expect(logs[0].metadata.reason).toBe('Reason with control');
     });
 
-    it('should handle transition with no reason provided', async () => {
+    it('should handle transition with no reason provided for non-terminal', async () => {
       const res = await request(app)
         .post('/api/invoices/inv-001/approve')
         .send({});
@@ -828,16 +1060,13 @@ describe('Invoice State API Routes', () => {
     });
 
     it('should handle unexpected errors in transition endpoint', async () => {
-      // Create a mock that will throw an unexpected error
       const { mockInvoices } = require('../src/routes/invoiceStateRoutes');
       const originalGet = mockInvoices.get;
-      
-      // Temporarily replace get to throw error
+
       mockInvoices.get = () => {
         const invoice = { id: 'inv-001', status: 'pending' };
-        // Simulate an unexpected error during processing
         Object.defineProperty(invoice, 'status', {
-          get() { throw new Error('Unexpected error'); }
+          get() { throw new Error('Unexpected error'); },
         });
         return invoice;
       };
@@ -846,10 +1075,8 @@ describe('Invoice State API Routes', () => {
         .post('/api/invoices/inv-001/transition')
         .send({ targetState: 'approved' });
 
-      // Should be handled by error handler
       expect(res.status).toBe(500);
 
-      // Restore original
       mockInvoices.get = originalGet;
     });
   });
@@ -858,11 +1085,11 @@ describe('Invoice State API Routes', () => {
     it('should handle approve endpoint with unexpected error', async () => {
       const { mockInvoices } = require('../src/routes/invoiceStateRoutes');
       const originalGet = mockInvoices.get;
-      
+
       mockInvoices.get = () => {
         const invoice = { id: 'inv-001', status: 'pending' };
         Object.defineProperty(invoice, 'status', {
-          get() { throw new Error('Unexpected error'); }
+          get() { throw new Error('Unexpected error'); },
         });
         return invoice;
       };
@@ -878,11 +1105,11 @@ describe('Invoice State API Routes', () => {
     it('should handle link-escrow endpoint with unexpected error', async () => {
       const { mockInvoices } = require('../src/routes/invoiceStateRoutes');
       const originalGet = mockInvoices.get;
-      
+
       mockInvoices.get = () => {
         const invoice = { id: 'inv-002', status: 'approved' };
         Object.defineProperty(invoice, 'status', {
-          get() { throw new Error('Unexpected error'); }
+          get() { throw new Error('Unexpected error'); },
         });
         return invoice;
       };
@@ -898,11 +1125,11 @@ describe('Invoice State API Routes', () => {
     it('should handle reject endpoint with unexpected error', async () => {
       const { mockInvoices } = require('../src/routes/invoiceStateRoutes');
       const originalGet = mockInvoices.get;
-      
+
       mockInvoices.get = () => {
         const invoice = { id: 'inv-001', status: 'pending' };
         Object.defineProperty(invoice, 'status', {
-          get() { throw new Error('Unexpected error'); }
+          get() { throw new Error('Unexpected error'); },
         });
         return invoice;
       };

@@ -188,9 +188,11 @@ describe('Idempotency Middleware', () => {
       .post('/api/invest/fund-invoice')
       .set('Idempotency-Key', key)
       .send(validBody({ investmentAmount: 2000 }))
-      .expect(409);
+      .expect(409)
+      .expect('Content-Type', /application\/problem\+json/);
 
-    expect(res.body.error).toMatch(/different request body/);
+    expect(res.body.detail).toMatch(/different request body/);
+    expect(res.body.type).toMatch(/conflict/);
   });
 
   // -- Multiple different keys --------------------------------------------

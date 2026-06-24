@@ -225,8 +225,10 @@ describe('StorageService Unit - File Validation', () => {
   describe('_sanitizeFilename', () => {
     const svc = new StorageService();
 
-    it('should strip directory traversal attempts', () => {
-      expect(svc._sanitizeFilename('../../etc/passwd')).toBe('passwd');
+    it('should reject directory traversal attempts', () => {
+      expect(() =>
+        svc._sanitizeFilename('../../etc/passwd')
+      ).toThrow('Path traversal detected');
     });
 
     it('should handle simple filename', () => {
@@ -242,13 +244,13 @@ describe('StorageService Unit - File Validation', () => {
       expect(result).toBe('bad_chars_here_.pdf');
     });
 
-    it('should return "unnamed" for empty input', () => {
-      expect(svc._sanitizeFilename('')).toBe('unnamed');
+    it('should reject empty input', () => {
+      expect(() => svc._sanitizeFilename('')).toThrow('Invalid filename');
     });
 
-    it('should return "unnamed" for non-string input', () => {
-      expect(svc._sanitizeFilename(null)).toBe('unnamed');
-      expect(svc._sanitizeFilename(undefined)).toBe('unnamed');
+    it('should reject non-string input', () => {
+      expect(() => svc._sanitizeFilename(null)).toThrow('Invalid filename');
+      expect(() => svc._sanitizeFilename(undefined)).toThrow('Invalid filename');
     });
 
     it('should truncate long filenames', () => {
@@ -257,9 +259,11 @@ describe('StorageService Unit - File Validation', () => {
       expect(result.length).toBeLessThanOrEqual(255);
     });
 
-    it('should handle Windows backslash traversal', () => {
-      expect(svc._sanitizeFilename('..\\..\\windows\\system32')).toBe('system32');
-    });
+  it('should reject Windows traversal attempts', () => {
+    expect(() =>
+      svc._sanitizeFilename('..\\..\\windows\\system32')
+    ).toThrow();
+  });
 
     it('should handle angle brackets in filename', () => {
       const result = svc._sanitizeFilename('<script>alert(1)</script>.pdf');
@@ -297,6 +301,46 @@ describe('StorageService Unit - File Validation', () => {
 
     it('should reject empty string', () => {
       expect(svc._validateMimeType('')).toBe(false);
+    });
+  });
+
+  describe('_validateTenantId', () => {
+    const svc = new StorageService();
+
+    it('accepts valid tenant ids', () => {
+      expect(svc._validateTenantId('tenant-123')).toBe(true);
+    });
+
+    it('rejects path traversal', () => {
+      expect(svc._validateTenantId('../../admin')).toBe(false);
+    });
+
+    it('rejects slashes', () => {
+      expect(svc._validateTenantId('tenant/admin')).toBe(false);
+    });
+
+    it('rejects empty values', () => {
+      expect(svc._validateTenantId('')).toBe(false);
+    });
+  });
+
+  describe('_validateInvoiceId', () => {
+    const svc = new StorageService();
+
+    it('accepts valid invoice ids', () => {
+      expect(svc._validateInvoiceId('inv-123')).toBe(true);
+    });
+
+    it('rejects traversal attempts', () => {
+      expect(svc._validateInvoiceId('../../invoice')).toBe(false);
+    });
+
+    it('rejects slashes', () => {
+      expect(svc._validateInvoiceId('inv/123')).toBe(false);
+    });
+
+    it('rejects empty values', () => {
+      expect(svc._validateInvoiceId('')).toBe(false);
     });
   });
 
@@ -343,6 +387,30 @@ describe('StorageService Unit - File Validation', () => {
 
   describe('getPresignedUploadUrl validation', () => {
     const svc = new StorageService();
+
+    it('rejects invalid tenant ids', async () => {
+      await expect(
+        svc.getPresignedUploadUrl({
+          tenantId: '../../admin',
+          invoiceId: 'inv1',
+          fileName: 'file.pdf',
+          mimeType: 'application/pdf',
+          fileSize: 100,
+        })
+      ).rejects.toThrow();
+    });
+
+    it('rejects invalid invoice ids', async () => {
+      await expect(
+        svc.getPresignedUploadUrl({
+          tenantId: 'tenant1',
+          invoiceId: '../../invoice',
+          fileName: 'file.pdf',
+          mimeType: 'application/pdf',
+          fileSize: 100,
+        })
+      ).rejects.toThrow();
+    });
 
     it('should reject oversized file sizes', async () => {
       await expect(
@@ -445,5 +513,21 @@ describe('InvoiceFile Route - Presigned Upload (POST /api/invoices/:id/presigned
     expect(bodyString).not.toContain('AKIA');
     expect(bodyString).not.toContain('secretAccessKey');
     expect(bodyString).not.toContain('AWS');
+  });
+});
+
+describe('getSignedUrl expiry validation', () => {
+  const svc = new StorageService();
+
+  it('rejects expiry less than 1 second', async () => {
+    await expect(
+      svc.getSignedUrl('test-key', 0)
+    ).rejects.toThrow('Expiry must be between');
+  });
+
+  it('rejects expiry greater than max allowed', async () => {
+    await expect(
+      svc.getSignedUrl('test-key', 999999)
+    ).rejects.toThrow('Expiry must be between');
   });
 });

@@ -73,18 +73,34 @@ class StorageService {
    * @param {string} filename - Raw filename from user input.
    * @returns {string} Sanitized filename safe for S3 key generation.
    */
+ 
   _sanitizeFilename(filename) {
-    if (!filename || typeof filename !== 'string') {
-      return 'unnamed';
-    }
-    let name = filename.replace(/\\/g, '/');
-    name = path.basename(name);
-    name = name.replace(/\0/g, '');
-    name = name.replace(/\.\./g, '');
-    name = name.replace(/[<>:"|?*\\/]/g, '_');
-    return name.slice(0, 255) || 'unnamed';
+  if (!filename || typeof filename !== 'string') {
+    const err = new Error('Invalid filename');
+    err.code = 'INVALID_FILENAME';
+    throw err;
   }
 
+  const normalized = path.posix.normalize(filename);
+
+  if (
+    normalized.includes('..') ||
+    normalized.startsWith('/') ||
+    normalized.startsWith('\\')
+  ) {
+    const err = new Error('Path traversal detected');
+    err.code = 'INVALID_FILENAME';
+    throw err;
+  }
+
+  let name = path.basename(normalized);
+
+  name = name.replace(/\0/g, '');
+
+  name = name.replace(/[<>:"|?*\\/]/g, '_');
+
+  return name.slice(0, 255);
+  }
   /**
    * Validates that the MIME type is in the allowed list.
    *
@@ -96,6 +112,38 @@ class StorageService {
   }
 
   /**
+ * Validates tenant identifiers.
+ * Only alphanumeric characters, underscores, and hyphens are allowed.
+ *
+ * @param {string} tenantId
+ * @returns {boolean}
+ */
+
+
+  _validateTenantId(tenantId) {
+    return (
+      typeof tenantId === 'string' &&
+      /^[a-zA-Z0-9_-]+$/.test(tenantId)
+    );
+  }
+
+
+  /**
+ * Validates invoice identifiers.
+ * Prevents path traversal and cross-tenant key manipulation.
+ *
+ * @param {string} invoiceId
+ * @returns {boolean}
+ */
+
+
+  _validateInvoiceId(invoiceId) {
+    return (
+      typeof invoiceId === 'string' &&
+      /^[a-zA-Z0-9_-]+$/.test(invoiceId)
+    );
+  }
+  /**
    * Generates a tenant/invoice-scoped S3 object key.
    * Format: tenants/{tenantId}/invoices/{invoiceId}/{uuid}-{safeName}
    *
@@ -104,10 +152,25 @@ class StorageService {
    * @param {string} safeName - Sanitized filename.
    * @returns {string} S3 object key.
    */
+
   _generateKey(tenantId, invoiceId, safeName) {
-    const uuid = crypto.randomUUID();
-    return `tenants/${tenantId}/invoices/${invoiceId}/${uuid}-${safeName}`;
+
+  if (!this._validateTenantId(tenantId)) {
+    const err = new Error('Invalid tenant ID');
+    err.code = 'INVALID_TENANT_ID';
+    throw err;
   }
+
+  if (!this._validateInvoiceId(invoiceId)) {
+    const err = new Error('Invalid invoice ID');
+    err.code = 'INVALID_INVOICE_ID';
+    throw err;
+  }
+
+  const uuid = crypto.randomUUID();
+
+  return `tenants/${tenantId}/invoices/${invoiceId}/${uuid}-${safeName}`;
+}
 
   /**
    * Uploads a file buffer to S3 with MIME type and size validation.
@@ -122,6 +185,20 @@ class StorageService {
    * @throws {Error} With code INVALID_MIME_TYPE if MIME type is rejected.
    */
   async uploadFile(fileBuffer, fileName, mimeType, tenantId = 'unknown', invoiceId = 'unknown') {
+    
+    
+    if (!this._validateTenantId(tenantId)) {
+      const err = new Error('Invalid tenant ID');
+      err.code = 'INVALID_TENANT_ID';
+      throw err;
+    }
+
+    if (!this._validateInvoiceId(invoiceId)) {
+      const err = new Error('Invalid invoice ID');
+      err.code = 'INVALID_INVOICE_ID';
+      throw err;
+    }
+
     if (fileBuffer.length > this.maxFileSize) {
       const err = new Error(`File size ${fileBuffer.length} exceeds maximum of ${this.maxFileSize} bytes`);
       err.code = 'FILE_TOO_LARGE';
@@ -160,6 +237,19 @@ class StorageService {
    * @throws {Error} With code FILE_TOO_LARGE if file size exceeds limit.
    */
   async getPresignedUploadUrl({ tenantId, invoiceId, fileName, mimeType, fileSize }) {
+    
+    if (!this._validateTenantId(tenantId)) {
+      const err = new Error('Invalid tenant ID');
+      err.code = 'INVALID_TENANT_ID';
+      throw err;
+    }
+
+if (!this._validateInvoiceId(invoiceId)) {
+      const err = new Error('Invalid invoice ID');
+      err.code = 'INVALID_INVOICE_ID';
+      throw err;
+    }
+        
     if (!this._validateMimeType(mimeType)) {
       const err = new Error(`Invalid MIME type: "${mimeType}". Allowed: ${ALLOWED_MIME_TYPES.join(', ')}`);
       err.code = 'INVALID_MIME_TYPE';
@@ -195,12 +285,26 @@ class StorageService {
    * @returns {Promise<string>} Presigned download URL.
    */
   async getSignedUrl(key, expiresIn = DEFAULT_DOWNLOAD_URL_EXPIRY_SEC) {
-    const safeExpiry = Math.min(Math.max(Math.floor(expiresIn), 1), MAX_DOWNLOAD_URL_EXPIRY_SEC);
+
+    const expiry = Math.floor(expiresIn);
+
+    if (
+      expiry < 1 ||
+      expiry > MAX_DOWNLOAD_URL_EXPIRY_SEC
+    ) {
+      const err = new Error(
+        `Expiry must be between 1 and ${MAX_DOWNLOAD_URL_EXPIRY_SEC} seconds`
+      );
+
+      err.code = 'INVALID_EXPIRY';
+
+      throw err;
+    }
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
     });
-    return await getSignedUrl(s3Client, command, { expiresIn: safeExpiry });
+    return await getSignedUrl(s3Client, command, { expiresIn: expiry });
   }
 }
 

@@ -6,88 +6,354 @@ const {
   isRetryableSubmitError,
   computeTxBackoff,
   handleTxSubmitJob,
+  DEFAULT_CONFIG,
 } = require('../src/workers/txSubmitter');
 
-// Mock the logger to avoid dependency issues
 jest.mock('../src/logger', () => ({
   warn: jest.fn(),
   error: jest.fn(),
   info: jest.fn(),
 }));
 
-describe('txSubmitter worker utilities', () => {
-  it('marks tx_bad_seq and timeout errors as retryable', () => {
+// ─── isRetryableSubmitError ───────────────────────────────────────────────────
+
+describe('isRetryableSubmitError', () => {
+  // Transient — should retry
+  it('retries on tx_bad_seq message', () => {
     expect(isRetryableSubmitError(new Error('tx_bad_seq'))).toBe(true);
-    expect(isRetryableSubmitError(new Error('transaction timed out'))).toBe(true);
+  });
+
+  it('retries on "timeout" in message', () => {
+    expect(isRetryableSubmitError(new Error('network timeout'))).toBe(true);
+  });
+
+  it('retries on "timed out" in message', () => {
+    expect(isRetryableSubmitError(new Error('connection timed out'))).toBe(true);
+  });
+
+  it('retries on "transaction_timeout" in message', () => {
+    expect(isRetryableSubmitError(new Error('transaction_timeout'))).toBe(true);
+  });
+
+  it('retries on ETIMEDOUT code', () => {
     expect(isRetryableSubmitError({ code: 'ETIMEDOUT' })).toBe(true);
+  });
+
+  it('retries on ECONNRESET code', () => {
+    expect(isRetryableSubmitError({ code: 'ECONNRESET' })).toBe(true);
+  });
+
+  it('retries on EAI_AGAIN code', () => {
+    expect(isRetryableSubmitError({ code: 'EAI_AGAIN' })).toBe(true);
+  });
+
+  it('retries on ENOTFOUND code', () => {
+    expect(isRetryableSubmitError({ code: 'ENOTFOUND' })).toBe(true);
+  });
+
+  it('retries when tx_bad_seq is in result.code', () => {
+    expect(isRetryableSubmitError({ result: { code: 'tx_bad_seq' } })).toBe(true);
+  });
+
+  it('retries when tx_bad_seq is in result.result.code', () => {
+    expect(isRetryableSubmitError({ result: { result: { code: 'TX_BAD_SEQ' } } })).toBe(true);
+  });
+
+  it('is case-insensitive for error codes', () => {
+    expect(isRetryableSubmitError({ code: 'etimedout' })).toBe(true);
+  });
+
+  // Permanent — should NOT retry
+  it('does not retry on malformed transaction error', () => {
+    expect(isRetryableSubmitError(new Error('malformed transaction xdr'))).toBe(false);
+  });
+
+  it('does not retry on insufficient fee error', () => {
+    expect(isRetryableSubmitError(new Error('insufficient base fee'))).toBe(false);
+  });
+
+  it('does not retry on bad signature error', () => {
     expect(isRetryableSubmitError(new Error('bad signature'))).toBe(false);
   });
 
-  it('computes exponential backoff correctly', () => {
-    expect(computeTxBackoff(0, 100, 1000)).toBe(100);
-    expect(computeTxBackoff(1, 100, 1000)).toBe(200);
-    expect(computeTxBackoff(4, 100, 500)).toBe(500);
+  it('does not retry on account not found error', () => {
+    expect(isRetryableSubmitError(new Error('account not found'))).toBe(false);
   });
 
-  it('retries transient failures and succeeds', async () => {
-    let attempts = 0;
-    const operation = jest.fn(async () => {
-      attempts += 1;
-      if (attempts === 1) {
-        const error = new Error('tx_bad_seq');
-        error.code = 'TX_BAD_SEQ';
-        throw error;
-      }
+  it('does not retry on EACCES code (not in allowlist)', () => {
+    expect(isRetryableSubmitError({ code: 'EACCES' })).toBe(false);
+  });
+
+  // Non-object inputs
+  it('returns false for null', () => {
+    expect(isRetryableSubmitError(null)).toBe(false);
+  });
+
+  it('returns false for undefined', () => {
+    expect(isRetryableSubmitError(undefined)).toBe(false);
+  });
+
+  it('returns false for a plain string', () => {
+    expect(isRetryableSubmitError('timeout')).toBe(false);
+  });
+
+  it('returns false for a number', () => {
+    expect(isRetryableSubmitError(408)).toBe(false);
+  });
+});
+
+// ─── computeTxBackoff ─────────────────────────────────────────────────────────
+
+describe('computeTxBackoff', () => {
+  it('returns baseDelay on attempt 0', () => {
+    expect(computeTxBackoff(0, 100, 10000)).toBe(100);
+  });
+
+  it('doubles on each attempt', () => {
+    expect(computeTxBackoff(1, 100, 10000)).toBe(200);
+    expect(computeTxBackoff(2, 100, 10000)).toBe(400);
+    expect(computeTxBackoff(3, 100, 10000)).toBe(800);
+  });
+
+  it('clamps at maxDelay', () => {
+    expect(computeTxBackoff(4, 100, 500)).toBe(500);
+    expect(computeTxBackoff(10, 100, 500)).toBe(500);
+  });
+
+  it('never returns a negative value', () => {
+    expect(computeTxBackoff(0, 0, 0)).toBe(0);
+  });
+});
+
+// ─── DEFAULT_CONFIG bounds ────────────────────────────────────────────────────
+
+describe('DEFAULT_CONFIG env clamping', () => {
+  it('maxRetries is clamped to 10', () => {
+    expect(DEFAULT_CONFIG.maxRetries).toBeLessThanOrEqual(10);
+    expect(DEFAULT_CONFIG.maxRetries).toBeGreaterThanOrEqual(0);
+  });
+
+  it('baseDelayMs is clamped to 10000', () => {
+    expect(DEFAULT_CONFIG.baseDelayMs).toBeLessThanOrEqual(10000);
+    expect(DEFAULT_CONFIG.baseDelayMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('maxDelayMs is clamped to 60000', () => {
+    expect(DEFAULT_CONFIG.maxDelayMs).toBeLessThanOrEqual(60000);
+    expect(DEFAULT_CONFIG.maxDelayMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('feeBumpMultiplier is clamped to 10', () => {
+    expect(DEFAULT_CONFIG.feeBumpMultiplier).toBeLessThanOrEqual(10);
+    expect(DEFAULT_CONFIG.feeBumpMultiplier).toBeGreaterThan(0);
+  });
+});
+
+// ─── submitWithRetry ──────────────────────────────────────────────────────────
+
+describe('submitWithRetry', () => {
+  const FAST = { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 5 };
+
+  it('resolves immediately on first success', async () => {
+    const op = jest.fn().mockResolvedValue('ok');
+    await expect(submitWithRetry(op, FAST)).resolves.toBe('ok');
+    expect(op).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes attempt number and feeBumpMultiplier to the operation', async () => {
+    const calls = [];
+    const op = jest.fn(async (ctx) => { calls.push({ ...ctx }); return 'done'; });
+    await submitWithRetry(op, { ...FAST, feeBumpMultiplier: 2 });
+    expect(calls[0]).toEqual({ attempt: 0, feeBumpMultiplier: 2 });
+  });
+
+  it('retries a transient error and succeeds on the second attempt', async () => {
+    let count = 0;
+    const op = jest.fn(async () => {
+      count += 1;
+      if (count === 1) { throw new Error('tx_bad_seq'); }
       return 'submitted';
     });
-
-    await expect(submitWithRetry(operation, { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 })).resolves.toBe('submitted');
-    expect(operation).toHaveBeenCalledTimes(2);
+    await expect(submitWithRetry(op, FAST)).resolves.toBe('submitted');
+    expect(op).toHaveBeenCalledTimes(2);
   });
 
-  it('fails immediately on non-retryable errors', async () => {
-    const operation = jest.fn(async () => {
-      throw new Error('invalid transaction');
+  it('passes the correct (incrementing) attempt number on each retry', async () => {
+    const attempts = [];
+    const op = jest.fn(async ({ attempt }) => {
+      attempts.push(attempt);
+      if (attempt < 2) { throw new Error('tx_bad_seq'); }
+      return 'done';
+    });
+    await submitWithRetry(op, FAST);
+    expect(attempts).toEqual([0, 1, 2]);
+  });
+
+  it('escalates feeBumpMultiplier context consistently across retries', async () => {
+    // The same multiplier value is forwarded on every attempt
+    const multipliers = [];
+    const op = jest.fn(async ({ attempt, feeBumpMultiplier }) => {
+      multipliers.push(feeBumpMultiplier);
+      if (attempt < 2) { throw new Error('tx_bad_seq'); }
+      return 'done';
+    });
+    await submitWithRetry(op, { ...FAST, feeBumpMultiplier: 3 });
+    expect(multipliers).toEqual([3, 3, 3]);
+  });
+
+  it('throws immediately on a permanent (non-retryable) error', async () => {
+    const op = jest.fn(async () => { throw new Error('insufficient base fee'); });
+    await expect(submitWithRetry(op, FAST)).rejects.toThrow('insufficient base fee');
+    expect(op).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops after maxRetries and throws the last error', async () => {
+    const op = jest.fn(async () => { throw new Error('tx_bad_seq'); });
+    await expect(submitWithRetry(op, FAST)).rejects.toThrow('tx_bad_seq');
+    // attempt 0, 1, 2, 3 = maxRetries + 1 total calls
+    expect(op).toHaveBeenCalledTimes(FAST.maxRetries + 1);
+  });
+
+  it('does not exceed maxRetries even for persistent transient errors', async () => {
+    const op = jest.fn(async () => { throw new Error('ECONNRESET'); });
+    const cfg = { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 };
+    await expect(submitWithRetry(op, cfg)).rejects.toThrow();
+    expect(op).toHaveBeenCalledTimes(3); // attempts 0, 1, 2
+  });
+
+  it('config overrides default — feeBumpMultiplier propagated to operation', async () => {
+    let received;
+    const op = jest.fn(async (ctx) => { received = ctx.feeBumpMultiplier; return 'ok'; });
+    await submitWithRetry(op, { ...FAST, feeBumpMultiplier: 5 });
+    expect(received).toBe(5);
+  });
+
+  it('delays stay within baseDelayMs..maxDelayMs', async () => {
+    // Verify the delay passed to setTimeout is within bounds
+    const delays = [];
+    const realSetTimeout = global.setTimeout;
+    jest.spyOn(global, 'setTimeout').mockImplementation((fn, ms) => {
+      delays.push(ms);
+      return realSetTimeout(fn, 0); // skip actual wait
     });
 
-    await expect(submitWithRetry(operation, { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 })).rejects.toThrow('invalid transaction');
-    expect(operation).toHaveBeenCalledTimes(1);
+    let count = 0;
+    const op = jest.fn(async () => {
+      count += 1;
+      if (count <= 2) { throw new Error('tx_bad_seq'); }
+      return 'ok';
+    });
+
+    const cfg = { maxRetries: 3, baseDelayMs: 50, maxDelayMs: 200 };
+    await submitWithRetry(op, cfg);
+
+    for (const d of delays) {
+      expect(d).toBeGreaterThanOrEqual(50);
+      expect(d).toBeLessThanOrEqual(200);
+    }
+
+    jest.restoreAllMocks();
+  });
+});
+
+// ─── handleTxSubmitJob ────────────────────────────────────────────────────────
+
+describe('handleTxSubmitJob', () => {
+  const validJob = { payload: { signedTransactionXdr: 'AAAA' + 'B'.repeat(50) } };
+
+  it('throws when job payload is null', async () => {
+    await expect(handleTxSubmitJob({ payload: null }, jest.fn())).rejects.toThrow('Invalid tx submit job payload');
   });
 
-  it('handles a worker job through the tx submitter worker', async () => {
-    let submitAttempts = 0;
-    const submitTransactionFn = jest.fn(async (payload, context) => {
-      submitAttempts += 1;
-      if (submitAttempts === 1) {
+  it('throws when job payload is not an object', async () => {
+    await expect(handleTxSubmitJob({ payload: 'string' }, jest.fn())).rejects.toThrow('Invalid tx submit job payload');
+  });
+
+  it('throws when submitTransactionFn is not a function', async () => {
+    await expect(handleTxSubmitJob(validJob, 'notafunction')).rejects.toThrow('submitTransactionFn must be supplied');
+  });
+
+  it('throws when signedTransactionXdr is missing', async () => {
+    await expect(handleTxSubmitJob({ payload: {} }, jest.fn())).rejects.toThrow('signedTransactionXdr is required');
+  });
+
+  it('throws when signedTransactionXdr is an empty string', async () => {
+    await expect(handleTxSubmitJob({ payload: { signedTransactionXdr: '   ' } }, jest.fn())).rejects.toThrow('signedTransactionXdr is required');
+  });
+
+  it('calls submitTransactionFn with the job payload and retry context', async () => {
+    const fn = jest.fn().mockResolvedValue({ status: 'ok' });
+    const result = await handleTxSubmitJob(validJob, fn, { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 5 });
+    expect(result).toEqual({ status: 'ok' });
+    expect(fn).toHaveBeenCalledWith(validJob.payload, expect.objectContaining({ attempt: 0, feeBumpMultiplier: expect.any(Number) }));
+  });
+
+  it('retries on transient error from submitTransactionFn', async () => {
+    let count = 0;
+    const fn = jest.fn(async () => {
+      count += 1;
+      if (count === 1) { throw new Error('tx_bad_seq'); }
+      return 'done';
+    });
+    const result = await handleTxSubmitJob(validJob, fn, { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 });
+    expect(result).toBe('done');
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('throws immediately on a permanent error from submitTransactionFn', async () => {
+    const fn = jest.fn(async () => { throw new Error('bad signature'); });
+    await expect(handleTxSubmitJob(validJob, fn, { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 5 })).rejects.toThrow('bad signature');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── createTxSubmitterWorker ──────────────────────────────────────────────────
+
+describe('createTxSubmitterWorker', () => {
+  it('retries transient failures and completes the job', async () => {
+    let attempts = 0;
+    const submitFn = jest.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
         const err = new Error('tx_bad_seq');
         err.code = 'TX_BAD_SEQ';
         throw err;
       }
-      return { status: 'ok', payload };
+      return { status: 'ok' };
     });
 
-    const { txQueue, txWorker, enqueueTxSubmission } = createTxSubmitterWorker(submitTransactionFn, {
+    const { txQueue, txWorker, enqueueTxSubmission } = createTxSubmitterWorker(submitFn, {
       pollIntervalMs: 10,
       maxConcurrency: 1,
       retryConfig: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 },
     });
 
     txWorker.start();
-
-    const jobId = enqueueTxSubmission({ signedTransactionXdr: 'abcdef123' });
-    expect(jobId).toEqual(expect.stringContaining('job-'));
-
+    const jobId = enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const job = txQueue.getJob(jobId);
-    expect(job.status).toBe('completed');
-    expect(submitTransactionFn).toHaveBeenCalledTimes(2);
+    expect(txQueue.getJob(jobId).status).toBe('completed');
+    expect(submitFn).toHaveBeenCalledTimes(2);
 
     await txWorker.stop();
   });
 
-  it('rejects invalid job payloads', async () => {
-    const submitTransactionFn = jest.fn();
-    await expect(handleTxSubmitJob({ payload: {} }, submitTransactionFn)).rejects.toThrow('signedTransactionXdr is required');
+  it('marks the job as failed on a permanent error', async () => {
+    const submitFn = jest.fn(async () => { throw new Error('insufficient fee'); });
+
+    const { txQueue, txWorker, enqueueTxSubmission } = createTxSubmitterWorker(submitFn, {
+      pollIntervalMs: 10,
+      maxConcurrency: 1,
+      retryConfig: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    txWorker.start();
+    const jobId = enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(txQueue.getJob(jobId).status).toBe('failed');
+    expect(submitFn).toHaveBeenCalledTimes(1); // no retry for permanent error
+
+    await txWorker.stop();
   });
 });

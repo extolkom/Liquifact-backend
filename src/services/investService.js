@@ -22,7 +22,14 @@
 const db = require('../db/knex');
 const { batchReadEscrowStates } = require('./escrowBatchRead');
 const { PUBLIC_INVESTABLE_INVOICE_STATUSES } = require('./marketplaceService');
+const { resolveEscrowAddress } = require('../config/escrowMap');
+const logger = require('../logger');
 
+/**
+ * Map a raw invoice row to an InvestmentOpportunity DTO.
+ * @param {Object} invoiceRow - Raw invoice row from the database.
+ * @returns {InvestmentOpportunity} DTO with camelCase fields and default on-chain pointers.
+ */
 function toOpportunityDto(invoiceRow) {
   const fundedRatio = invoiceRow && invoiceRow.funded_ratio !== undefined ? Number(invoiceRow.funded_ratio) : 0;
   const fundedBpsOfTarget = Number.isFinite(fundedRatio) ? Math.round(fundedRatio * 100) : 0;
@@ -164,8 +171,99 @@ async function listInvestments({ tenantId, cursor, limit = 10 } = {}) {
   };
 }
 
+/**
+ * Retrieves a paginated list of investment opportunities enriched with
+ * on-chain escrow state.
+ *
+ * Queries invoices that are publicly investable (status in
+ * {@link PUBLIC_INVESTABLE_INVOICE_STATUSES}), maps each to an
+ * {@link InvestmentOpportunity} DTO, and enriches with live on-chain data
+ * from the Soroban escrow contract. If a per-invoice on-chain read fails,
+ * that invoice is silently skipped from enrichment but still included in
+ * the result with default on-chain pointers.
+ *
+ * @param {Object} [options={}] - Query options.
+ * @param {string} options.tenantId - The resolved tenant identifier.
+ * @param {number} [options.page=1] - Page number (1-based).
+ * @param {number} [options.limit=20] - Items per page (capped at 100).
+ * @returns {Promise<{data: InvestmentOpportunity[], meta: {total: number, page: number, limit: number, totalPages: number}}>}
+ */
+async function listOpportunities({ tenantId, page = 1, limit = 20 } = {}) {
+  if (!tenantId || typeof tenantId !== 'string') {
+    throw new Error('Missing tenant context');
+  }
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitSize = Math.max(1, Math.min(100, parseInt(limit, 10) || 20));
+  const offset = (pageNum - 1) * limitSize;
+
+  const baseQuery = db('invoices')
+    .whereNull('deleted_at')
+    .where('tenant_id', tenantId)
+    .whereIn('status', PUBLIC_INVESTABLE_INVOICE_STATUSES);
+
+  const countRow = await baseQuery.clone().clearSelect().clearOrder().count('* as total').first();
+  const total = countRow && countRow.total ? parseInt(countRow.total, 10) : 0;
+
+  const rows = await baseQuery
+    .clone()
+    .select(
+      'id',
+      'yield_bps',
+      'funded_ratio',
+      'maturity_date'
+    )
+    .orderBy('created_at', 'desc')
+    .limit(limitSize)
+    .offset(offset);
+
+  const data = rows.map(toOpportunityDto);
+  const invoiceIds = data.map(o => o.invoiceId);
+
+  // Batch-read on-chain state; failures are isolated per invoice.
+  const { results, errors } = await batchReadEscrowStates(invoiceIds);
+
+  if (errors.length > 0) {
+    logger.warn(
+      { invoiceIds: errors.map(e => e.invoiceId), count: errors.length },
+      'listOpportunities: on-chain reads failed for some invoices — skipping enrichment',
+    );
+  }
+
+  // Merge on-chain state into each opportunity.
+  for (const item of data) {
+    const onChainState = results.find(r => r.invoiceId === item.invoiceId);
+    let escrowAddress = '';
+    try {
+      const addr = resolveEscrowAddress(item.invoiceId);
+      if (addr) {
+        escrowAddress = addr;
+      }
+    } catch {
+      // Escrow mapping not configured for this invoice; leave as empty string.
+    }
+
+    item.onChain = {
+      ...(onChainState || {}),
+      escrowAddress,
+      ledgerIndex: null,
+    };
+  }
+
+  return {
+    data,
+    meta: {
+      total,
+      page: pageNum,
+      limit: limitSize,
+      totalPages: Math.ceil(total / limitSize),
+    },
+  };
+}
+
 module.exports = {
   getOpportunities,
   listInvestments,
+  listOpportunities,
   PUBLIC_INVESTABLE_INVOICE_STATUSES,
 };

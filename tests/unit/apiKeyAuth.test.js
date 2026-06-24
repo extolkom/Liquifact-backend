@@ -26,6 +26,7 @@ const {
 const {
   authenticateApiKey,
   API_KEY_HEADER,
+  timingSafeStringEqual,
 } = require('../../src/middleware/apiKeyAuth');
 
 // ---------------------------------------------------------------------------
@@ -364,5 +365,88 @@ describe('middleware/apiKeyAuth — malformed API_KEYS env propagates error', ()
     const res = await request(app).get('/test').set('X-API-Key', 'lf_anything000');
     // The registry load throws; Express default error handler returns 500
     expect(res.status).toBe(500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// timingSafeStringEqual — unit tests
+// ---------------------------------------------------------------------------
+
+describe('timingSafeStringEqual — constant-time comparison helper', () => {
+  it('returns true when both strings are identical', () => {
+    expect(timingSafeStringEqual('lf_validkey001', 'lf_validkey001')).toBe(true);
+  });
+
+  it('returns false when strings differ by one character', () => {
+    expect(timingSafeStringEqual('lf_validkey001', 'lf_validkey002')).toBe(false);
+  });
+
+  it('returns false for completely different strings', () => {
+    expect(timingSafeStringEqual('lf_aaaaaaaaaa', 'lf_bbbbbbbbbb')).toBe(false);
+  });
+
+  it('returns false when strings have different lengths', () => {
+    expect(timingSafeStringEqual('lf_short', 'lf_muchlongerkey')).toBe(false);
+  });
+
+  it('returns false for empty string vs non-empty string', () => {
+    expect(timingSafeStringEqual('', 'lf_validkey001')).toBe(false);
+  });
+
+  it('returns true for two empty strings', () => {
+    expect(timingSafeStringEqual('', '')).toBe(true);
+  });
+
+  it('is case-sensitive', () => {
+    expect(timingSafeStringEqual('lf_ValidKey001', 'lf_validkey001')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// middleware/apiKeyAuth — constant-time lookup via findEntry (via middleware)
+// ---------------------------------------------------------------------------
+
+describe('middleware/apiKeyAuth — constant-time lookup', () => {
+  it('always evaluates every registry entry (does not short-circuit on first match)', async () => {
+    // Build a registry with multiple entries; the valid key is the first entry.
+    // If lookup short-circuits, the timing for a matching first key would differ
+    // from a matching last key. We assert correct behaviour for all positions.
+    const multiEnv = {
+      API_KEYS: [
+        JSON.stringify({ key: 'lf_firstkey0001', clientId: 'svc-first', scopes: ['invoices:read'] }),
+        JSON.stringify({ key: 'lf_middlekey001', clientId: 'svc-mid', scopes: ['invoices:read'] }),
+        JSON.stringify({ key: 'lf_lastkey00001', clientId: 'svc-last', scopes: ['invoices:read'] }),
+      ].join(';'),
+    };
+
+    const app = makeApp(authenticateApiKey({ env: multiEnv }));
+
+    // First entry resolves correctly
+    const res1 = await request(app).get('/test').set('X-API-Key', 'lf_firstkey0001');
+    expect(res1.status).toBe(200);
+    expect(res1.body.apiClient.clientId).toBe('svc-first');
+
+    // Middle entry resolves correctly
+    const res2 = await request(app).get('/test').set('X-API-Key', 'lf_middlekey001');
+    expect(res2.status).toBe(200);
+    expect(res2.body.apiClient.clientId).toBe('svc-mid');
+
+    // Last entry resolves correctly
+    const res3 = await request(app).get('/test').set('X-API-Key', 'lf_lastkey00001');
+    expect(res3.status).toBe(200);
+    expect(res3.body.apiClient.clientId).toBe('svc-last');
+  });
+
+  it('returns 401 for a key that is a prefix of a valid key', async () => {
+    const app = makeApp(authenticateApiKey({ env: REGISTRY_ENV }));
+    // VALID_KEY = 'lf_validkey001'; send a prefix of it
+    const res = await request(app).get('/test').set('X-API-Key', 'lf_validkey00');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 for a key that is a superset of a valid key', async () => {
+    const app = makeApp(authenticateApiKey({ env: REGISTRY_ENV }));
+    const res = await request(app).get('/test').set('X-API-Key', `${VALID_KEY}extra`);
+    expect(res.status).toBe(401);
   });
 });

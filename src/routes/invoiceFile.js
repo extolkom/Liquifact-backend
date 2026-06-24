@@ -63,13 +63,25 @@ router.post('/:id/presigned-upload', express.json(), async (req, res) => {
       message: 'Presigned upload URL generated',
     });
   } catch (error) {
-    if (error.code === 'INVALID_MIME_TYPE' || error.code === 'FILE_TOO_LARGE') {
+     if (
+      error.code === 'INVALID_MIME_TYPE' ||
+      error.code === 'FILE_TOO_LARGE' ||
+      error.code === 'INVALID_FILENAME' ||
+      error.code === 'INVALID_TENANT_ID' ||
+      error.code === 'INVALID_INVOICE_ID' ||
+      error.code === 'INVALID_EXPIRY'
+    ) {
       return res.status(400).json({
         error: 'Bad Request',
         message: error.message,
       });
     }
-    console.error('Presigned upload error:', error);
+   const logger = require('../logger');
+
+   logger.error(
+    { err: error, invoiceId: id },
+    'Failed to generate presigned upload URL'
+  );
     return res.status(500).json({
       error: 'Internal Server Error',
       message: 'Failed to generate presigned upload URL',
