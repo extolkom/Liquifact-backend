@@ -23,21 +23,26 @@ module.exports = {
     // Note: Prefer creating migrations for `node-pg-migrate` (Postgres) and
     // testing them against a Postgres instance. The SQLite configs here are
     // provided for convenience in local development only.
-    directory: './migrations',
+    client: 'sqlite3',
+    connection: {
+      filename: ':memory:',
+    },
+    migrations: {
+      directory: './migrations',
+    },
+    seeds: {
+      directory: './seeds',
+    },
+    useNullAsDefault: true,
   },
-  seeds: {
-    directory: './seeds',
-  },
-  useNullAsDefault: true,
-},
   production: {
-  client: 'pg',
+    client: 'pg',
     connection: process.env.DATABASE_URL,
-      migrations: {
-    directory: './migrations',
+    migrations: {
+      directory: './migrations',
     },
-  seeds: {
-    directory: './seeds',
+    seeds: {
+      directory: './seeds',
     },
-},
+  },
 };

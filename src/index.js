@@ -33,14 +33,17 @@ function resetStore() {
   // intentional no-op
 }
 
+const originalCreateApp = app.createApp;
+
 /**
  * Returns the underlying Express app factory.
  *
  * @returns {import('express').Express} Configured Express app.
  */
 function createApp() {
-  return typeof app.createApp === 'function' ? app.createApp() : app;
+  return typeof originalCreateApp === 'function' ? originalCreateApp() : app;
 }
+
 
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
   startServer();

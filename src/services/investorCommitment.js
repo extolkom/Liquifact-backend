@@ -15,7 +15,7 @@
 
 'use strict';
 
-const db = require('../db'); // project's shared Knex instance
+const db = require('../db/knex'); // project's shared Knex instance
 
 const TABLE = 'investor_commitments';
 
@@ -100,7 +100,9 @@ async function updateCommitment(id, fields) {
     .where({ id })
     .update({ ...fields, updated_at: db.fn.now() })
     .returning('*');
-  if (!row) throw new Error(`Commitment not found: ${id}`);
+  if (!row) {
+    throw new Error(`Commitment not found: ${id}`);
+  }
   return row;
 }
 

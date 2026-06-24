@@ -1,45 +1,69 @@
 'use strict';
 
 const helmet = require('helmet');
+const { securityHeaders } = require('../config');
 
 /**
- * Creates and returns configured Helmet security middleware.
- * @returns {Function} Express middleware that sets secure HTTP response headers.
+ * Security middleware factory.
+ * Applies Helmet with the appropriate Content‑Security‑Policy based on the request path.
+ * For Swagger/OpenAPI docs routes (`/api-docs` or `/docs`) a relaxed CSP is used to allow
+ * inline scripts/styles required by the UI. All other routes receive the strict default CSP.
+ * All other security headers are sourced from `securityHeaders` defined in the config module.
+ *
+ * @returns {import('express').RequestHandler}
  */
 function createSecurityMiddleware() {
-  return helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'"],
-        imgSrc: ["'self'", 'data:'],
-        connectSrc: ["'self'"],
-        fontSrc: ["'self'"],
-        objectSrc: ["'none'"],
-        mediaSrc: ["'self'"],
-        frameSrc: ["'none'"],
-        baseUri: ["'self'"],
-        formAction: ["'self'"],
-      },
-    },
-    crossOriginEmbedderPolicy: { policy: 'require-corp' },
-    crossOriginOpenerPolicy: { policy: 'same-origin' },
-    crossOriginResourcePolicy: { policy: 'same-origin' },
-    dnsPrefetchControl: { allow: false },
-    frameguard: { action: 'deny' },
-    hidePoweredBy: true,
-    hsts: {
-      maxAge: 31536000,
-      includeSubDomains: true,
-      preload: true,
-    },
-    ieNoOpen: true,
-    noSniff: true,
-    originAgentCluster: true,
-    permittedCrossDomainPolicies: { permittedPolicies: 'none' },
-    referrerPolicy: { policy: 'no-referrer' },
-  });
+  return (req, res, next) => {
+    const isDocs = req.path && (/^\/api-docs|\/docs/.test(req.path));
+
+    const csp = isDocs ? securityHeaders.docsContentSecurityPolicy : securityHeaders.contentSecurityPolicy;
+
+    // Helmet expects an options object; we spread the common options and inject the chosen CSP.
+    const helmetOptions = {
+      contentSecurityPolicy: csp,
+      referrerPolicy: securityHeaders.referrerPolicy,
+      hsts: securityHeaders.hsts,
+      crossOriginEmbedderPolicy: { policy: 'require-corp' },
+      crossOriginOpenerPolicy: { policy: 'same-origin' },
+      crossOriginResourcePolicy: { policy: 'same-origin' },
+      dnsPrefetchControl: { allow: false },
+      frameguard: { action: 'deny' },
+      hidePoweredBy: true,
+      ieNoOpen: true,
+      noSniff: true,
+      originAgentCluster: true,
+      permittedCrossDomainPolicies: { permittedPolicies: 'none' },
+    };
+
+    return helmet(helmetOptions)(req, res, next);
+  };
 }
 
-module.exports = { createSecurityMiddleware };
+/**
+ * Explicit middleware for the documentation route.
+ * This is kept for backward compatibility – it applies the docs‑specific CSP directly.
+ *
+ * @returns {import('express').RequestHandler}
+ */
+function createDocsSecurityMiddleware() {
+  return (req, res, next) => {
+    const helmetOptions = {
+      contentSecurityPolicy: securityHeaders.docsContentSecurityPolicy,
+      referrerPolicy: securityHeaders.referrerPolicy,
+      hsts: securityHeaders.hsts,
+      crossOriginEmbedderPolicy: { policy: 'require-corp' },
+      crossOriginOpenerPolicy: { policy: 'same-origin' },
+      crossOriginResourcePolicy: { policy: 'same-origin' },
+      dnsPrefetchControl: { allow: false },
+      frameguard: { action: 'deny' },
+      hidePoweredBy: true,
+      ieNoOpen: true,
+      noSniff: true,
+      originAgentCluster: true,
+      permittedCrossDomainPolicies: { permittedPolicies: 'none' },
+    };
+    return helmet(helmetOptions)(req, res, next);
+  };
+}
+
+module.exports = { createSecurityMiddleware, createDocsSecurityMiddleware };

@@ -30,7 +30,7 @@ const ConfigSchema = z
     KYC_PROVIDER_SECRET: z.string().min(1).optional(),
   })
   .superRefine((data, ctx) => {
-    if (data.NODE_ENV === 'test') return;
+    if (data.NODE_ENV === 'test') { return; }
     const hasUrl = Boolean(data.KYC_PROVIDER_URL);
     const hasKey = Boolean(data.KYC_PROVIDER_API_KEY);
     if (hasUrl !== hasKey) {
@@ -76,8 +76,45 @@ function get() {
   return config;
 }
 
+const securityHeaders = {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"]
+    }
+  },
+  referrerPolicy: { policy: 'no-referrer' },
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  // Less restrictive CSP for Swagger UI docs
+  docsContentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"]
+    }
+  }
+};
+
 module.exports = {
   validate,
   get,
   ConfigSchema,
+  securityHeaders,
 };
