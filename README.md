@@ -616,9 +616,58 @@ Run SQL migrations in order:
 - successful `POST|PUT|PATCH|DELETE` requests under `/api/admin/*` are auto-logged
 - sensitive fields are redacted before persistence (`password`, `token`, `secret`, `apiKey`, `privateKey`, etc.)
 
+### Audit trail export
+
+`GET /api/admin/audit/invoices/:invoiceId/export` accepts a `format` query parameter:
+
+| `format` | Behaviour |
+| --- | --- |
+| `json` (default) | Returns a paginated JSON array. The `limit` query param (default 50, max 500) controls the page size. |
+| `csv` | **Streaming**: rows are emitted directly from the database cursor and piped to the HTTP response. The full result set is **never** buffered in memory, making this safe for arbitrarily large audit trails. |
+
+#### CSV streaming pipeline
+
+```
+PostgreSQL cursor (Knex .stream())
+  → createCsvTransform()   ← object-mode Transform, writes header on first row
+  → res (HTTP response)
+```
+
+Both ends of the pipeline attach `error` listeners. If the database stream or the transform errors after headers have been flushed, the socket is destroyed cleanly to avoid a hanging client connection.
+
+#### Formula-injection safety
+
+Every CSV field is processed by `escapeCsvField()` in `src/services/auditLogStore.js`:
+
+1. **Leading-character neutralisation** — cells beginning with `=`, `+`, `-`, `@`, TAB, or CR are prefixed with a single quote (`'`). This prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or a DDE command.
+2. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
+
+#### Tenant isolation
+
+Tenant scoping is enforced **at the database level** using a `whereRaw` filter on the JSONB `metadata` column:
+
+```sql
+WHERE metadata->>'tenantId' = ?
+```
+
+No cross-tenant row is ever loaded into application memory.
+
+#### Response headers
+
+```
+Content-Type: text/csv
+Content-Disposition: attachment; filename="audit-<invoiceId>.csv"
+```
+
+#### Column order
+
+```
+id, timestamp, actor, action, resourceType, resourceId, statusCode, ipAddress, userAgent
+```
+
 ### Example API usage
 
-Admin action example:
+Admin action logging:
 
 ```bash
 curl -X POST http://localhost:3001/api/admin/kyc/cus_42/approve \
@@ -630,9 +679,25 @@ curl -X POST http://localhost:3001/api/admin/kyc/cus_42/approve \
   -d '{"reason":"manual review","privateKey":"redacted-at-write-time"}'
 ```
 
-Webhook delivery logging is typically called internally from delivery workers/routes via `req.audit.logWebhookDelivery(...)`.
+Streaming CSV export:
+
+```bash
+curl -H "Authorization: Bearer <admin-jwt>" \
+     -H "x-tenant-id: tenant-alpha" \
+     "http://localhost:3001/api/admin/audit/invoices/inv-001/export?format=csv" \
+     -o audit-inv-001.csv
+```
+
+JSON export (paginated):
+
+```bash
+curl -H "Authorization: Bearer <admin-jwt>" \
+     -H "x-tenant-id: tenant-alpha" \
+     "http://localhost:3001/api/admin/audit/invoices/inv-001/export?format=json&limit=100"
+```
 
 ---
+
 
 ## Load baseline suite
 
