@@ -201,8 +201,8 @@ function getInvoiceAuditTrail(invoiceId, limit = 100, offset = 0, tenantId = nul
 /**
  * Counts total audit logs matching criteria.
  */
-function countAuditLogs(options = {}) {
-  const logs = getAuditLogs({ ...options, limit: Infinity, offset: 0 });
+async function countAuditLogs(options = {}) {
+  const logs = await getAuditLogs({ ...options, limit: Infinity, offset: 0 });
   return logs.length;
 }
 
@@ -267,10 +267,10 @@ async function exportAuditLogs({ limit = Infinity, format = 'json' } = {}) {
  * @param {number} [options.limit=100] Maximum records to export
  * @param {string} [options.format='json'] 'json' or 'csv'
  * @param {string} [options.tenantId] Tenant ID for isolation
- * @returns {string} Formatted audit log output
+ * @returns {Promise<string>} Formatted audit log output
  */
-function exportInvoiceAuditLogs({ invoiceId, limit = 100, format = 'json', tenantId = null } = {}) {
-  const logs = getAuditLogs({
+async function exportInvoiceAuditLogs({ invoiceId, limit = 100, format = 'json', tenantId = null } = {}) {
+  const logs = await getAuditLogs({
     resourceId: invoiceId,
     resourceType: 'invoice',
     limit,
@@ -280,7 +280,14 @@ function exportInvoiceAuditLogs({ invoiceId, limit = 100, format = 'json', tenan
 
   if (format === 'csv') {
     const escapeCsv = (val) => {
-      const str = val == null ? '' : String(val);
+      let str = val == null ? '' : String(val);
+      
+      // Prevent CSV formula injection by prefixing dangerous characters with a single quote
+      // Dangerous chars: =, +, -, @, |, tab (0x09), carriage return (0x0D)
+      if (str.length > 0 && /^[=+\-@|\t\r]/.test(str)) {
+        str = `'${str}`;
+      }
+      
       if (str.includes(',') || str.includes('"') || str.includes('\n')) {
         return `"${str.replace(/"/g, '""')}"`;
       }

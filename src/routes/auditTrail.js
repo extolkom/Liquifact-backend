@@ -50,7 +50,7 @@ function isValidInvoiceId(invoiceId) {
  * Returns paginated audit trail for a specific invoice.
  * Tenant-scoped: only returns records matching req.tenantId.
  */
-router.get('/invoices/:invoiceId', (req, res, next) => {
+router.get('/invoices/:invoiceId', async (req, res, next) => {
   try {
     const { invoiceId } = req.params;
     if (!isValidInvoiceId(invoiceId)) {
@@ -63,8 +63,10 @@ router.get('/invoices/:invoiceId', (req, res, next) => {
     }
 
     const { limit, offset } = parsePagination(req.query);
-    const logs = getInvoiceAuditTrail(invoiceId, limit, offset, req.tenantId);
-    const total = countAuditLogs({ resourceId: invoiceId, resourceType: 'invoice', tenantId: req.tenantId });
+    const [logs, total] = await Promise.all([
+      getInvoiceAuditTrail(invoiceId, limit, offset, req.tenantId),
+      countAuditLogs({ resourceId: invoiceId, resourceType: 'invoice', tenantId: req.tenantId }),
+    ]);
 
     return res.json({
       data: logs,
@@ -79,7 +81,7 @@ router.get('/invoices/:invoiceId', (req, res, next) => {
  * GET /api/admin/audit/invoices/:invoiceId/transitions
  * Returns state-transition history for a specific invoice.
  */
-router.get('/invoices/:invoiceId/transitions', (req, res, next) => {
+router.get('/invoices/:invoiceId/transitions', async (req, res, next) => {
   try {
     const { invoiceId } = req.params;
     if (!isValidInvoiceId(invoiceId)) {
@@ -91,7 +93,7 @@ router.get('/invoices/:invoiceId/transitions', (req, res, next) => {
       }));
     }
 
-    const transitions = getTransitionHistory(invoiceId, (opts) =>
+    const transitions = await getTransitionHistory(invoiceId, (opts) =>
       getAuditLogs({ ...opts, tenantId: req.tenantId })
     );
 
@@ -106,7 +108,7 @@ router.get('/invoices/:invoiceId/transitions', (req, res, next) => {
  * Exports audit trail as JSON or CSV.
  * Query params: format=json|csv, limit, offset
  */
-router.get('/invoices/:invoiceId/export', (req, res, next) => {
+router.get('/invoices/:invoiceId/export', async (req, res, next) => {
   try {
     const { invoiceId } = req.params;
     if (!isValidInvoiceId(invoiceId)) {
@@ -120,7 +122,7 @@ router.get('/invoices/:invoiceId/export', (req, res, next) => {
 
     const format = req.query.format === 'csv' ? 'csv' : 'json';
     const { limit } = parsePagination(req.query);
-    const output = exportInvoiceAuditLogs({ invoiceId, limit, format, tenantId: req.tenantId });
+    const output = await exportInvoiceAuditLogs({ invoiceId, limit, format, tenantId: req.tenantId });
 
     if (format === 'csv') {
       res.set('Content-Type', 'text/csv');
