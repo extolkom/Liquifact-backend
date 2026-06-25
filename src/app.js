@@ -42,6 +42,7 @@ const smeRoutes = require('./routes/sme');
 const invoiceFileRoutes = require('./routes/invoiceFile');
 const auditTrailRoutes = require('./routes/auditTrail');
 const investRoutes = require('./routes/invest');
+const investorRoutes = require('./routes/investor');
 const marketplaceRoutes = require('./routes/marketplace');
 const retentionRoutes = require('./routes/retention');
 const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
@@ -311,6 +312,7 @@ function createApp() {
   app.use('/api/invoices', invoiceFileRoutes);
   app.use('/api/invoices', invoiceStateRoutes);
   app.use('/api/invest', investRoutes);
+  app.use('/api/investor', investorRoutes);
   app.use('/api/kyc', kycRoutes);
   app.use('/api/marketplace', marketplaceRoutes);
   app.use('/api/retention', retentionRoutes);

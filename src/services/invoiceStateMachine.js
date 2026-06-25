@@ -9,6 +9,8 @@
 const { createAuditLog } = require('./auditLog');
 const logger = require('../logger');
 const { enqueueWebhookDelivery } = require('./webhooks');
+const { getSharedStore } = require('./cacheStore');
+const { invalidatePrefix } = require('../middleware/cache');
 
 
 /**
@@ -304,6 +306,10 @@ async function executeTransition({
     transitionedAt: auditLog.timestamp,
     transitionedBy: actor,
   };
+
+  // Invalidate marketplace cache so that the new state is reflected
+  // immediately on the next GET /api/marketplace request.
+  invalidatePrefix(getSharedStore(), 'marketplace:');
 
   // Enqueue a signed webhook delivery job for this transition.
   // This is fire-and-forget: webhook errors must never fail the transition.

@@ -1,17 +1,40 @@
 /**
+ * Response-caching middleware and cache-invalidation helpers.
+ *
+ * The {@link cacheResponse} function returns an Express middleware that caches
+ * JSON responses with a configurable TTL.  Cache keys are derived via the
+ * optional `keyFn` — the default uses `req.originalUrl`.
+ *
+ * Three key helpers are exported for route files:
+ * - {@link makeMarketplaceKey}   — tenant-scoped key including the full query string
+ * - {@link makeInvestorLocksKey} — tenant-scoped key for the locks-list endpoint
+ * - {@link makeInvestorLockKey}  — key for a single lock identified by invoiceId + funderAddress
+ *
+ * The {@link invalidatePrefix} helper lets write-side services (e.g. invoice
+ * state machine, investor commitment) flush groups of related cache entries
+ * without knowing the exact keys.
+ *
+ * @module middleware/cache
+ */
+
+/**
  * Creates an Express middleware that caches JSON responses with a TTL.
  *
- * On cache hit, returns the cached JSON and sets X-Cache: HIT header.
- * On cache miss, intercepts res.json() to capture and cache 2xx responses,
- * then sets X-Cache: MISS header.
+ * On cache hit, returns the cached JSON and sets `X-Cache: HIT` header.
+ * On cache miss, intercepts `res.json()` to capture and cache 2xx responses,
+ * then sets `X-Cache: MISS` header.
  *
- * Cache store errors are caught and logged — the request falls through
- * to the route handler so the cache never blocks a request.
+ * The cache is bypassed when the request carries a `Cache-Control: no-cache`
+ * header, allowing clients to always fetch fresh data.
  *
- * @param {object} options - Middleware configuration.
- * @param {number} options.ttl - Cache TTL in milliseconds.
- * @param {object} options.store - Cache store instance with get/set methods.
- * @param {Function} [options.keyFn] - Function to derive cache key from request. Defaults to req.originalUrl.
+ * Cache store errors are caught and logged — the request always falls through
+ * to the next handler so the cache never blocks a request.
+ *
+ * @param {object}    options          - Middleware configuration.
+ * @param {number}    options.ttl      - Cache TTL in milliseconds.
+ * @param {object}    options.store    - Cache store instance with get/set methods.
+ * @param {Function} [options.keyFn]   - Function to derive cache key from request.
+ *                                       Defaults to `req.originalUrl`.
  * @returns {Function} Express middleware function.
  */
 function cacheResponse({ ttl, store, keyFn }) {
@@ -24,6 +47,12 @@ function cacheResponse({ ttl, store, keyFn }) {
   const resolveKey = keyFn || ((req) => req.originalUrl);
 
   return (req, res, next) => {
+    // Honour Cache-Control: no-cache — bypass cache entirely
+    const cc = req.headers ? req.headers['cache-control'] : undefined;
+    if (cc && typeof cc === 'string' && cc.indexOf('no-cache') !== -1) {
+      return next();
+    }
+
     let cached;
     const key = resolveKey(req);
 
@@ -44,7 +73,7 @@ function cacheResponse({ ttl, store, keyFn }) {
     const originalJson = res.json.bind(res);
 
     /**
-     * Patched res.json that caches 2xx responses before sending.
+     * Patched `res.json` that caches 2xx responses before sending.
      *
      * @param {*} body - The response body to send.
      * @returns {object} The Express response.
@@ -64,6 +93,69 @@ function cacheResponse({ ttl, store, keyFn }) {
   };
 }
 
+/**
+ * Creates a tenant-isolated cache key for the marketplace search endpoint.
+ *
+ * The key includes the tenant ID and the full original URL (path + query
+ * string) so that different filter / sort / pagination parameters produce
+ * distinct cache entries.
+ *
+ * @param {import('express').Request} req - The Express request.
+ * @returns {string} Cache key, e.g. `marketplace:tenant-abc:/api/marketplace?status=verified`
+ */
+function makeMarketplaceKey(req) {
+  const tenantId = req.tenantId || 'unknown';
+  return 'marketplace:' + tenantId + ':' + req.originalUrl;
+}
+
+/**
+ * Creates a tenant-isolated cache key for the investor locks list endpoint.
+ *
+ * @param {import('express').Request} req - The Express request.
+ * @returns {string} Cache key, e.g. `investor:locks:tenant-abc:/api/investor/locks?funderAddress=G...`
+ */
+function makeInvestorLocksKey(req) {
+  const tenantId = req.tenantId || 'unknown';
+  return 'investor:locks:' + tenantId + ':' + req.originalUrl;
+}
+
+/**
+ * Creates a tenant-isolated cache key for a single investor lock by invoice
+ * ID and funder address.
+ *
+ * @param {import('express').Request} req - The Express request.
+ * @returns {string} Cache key, e.g. `investor:lock:tenant-abc:inv_123:G...`
+ */
+function makeInvestorLockKey(req) {
+  const tenantId = req.tenantId || 'unknown';
+  return 'investor:lock:' + tenantId + ':' + req.params.invoiceId + ':' + req.query.funderAddress;
+}
+
+/**
+ * Invalidates all cache entries whose key starts with the given prefix.
+ *
+ * This is called by write-side services (invoice state machine, investor
+ * commitment) so that subsequent reads return fresh data.
+ *
+ * Errors from the store are caught and logged — invalidation failures never
+ * propagate to the caller.
+ *
+ * @param {object} store  - Cache store instance with a `delByPrefix` method.
+ * @param {string} prefix - Key prefix (e.g. `marketplace:`, `investor:`).
+ * @returns {void}
+ */
+function invalidatePrefix(store, prefix) {
+  try {
+    store.delByPrefix(prefix);
+  } catch (err) {
+    console.warn('Cache invalidation error:', err.message);
+  }
+}
+
 module.exports = {
   cacheResponse,
+  invalidatePrefix,
+  makeMarketplaceKey,
+  makeInvestorLocksKey,
+  makeInvestorLockKey,
 };

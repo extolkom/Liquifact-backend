@@ -59,6 +59,44 @@ class MemoryCacheStore {
   }
 
   /**
+   * Returns all currently valid (non-expired) cache keys.
+   *
+   * Expired entries are lazily evicted during iteration.
+   *
+   * @returns {string[]} Array of active cache keys.
+   */
+  keys() {
+    const now = Date.now();
+    const valid = [];
+    for (const [key, entry] of this._cache) {
+      if (now <= entry.expiresAt) {
+        valid.push(key);
+      } else {
+        this._cache.delete(key);
+      }
+    }
+    return valid;
+  }
+
+  /**
+   * Deletes all cache entries whose key starts with the given prefix.
+   * Expired entries are also cleaned up during iteration.
+   *
+   * @param {string} prefix - The key prefix to match.
+   * @returns {void}
+   */
+  delByPrefix(prefix) {
+    const now = Date.now();
+    for (const [key, entry] of this._cache) {
+      if (now > entry.expiresAt) {
+        this._cache.delete(key);
+      } else if (key.startsWith(prefix)) {
+        this._cache.delete(key);
+      }
+    }
+  }
+
+  /**
    * Removes all entries from the cache.
    *
    * @returns {void}
@@ -79,7 +117,25 @@ function createCacheStore() {
   return new MemoryCacheStore();
 }
 
+/**
+ * Returns a shared singleton cache store instance.
+ *
+ * All middleware and services that need to read or invalidate cache entries
+ * should use this instance to ensure consistency.
+ *
+ * @returns {MemoryCacheStore} The shared cache store.
+ */
+function getSharedStore() {
+  if (!_sharedInstance) {
+    _sharedInstance = new MemoryCacheStore();
+  }
+  return _sharedInstance;
+}
+
+let _sharedInstance = null;
+
 module.exports = {
   MemoryCacheStore,
   createCacheStore,
+  getSharedStore,
 };
