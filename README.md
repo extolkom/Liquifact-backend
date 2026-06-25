@@ -601,6 +601,14 @@ tests/load/reports/
 
 ## Resiliency & Retries
 
+### Soroban RPC Circuit Breaker
+
+Soroban RPC reads are routed through a circuit breaker to prevent cascading failures during sustained RPC outages.
+The breaker trips to an `OPEN` state after a configurable threshold of failures (default 5) and begins failing fast,
+returning a `503 Service Unavailable` with `code = 'CIRCUIT_OPEN'`.
+
+After a recovery timeout (default 10s), the breaker transitions to `HALF_OPEN` and probes the RPC. If successful, it closes and resumes normal operation; if it fails, it re-opens. State transitions are tracked as a Prometheus metric: `soroban_circuit_breaker_state_transitions_total`.
+
 ### Security notes
 
 - Remote load targets are blocked by default.

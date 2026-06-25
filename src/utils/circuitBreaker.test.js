@@ -51,7 +51,16 @@ describe('CircuitBreaker', () => {
 
         const operation = jest.fn();
 
-        await expect(cb.execute(operation)).rejects.toThrow('Circuit Breaker is OPEN. Operation failed fast.');
+        let caughtError;
+        try {
+            await cb.execute(operation);
+        } catch (err) {
+            caughtError = err;
+        }
+
+        expect(caughtError).toBeDefined();
+        expect(caughtError.message).toBe('Circuit Breaker is OPEN. Operation failed fast.');
+        expect(caughtError.code).toBe('CIRCUIT_OPEN');
         expect(operation).not.toHaveBeenCalled();
     });
 
@@ -100,5 +109,33 @@ describe('CircuitBreaker', () => {
         expect(operation).toHaveBeenCalledTimes(1);
         expect(cb.state).toBe(CircuitBreakerState.OPEN);
         expect(cb.failureCount).toBe(1); // incremented
+    });
+
+    it('should trigger onStateChange callback upon state transitions', async () => {
+        const onStateChange = jest.fn();
+        cb = new CircuitBreaker({
+            failureThreshold: 1,
+            recoveryTimeout: 5000,
+            onStateChange
+        });
+
+        const operation = jest.fn().mockRejectedValue(new Error('failure'));
+
+        // Trip the breaker
+        await expect(cb.execute(operation)).rejects.toThrow('failure');
+        expect(onStateChange).toHaveBeenCalledWith(CircuitBreakerState.CLOSED, CircuitBreakerState.OPEN);
+
+        // Fast fail won't transition
+        await expect(cb.execute(operation)).rejects.toThrow('Circuit Breaker is OPEN. Operation failed fast.');
+        expect(onStateChange).toHaveBeenCalledTimes(1);
+
+        // Advance time to HALF_OPEN
+        jest.setSystemTime(Date.now() + 5001);
+        operation.mockResolvedValue('success');
+        await cb.execute(operation);
+        
+        expect(onStateChange).toHaveBeenCalledWith(CircuitBreakerState.OPEN, CircuitBreakerState.HALF_OPEN);
+        expect(onStateChange).toHaveBeenCalledWith(CircuitBreakerState.HALF_OPEN, CircuitBreakerState.CLOSED);
+        expect(onStateChange).toHaveBeenCalledTimes(3);
     });
 });

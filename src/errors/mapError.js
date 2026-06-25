@@ -73,6 +73,16 @@ function mapError(error) {
     };
   }
 
+  if (error && typeof error === "object" && error.code === "CIRCUIT_OPEN") {
+    return {
+      status: 503,
+      code: "CIRCUIT_OPEN",
+      message: "Service temporarily unavailable due to upstream outage. Circuit breaker is OPEN.",
+      retryable: true,
+      retryHint: "Retry the request in a few moments.",
+    };
+  }
+
   const status = (error && error.status) || 500;
   return {
     status,

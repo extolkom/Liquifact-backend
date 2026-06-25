@@ -147,6 +147,18 @@ const footprintCacheEvictionsTotal = new client.Counter({
 });
 
 /**
+ * Counter: Soroban circuit breaker state transitions.
+ * Incremented each time the circuit breaker changes state (e.g., to OPEN or HALF_OPEN).
+ * @type {import('prom-client').Counter}
+ */
+const sorobanCircuitBreakerStateTransitionsTotal = new client.Counter({
+  name: 'soroban_circuit_breaker_state_transitions_total',
+  help: 'Total number of state transitions in the Soroban circuit breaker',
+  labelNames: ['state'],
+  registers: [registry],
+});
+
+/**
  * Express middleware that enforces metrics auth.
  *
  * @param {import('express').Request} req
@@ -204,6 +216,7 @@ module.exports = {
   footprintCacheHitsTotal,
   footprintCacheMissesTotal,
   footprintCacheEvictionsTotal,
+  sorobanCircuitBreakerStateTransitionsTotal,
   escrowReconciliationMismatches,
   readinessGauge,
 };
