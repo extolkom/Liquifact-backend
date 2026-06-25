@@ -18,15 +18,15 @@ jest.mock('../src/middleware/apiKey', () => ({
 
 // ── Mock the streaming helpers so CSV export tests don't need a real DB ───────
 // We expose setMockRows() so each test can control what the stream emits.
-let _mockRows = [];
-const setMockRows = (rows) => { _mockRows = rows; };
+let mockRows = [];
+const setMockRows = (rows) => { mockRows = rows; };
 
 jest.mock('../src/services/auditLogStore', () => {
   const { Readable, Transform } = require('stream');
   const original = jest.requireActual('../src/services/auditLogStore');
   return {
     ...original,
-    streamAuditEvents: jest.fn(() => Readable.from(_mockRows, { objectMode: true })),
+    streamAuditEvents: jest.fn(() => Readable.from(mockRows, { objectMode: true })),
   };
 });
 
