@@ -38,6 +38,7 @@ const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
  */
 class EscrowNotFoundError extends Error {
   /**
+   * Creates an error for a missing invoice mapping.
    * @param {string} invoiceId - The invoice ID that could not be resolved.
    */
   constructor(invoiceId) {
@@ -52,6 +53,7 @@ class EscrowNotFoundError extends Error {
  */
 class EscrowMapConfigError extends Error {
   /**
+   * Creates an error for invalid escrow map configuration.
    * @param {string} message - Human-readable configuration error.
    */
   constructor(message) {
