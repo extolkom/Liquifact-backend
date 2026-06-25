@@ -1,4 +1,4 @@
-/**
+﻿/**
  * S3-compatible storage service for invoice file uploads and presigned URLs.
  * Handles MIME validation, size enforcement, tenant scoping, and path traversal prevention.
  *
@@ -62,7 +62,7 @@ const s3Client = new S3Client({
 
 class StorageService {
   /**
-   *
+   * Creates a new StorageService instance, reading bucket name and max file size from env.
    */
   constructor() {
     this.bucket = process.env.S3_BUCKET || 'liquifact-invoices';
@@ -75,11 +75,6 @@ class StorageService {
    *
    * @param {string} filename - Raw filename from user input.
    * @returns {string} Sanitized filename safe for S3 key generation.
-   */
- 
-  /**
-   *
-   * @param filename
    */
   _sanitizeFilename(filename) {
   if (!filename || typeof filename !== 'string') {
@@ -119,17 +114,11 @@ class StorageService {
   }
 
   /**
- * Validates tenant identifiers.
- * Only alphanumeric characters, underscores, and hyphens are allowed.
- *
- * @param {string} tenantId
- * @returns {boolean}
- */
-
-
-  /**
+   * Validates tenant identifiers.
+   * Only alphanumeric characters, underscores, and hyphens are allowed.
    *
-   * @param tenantId
+   * @param {string} tenantId
+   * @returns {boolean}
    */
   _validateTenantId(tenantId) {
     return (
@@ -140,17 +129,11 @@ class StorageService {
 
 
   /**
- * Validates invoice identifiers.
- * Prevents path traversal and cross-tenant key manipulation.
- *
- * @param {string} invoiceId
- * @returns {boolean}
- */
-
-
-  /**
+   * Validates invoice identifiers.
+   * Prevents path traversal and cross-tenant key manipulation.
    *
-   * @param invoiceId
+   * @param {string} invoiceId
+   * @returns {boolean}
    */
   _validateInvoiceId(invoiceId) {
     return (
@@ -166,13 +149,6 @@ class StorageService {
    * @param {string} invoiceId - Invoice identifier.
    * @param {string} safeName - Sanitized filename.
    * @returns {string} S3 object key.
-   */
-
-  /**
-   *
-   * @param tenantId
-   * @param invoiceId
-   * @param safeName
    */
   _generateKey(tenantId, invoiceId, safeName) {
 
