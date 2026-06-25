@@ -1100,5 +1100,61 @@ WHERE id = 'your-tenant-id';
 
 ---
 
+## Soroban transaction submission queue
+
+Background Soroban transaction submissions are processed by `src/workers/txSubmitter.js` using the shared `BackgroundWorker` loop. By default, queued submissions are persisted to the `tx_submissions` table so in-flight jobs survive process restarts.
+
+### How it works
+
+1. **Enqueue** — `createTxSubmitterWorker(...).enqueueTxSubmission(payload)` writes a row to `tx_submissions` with a SHA-256 payload fingerprint and a sanitized JSON payload.
+2. **Process** — the worker dequeues jobs, runs the existing retry classifier / fee-bump logic in `submitWithRetry`, and updates row status (`processing`, `completed`, `retrying`, `failed`).
+3. **Restart** — on startup, `restore()` reloads non-terminal rows (`pending`, `processing`, `retrying`), resets interrupted `processing` jobs back to `pending`, and requeues them idempotently.
+
+Apply the migration before enabling durable mode in production:
+
+```bash
+npm run db:migrate
+```
+
+Migration file: `migrations/20260618000000_create_tx_submissions.sql`
+
+### Usage
+
+```js
+const { createTxSubmitterWorker } = require('./src/workers/txSubmitter');
+
+const submitter = createTxSubmitterWorker(submitToHorizon, {
+  retryConfig: {
+    maxRetries: 3,
+    baseDelayMs: 500,
+    maxDelayMs: 20000,
+    feeBumpMultiplier: 2,
+  },
+});
+
+await submitter.start();
+const jobId = await submitter.enqueueTxSubmission({ signedTransactionXdr: '<signed-xdr>' });
+```
+
+Pass `{ durable: false }` for in-memory-only queues (local tests and ephemeral environments).
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOROBAN_TX_SUBMIT_MAX_RETRIES` | `3` | Max in-handler retry attempts for transient Soroban errors |
+| `SOROBAN_TX_SUBMIT_BASE_DELAY_MS` | `500` | Base exponential backoff delay (ms) |
+| `SOROBAN_TX_SUBMIT_MAX_DELAY_MS` | `20000` | Backoff cap (ms) |
+| `SOROBAN_TX_FEE_BUMP_MULTIPLIER` | `2` | Fee-bump multiplier forwarded to submit handler |
+
+### Security notes
+
+- Raw secret keys and other sensitive fields (`secretKey`, `privateKey`, `seed`, `apiKey`, etc.) are redacted before persistence.
+- Only signed transaction envelopes and non-secret metadata are stored in `payload`.
+- `restore()` is idempotent — repeated startup calls do not duplicate in-memory jobs.
+- Attempt counts remain bounded by the existing retry classifier and queue retry limits.
+
+---
+
 ## License
 MIT (see root LiquiFact project for full license).

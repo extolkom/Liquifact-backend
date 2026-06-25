@@ -7,7 +7,12 @@
 
 const JobQueue = require('./jobQueue');
 const BackgroundWorker = require('./worker');
-const { JOB_STATUS } = require('./jobQueue');
+const {
+  JOB_STATUS,
+  DurableJobQueue,
+  sanitizePayloadForPersistence,
+  computePayloadFingerprint,
+} = require('./jobQueue');
 
 describe('JobQueue', () => {
   let queue;
@@ -432,6 +437,113 @@ describe('JobQueue', () => {
       const cleared = queue.clear();
       expect(cleared).toBe(0);
     });
+  });
+});
+
+function createInMemoryTxSubmissionStore() {
+  const rows = new Map();
+
+  const db = jest.fn(() => {
+    const query = {
+      _where: null,
+      _whereIn: null,
+      insert(data) {
+        rows.set(data.id, { ...data });
+        return Promise.resolve([data]);
+      },
+      where(criteria) {
+        query._where = criteria;
+        return query;
+      },
+      whereIn(_column, values) {
+        query._whereIn = values;
+        return query;
+      },
+      orderBy() {
+        return query;
+      },
+      update(patch) {
+        let matches = [...rows.values()];
+        if (query._whereIn) {
+          matches = matches.filter((row) => query._whereIn.includes(row.status));
+        }
+        if (query._where && query._where.id) {
+          matches = matches.filter((row) => row.id === query._where.id);
+        }
+        for (const row of matches) {
+          rows.set(row.id, { ...row, ...patch });
+        }
+        return Promise.resolve(matches.length);
+      },
+      then(resolve, reject) {
+        let matches = [...rows.values()];
+        if (query._whereIn) {
+          matches = matches.filter((row) => query._whereIn.includes(row.status));
+        }
+        matches.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        return Promise.resolve(matches).then(resolve, reject);
+      },
+    };
+    return query;
+  });
+
+  return { db, rows };
+}
+
+describe('DurableJobQueue persistence hooks', () => {
+  it('redacts secret-like payload fields before persistence helpers run', () => {
+    const sanitized = sanitizePayloadForPersistence({
+      signedTransactionXdr: 'AAABBB',
+      nested: { apiKey: 'secret-value' },
+    });
+
+    expect(sanitized.nested.apiKey).toBe('[REDACTED]');
+    expect(computePayloadFingerprint(sanitized)).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('persists enqueue, processing, and completed states', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const queue = new DurableJobQueue({ db });
+
+    const jobId = await queue.enqueue('submit_soroban_tx', { signedTransactionXdr: 'AAABBB' });
+    expect(rows.get(jobId).status).toBe(JOB_STATUS.PENDING);
+
+    const job = queue.dequeue();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(rows.get(jobId).status).toBe(JOB_STATUS.PROCESSING);
+
+    queue.ack(job.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(rows.get(jobId).status).toBe(JOB_STATUS.COMPLETED);
+  });
+
+  it('persists retry and failed states when attempts are exhausted', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const queue = new DurableJobQueue({ db, maxRetries: 0 });
+
+    const jobId = await queue.enqueue('submit_soroban_tx', { signedTransactionXdr: 'AAABBB' });
+    queue.dequeue();
+    queue.retry(jobId, new Error('tx_bad_seq'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(rows.get(jobId).status).toBe(JOB_STATUS.FAILED);
+    expect(rows.get(jobId).last_error).toBe('tx_bad_seq');
+  });
+
+  it('restores pending jobs idempotently after restart', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const writer = new DurableJobQueue({ db });
+
+    const jobId = await writer.enqueue('submit_soroban_tx', { signedTransactionXdr: 'AAABBB' });
+    rows.set(jobId, { ...rows.get(jobId), status: JOB_STATUS.PROCESSING, attempts: 1 });
+
+    const restoredQueue = new DurableJobQueue({ db });
+    const first = await restoredQueue.restore();
+    const second = await restoredQueue.restore();
+
+    expect(first).toEqual({ restored: 1, skipped: 0 });
+    expect(second).toEqual({ restored: 0, skipped: 0 });
+    expect(restoredQueue.getJob(jobId).status).toBe(JOB_STATUS.PENDING);
   });
 });
 
