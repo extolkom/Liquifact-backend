@@ -85,7 +85,12 @@ function handleInternalError(err, req, res, _next) {
 
   // AppError: use the status it carries
   if (err && err.status && err.status >= 400 && err.status < 500) {
-    res.status(err.status).json({ error: err.detail || err.title || err.message });
+    res.status(err.status).json({
+      error: {
+        code: err.code || String(err.status),
+        message: err.detail || err.title || err.message,
+      },
+    });
     return;
   }
 
