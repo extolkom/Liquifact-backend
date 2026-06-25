@@ -414,19 +414,34 @@ describe('RECONCILABLE_STATUSES', () => {
 describe('readFundedAmount', () => {
   const { readFundedAmount } = require('../src/services/escrowRead');
 
-  it('uses the production base-state stub when no adapter is injected', async () => {
-    // 'funded_invoice' is the stub fixture that reports fundedAmount 1000.
+  it('reads from the projection table when no adapter is injected', async () => {
+    // Seed a projection row for 'funded_invoice' — the read path now resolves
+    // funded_invoice through the projection table instead of any hardcoded
+    // fixture, so the value comes straight from event data.
+    dbState.firstResult = {
+      invoice_id: 'funded_invoice',
+      latest_event_id: 'evt_live_1',
+      latest_event_type: 'funded',
+      latest_ledger_sequence: 9001,
+      latest_event_body: JSON.stringify({ status: 'funded', fundedAmount: 1000 }),
+    };
+
     await expect(readFundedAmount('funded_invoice')).resolves.toBe(1000);
-    // Unknown id -> stub returns 0.
+  });
+
+  it('returns the neutral 0 when neither projection nor adapter has data', async () => {
+    dbState.firstResult = null; // no projection row
     await expect(readFundedAmount('some_other_invoice')).resolves.toBe(0);
   });
 
   it('accepts a bare numeric adapter return', async () => {
+    // Adapter short-circuits: the projection lookup must not run.
+    dbState.firstResult = { latest_event_body: JSON.stringify({ fundedAmount: 9999 }) };
     const amount = await readFundedAmount('inv_1', { escrowAdapter: () => Promise.resolve(750) });
     expect(amount).toBe(750);
   });
 
-  it('falls back to 0 for a non-finite on-chain value', async () => {
+  it('falls back to 0 for a non-finite adapter value', async () => {
     const amount = await readFundedAmount('inv_1', {
       escrowAdapter: () => Promise.resolve({ fundedAmount: 'not-a-number' }),
     });

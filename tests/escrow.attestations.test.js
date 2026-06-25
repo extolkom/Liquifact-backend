@@ -21,11 +21,48 @@ jest.mock('../src/logger', () => ({
   info: jest.fn(),
 }));
 
+// Stub the Knex default export with an in-memory store so we can drive the
+// projection-first path without a real database. Only the
+// `db('escrow_event_projection').where('invoice_id', id).first()` chain is
+// exercised here; Knex's full surface is not required.
+const projectionRows = new Map();
+function makeProjectionBuilder() {
+  const builder = {
+    _table: 'escrow_event_projection',
+    async first() {
+      return projectionRows.get(builder._whereId) || null;
+    },
+    where(fieldOrObj, value) {
+      builder._whereId = typeof fieldOrObj === 'string' ? String(value) : '';
+      return builder;
+    },
+  };
+  return builder;
+}
+const mockKnex = jest.fn((table) => {
+  if (table === 'escrow_event_projection') {
+    return makeProjectionBuilder();
+  }
+  // Other tables aren't exercised by the attestation read path; return a
+  // safe empty shape that resolves to null instead of throwing so the rest
+  // of the helper invocations stay quiet.
+  return {
+    _table: table,
+    where() { return this; },
+    async first() { return null; },
+  };
+});
+jest.mock('../src/db/knex', () => mockKnex);
+
 const { readEscrowStateWithAttestations, fetchAttestationAppendLog, validateInvoiceId } = require('../src/services/escrowRead');
 
 // ── unit: escrowRead attestation service ──────────────────────────────────────
 
 describe('escrowRead attestation service', () => {
+  beforeEach(() => {
+    projectionRows.clear();
+    mockKnex.mockClear();
+  });
   describe('fetchAttestationAppendLog', () => {
     it('returns array of attestation entries with hex digests', async () => {
       const mockAdapter = jest.fn().mockResolvedValue([
@@ -140,6 +177,48 @@ describe('escrowRead attestation service', () => {
 
       expect(result.attestations).toEqual([]);
     });
+
+    it('reads base state from the projection when no adapter is injected', async () => {
+      projectionRows.set('inv_proj_att', {
+        invoice_id: 'inv_proj_att',
+        latest_event_id: 'evt_p',
+        latest_event_type: 'funded',
+        latest_ledger_sequence: '42',
+        latest_event_body: JSON.stringify({ status: 'funded', fundedAmount: 2500 }),
+      });
+
+      const result = await readEscrowStateWithAttestations('inv_proj_att', {
+        attestationAdapter: () => Promise.resolve([]),
+      });
+
+      expect(result).toMatchObject({
+        invoiceId: 'inv_proj_att',
+        status: 'funded',
+        fundedAmount: 2500,
+        attestations: [],
+        source: 'projection',
+        fromProjection: true,
+      });
+      expect(result.latest_ledger_sequence).toBe(42);
+    });
+
+    it('falls through to the neutral RPC stub when projection is missing', async () => {
+      projectionRows.clear(); // safety
+      const result = await readEscrowStateWithAttestations('inv_unknown', {
+        attestationAdapter: () => Promise.resolve([]),
+      });
+
+      expect(result).toMatchObject({
+        invoiceId: 'inv_unknown',
+        status: 'not_found',
+        fundedAmount: 0,
+      });
+      // The neutral stub must NOT fabricate funded/settled values.
+      expect(result.fundedAmount).toBe(0);
+    });
+  });
+
+  describe('validateInvoiceId', () => {
   });
 
   describe('validateInvoiceId', () => {
