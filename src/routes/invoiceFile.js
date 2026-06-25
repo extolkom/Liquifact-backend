@@ -17,11 +17,12 @@ const router = express.Router();
 const invoiceFiles = new Map();
 
 /**
- *
- * @param buffer
+ * Computes the SHA-256 hash of a buffer.
+ * @param {Buffer} buffer The input buffer.
+ * @returns {string} The SHA-256 hash as a hexadecimal string.
  */
 function computeHash(buffer) {
-  return crypto.createHash('sha256').update(buffer).digest('hex');
+  return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
 /**

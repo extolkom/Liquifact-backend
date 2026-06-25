@@ -153,8 +153,8 @@ function decodeCursor(cursor, expectedSortField) {
  */
 class CursorError extends Error {
   /**
-   *
-   * @param message
+   * Creates an instance of CursorError.
+   * @param {string} message The error message.
    */
   constructor(message) {
     super(message);

@@ -24,17 +24,18 @@ function setSharedWorker(worker) {
 
 let client;
 try {
-  client = require('prom-client');
-} catch (e) {
+  client = require("prom-client");
+} catch (_e) {
   // In test environments where prom-client may not be installed, provide a noop shim
   client = {
     Counter: class {
       /**
-       *
+       * Creates a new mock Counter instance.
        */
       constructor() { }
       /**
-       *
+       * Increments the mock counter.
+       * @returns {void}
        */
       inc() { }
     },
@@ -206,9 +207,9 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
             payload,
           },
         });
-      } catch (e) {
-        // don't let audit failures stop retries
-        logger.warn({ err: e.message }, 'Failed to append audit event for webhook attempt');
+      } catch (_e) {
+        // don\'t let audit failures stop retries
+        logger.warn({ err: _e.message }, \'Failed to append audit event for webhook attempt\');
       }
     };
 
@@ -219,24 +220,24 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
       // record successful delivery
       try {
         await appendAuditEvent({
-          eventType: 'webhook_delivery',
-          action: 'webhook.dispatch',
-          actorType: 'system',
+          eventType: \'webhook_delivery\',
+          action: \'webhook.dispatch\',
+          actorType: \'system\',
           actorId: tenant_id,
-          targetType: 'invoice',
+          targetType: \'invoice\',
           targetId: invoiceId,
           statusCode: result && result.status ? Number(result.status) : 200,
           metadata: { url: webhook_url, payload, attempt: 1 },
         });
-      } catch (e) {
-        logger.warn({ err: e.message }, 'Failed to append audit event for webhook success');
+      } catch (_e) {
+        logger.warn({ err: _e.message }, \'Failed to append audit event for webhook success\');
       }
 
-      logger.info({ event, invoiceId, tenant_id }, 'Webhook emitted successfully');
+      logger.info({ event, invoiceId, tenant_id }, \'Webhook emitted successfully\');
     } catch (error) {
       // exhausted retries -> dead-letter
       try {
-        await db('webhook_dead_letters').insert({
+        await db(\'webhook_dead_letters\').insert({
           tenant_id,
           invoice_id: invoiceId,
           event,
@@ -245,21 +246,21 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
           attempts: maxRetries + 1,
           created_at: new Date(),
         });
-      } catch (e) {
-        logger.warn({ err: e.message }, 'Failed to persist webhook dead-letter');
+      } catch (_e) {
+        logger.warn({ err: _e.message }, \'Failed to persist webhook dead-letter\');
       }
 
       // emit delivery-failure metric
       try {
         emitWebhook._failureCounter.inc();
-      } catch (e) {
+      } catch (_e) {
         // ignore metric errors
       }
 
-      logger.error({ event, invoiceId, error: error.message }, 'Failed to emit webhook');
+      logger.error({ event, invoiceId, error: error.message }, \'Failed to emit webhook\');
     }
   } catch (error) {
-    logger.error({ event, invoiceId, error: error.message }, 'Failed to emit webhook');
+    logger.error({ event, invoiceId, error: error.message }, \'Failed to emit webhook\');
   }
 }
 

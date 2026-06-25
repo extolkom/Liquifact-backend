@@ -5,8 +5,9 @@ const { appendAuditEvent, redactValue } = require('../services/auditLogStore');
 const MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 /**
- *
- * @param req
+ * Determines the actor (user or API client) from the request.
+ * @param {import("express").Request} req The Express request object.
+ * @returns {{actorType: string, actorId: string}} The actor's type and ID.
  */
 function getActor(req) {
   if (req.user && typeof req.user === 'object') {
@@ -26,16 +27,18 @@ function getActor(req) {
 }
 
 /**
- *
- * @param req
+ * Checks if the request path is an admin action.
+ * @param {import("express").Request} req The Express request object.
+ * @returns {boolean} True if the request is for an admin action.
  */
 function isAdminAction(req) {
   return req.path.startsWith('/api/admin/');
 }
 
 /**
- *
- * @param req
+ * Builds a base audit event object from the request.
+ * @param {import("express").Request} req The Express request object.
+ * @returns {object} The base audit event object.
  */
 function buildBaseEvent(req) {
   const actor = getActor(req);
@@ -50,8 +53,9 @@ function buildBaseEvent(req) {
 }
 
 /**
- *
- * @param req
+ * Creates an audit context object for the given request.
+ * @param {import("express").Request} req The Express request object.
+ * @returns {{logAdminAction: Function, logWebhookDelivery: Function}} The audit context with logging functions.
  */
 function createAuditContext(req) {
   const baseEvent = buildBaseEvent(req);
@@ -96,10 +100,12 @@ function createAuditContext(req) {
 }
 
 /**
- *
- * @param req
- * @param res
- * @param next
+ * Express middleware for auditing administrative actions.
+ * Automatically logs POST, PUT, PATCH, DELETE requests to /api/admin/.
+ * @param {import("express").Request} req The Express request object.
+ * @param {import("express").Response} res The Express response object.
+ * @param {import("express").NextFunction} next The Express next middleware function.
+ * @returns {void}
  */
 function auditLogMiddleware(req, res, next) {
   req.audit = createAuditContext(req);

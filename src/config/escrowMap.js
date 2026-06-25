@@ -33,8 +33,8 @@ const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
 
 class EscrowNotFoundError extends Error {
   /**
-   *
-   * @param invoiceId
+   * Creates an instance of EscrowNotFoundError.
+   * @param {string} invoiceId The ID of the invoice for which no escrow was found.
    */
   constructor(invoiceId) {
     super(`No active escrow contract mapped for invoiceId: ${invoiceId}`);
@@ -45,8 +45,8 @@ class EscrowNotFoundError extends Error {
 
 class EscrowMapConfigError extends Error {
   /**
-   *
-   * @param message
+   * Creates an instance of EscrowMapConfigError.
+   * @param {string} message The error message.
    */
   constructor(message) {
     super(message);
@@ -55,8 +55,9 @@ class EscrowMapConfigError extends Error {
 }
 
 /**
- * Parse and validate the raw config JSON from the environment.
- * @returns {{ mappings: Array, defaultEnvironment: string, allowlistEnabled: boolean }}
+ * Parses and validates the raw escrow map configuration from the environment variable.
+ * @returns {{ mappings: Array, defaultEnvironment: string, allowlistEnabled: boolean }} The parsed and validated configuration.
+ * @throws {EscrowMapConfigError} If the configuration JSON is malformed or invalid.
  */
 function _parseConfig() {
   const raw = process.env.ESCROW_ADDR_BY_INVOICE;
@@ -67,7 +68,7 @@ function _parseConfig() {
   let parsed;
   try {
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (_error) {
     throw new EscrowMapConfigError(
       'ESCROW_ADDR_BY_INVOICE is not valid JSON. Check your environment configuration.'
     );
@@ -99,7 +100,9 @@ function _parseConfig() {
 let _cache = null;
 
 /**
- *
+ * Retrieves the escrow map configuration, utilizing a memoized cache.
+ * @returns {{ mappings: Array, defaultEnvironment: string, allowlistEnabled: boolean }} The escrow map configuration.
+ * @throws {EscrowMapConfigError} If the configuration is invalid during parsing.
  */
 function _getConfig() {
   if (!_cache) {

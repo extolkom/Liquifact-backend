@@ -47,11 +47,12 @@ try {
   promClient = {
     Counter: class {
       /**
-       *
+       * Creates a new mock Counter instance.
        */
       constructor() {}
       /**
-       *
+       * Increments the mock counter.
+       * @returns {void}
        */
       inc() {}
     },
@@ -218,13 +219,13 @@ async function writeDeadLetter({ tenantId, invoiceId, event, payload, lastError,
     logger.warn({ err: dbErr.message }, 'Failed to persist webhook dead-letter record');
   }
 
-  // Increment Prometheus dead-letter counter
-  try {
-    deadLetterCounter().inc();
-  } catch (_) {
-    // Ignore metric errors
-  }
-}
+      // Increment Prometheus dead-letter counter
+      try {
+        deadLetterCounter().inc();
+      } catch (_error) {
+        // Ignore metric errors
+      }
+    }
 
 // ---------------------------------------------------------------------------
 // Job handler factory
