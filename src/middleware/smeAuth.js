@@ -6,7 +6,16 @@ const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
 
 /**
  * Middleware: verifies the authenticated user has a bound Stellar wallet address.
- * Accepts wallet from req.user.walletAddress or x-stellar-address header (stub).
+ * 
+ * Wallet resolution:
+ * - Resolves wallet address exclusively from req.user.walletAddress
+ * - Does NOT accept x-stellar-address header (header fallback removed for security)
+ * - Rejects requests where no verified wallet is bound with RFC 7807 403
+ * 
+ * @param {import('express').Request} req - Express request
+ * @param {import('express').Response} res - Express response
+ * @param {import('express').NextFunction} next - Express next
+ * @returns {void}
  */
 function authorizeSmeWallet(req, res, next) {
   if (!req.user) {
@@ -18,7 +27,7 @@ function authorizeSmeWallet(req, res, next) {
     }));
   }
 
-  const wallet = req.user.walletAddress || req.headers['x-stellar-address'];
+  const wallet = req.user.walletAddress;
 
   if (!wallet) {
     return next(new AppError({
@@ -45,6 +54,7 @@ function authorizeSmeWallet(req, res, next) {
 /**
  * Middleware factory: verifies the authenticated user owns the invoice.
  * @param {Array} invoices - Invoice collection to check against.
+ * @returns {import('express').RequestHandler} Express middleware
  */
 function verifyInvoiceOwner(invoices) {
   return function (req, res, next) {

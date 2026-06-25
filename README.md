@@ -251,6 +251,37 @@ curl -H "Authorization: Bearer <token>" \
 
 ---
 
+## SME Wallet Authorization
+
+The `src/middleware/smeAuth.js` middleware binds Stellar wallet authorization strictly to the authenticated principal.
+
+### Wallet resolution
+
+- `authorizeSmeWallet` resolves the wallet address **only** from `req.user.walletAddress`.
+- The `x-stellar-address` header is **not accepted** as a wallet source. Any such header is silently ignored.
+- Requests with no verified wallet bound to the account are rejected with an RFC 7807 `403 Forbidden`.
+
+### Address format
+
+All wallet addresses are validated against `^G[A-Z2-7]{55}$` (Stellar Ed25519 public key format). Invalid formats yield a `400` before any capital-movement logic runs.
+
+### Error responses
+
+| Condition | Status | type URI |
+|-----------|--------|----------|
+| No `req.user` (unauthenticated) | 401 | `.../probs/unauthorized` |
+| No wallet bound to account | 403 | `.../probs/forbidden` |
+| Invalid address format | 400 | `.../probs/validation-error` |
+
+### Security notes
+
+- Header spoofing is eliminated: a caller cannot assert a wallet they do not control by supplying `x-stellar-address`.
+- Wallet identity is derived from the JWT principal (`req.user`), which is set by the auth middleware before `authorizeSmeWallet` runs.
+- `req.user` shape is unchanged; downstream KYC/tenant resolution is unaffected.
+- `verifyInvoiceOwner` accepts ownership by either `req.user.id` matching `invoice.ownerId` or `req.walletAddress` matching `invoice.smeWallet`, preventing privilege escalation via wallet substitution.
+
+---
+
 ## Invoice Upload Security
 
 LiquiFact uses tenant-scoped object storage and strict validation controls for invoice uploads.
