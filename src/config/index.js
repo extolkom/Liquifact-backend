@@ -58,11 +58,28 @@ let config;
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
   if (!parsed.success) {
-    console.error('Config validation failed:', parsed.error.format());
-    throw new Error(`Invalid configuration: ${parsed.error.message}`);
+    throw parsed.error;
   }
   config = parsed.data;
   return config;
+}
+
+/**
+ * Format and log a redacted summary of validation issues to console.error.
+ * Never prints secret values (only key names and validation error messages).
+ * @param {z.ZodError} error - The Zod error to summarize.
+ * @returns {void}
+ */
+function logRedactedSummary(error) {
+  console.error('Configuration validation failed:');
+  if (error && Array.isArray(error.issues)) {
+    error.issues.forEach(issue => {
+      const key = issue.path.join('.');
+      console.error(`- [${key}]: ${issue.message}`);
+    });
+  } else {
+    console.error(error ? error.message : 'Unknown configuration error');
+  }
 }
 
 /**
@@ -115,6 +132,7 @@ const securityHeaders = {
 module.exports = {
   validate,
   get,
+  logRedactedSummary,
   ConfigSchema,
   securityHeaders,
 };

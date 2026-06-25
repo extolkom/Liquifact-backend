@@ -36,6 +36,9 @@ Part of the LiquiFact stack: frontend (Next.js) | backend (this repo) | contract
    # Edit .env with your database configuration
    ```
 
+   > [!IMPORTANT]
+   > **Startup Validation Gate**: The application validates all required environment variables at boot time before binding to a port. If the configuration is invalid (e.g. `JWT_SECRET` is shorter than 32 characters or KYC keys are half-configured), the server will print a redacted error summary showing the failed keys and exit immediately. Secret values are never exposed in validation output.
+
 4. Start database services
 
    ```bash
