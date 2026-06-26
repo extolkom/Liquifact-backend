@@ -14,22 +14,47 @@
 
 let client;
 try {
-  client = require('prom-client');
-} catch (e) {
+  client = require("prom-client");
+} catch (_e) {
   // Fallback shim for environments without prom-client (tests)
   client = {
     Registry: class {
-      constructor() { this.contentType = 'text/plain'; }
-      metrics() { return ''; }
+      /**
+       * Creates a new mock Registry instance.
+       */
+      constructor() { this.contentType = "text/plain"; }
+      /**
+       * Returns mock metrics.
+       * @returns {string}
+       */
+      metrics() { return ""; }
     },
     collectDefaultMetrics: () => { },
     Counter: class {
+      /**
+       * Creates a new mock Counter instance.
+       */
       constructor() {}
+      /**
+       * Increments the mock counter.
+       * @returns {void}
+       */
       inc() {}
     },
     Gauge: class {
+      /**
+       * Creates a new mock Gauge instance.
+       */
       constructor() {}
+      /**
+       * Sets the mock gauge value.
+       * @returns {void}
+       */
       set() {}
+      /**
+       * Sets the mock gauge to current time.
+       * @returns {void}
+       */
       setToCurrentTime() {}
     },
   };

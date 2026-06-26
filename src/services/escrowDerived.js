@@ -128,17 +128,13 @@ function computeFundedPercent(fundedAmount, totalAmount) {
  * @param {Date|null|undefined} [opts.now] - Explicit reference time override.
  * @returns {number|null} Null when maturityDate is absent or unparseable.
  */
-function computeDaysToMaturity(maturityDate, opts = {}) {
-  if (maturityDate == null) { return null; }
+function computeDaysToMaturity(maturityDate, now = new Date()) {
+  if (maturityDate == null) {return null;}
   const maturity =
     maturityDate instanceof Date ? maturityDate : new Date(maturityDate);
-  if (isNaN(maturity.getTime())) { return null; }
-
-  // Support legacy callers that pass a Date directly as the second argument.
-  const resolvedOpts = opts instanceof Date ? { now: opts } : opts;
-  const ref = resolveReferenceTime(resolvedOpts);
-
-  return Math.floor((maturity.getTime() - ref.getTime()) / MS_PER_DAY);
+  if (isNaN(maturity.getTime())) {return null;}
+  const nowMs = (now instanceof Date ? now : new Date()).getTime();
+  return Math.floor((maturity.getTime() - nowMs) / MS_PER_DAY);
 }
 
 /**

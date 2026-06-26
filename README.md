@@ -79,6 +79,7 @@ Optional Sentry error tracking is supported through the `SENTRY_DSN` environment
 
 - Invoice payload bodies and invoice-related fields
 - Authorization headers and bearer tokens
+- JWT claims (issuer, audience) and algorithms
 - API keys and secret values
 - Stellar XDR / Stellar-specific payloads
 

@@ -267,7 +267,19 @@ function validateSimulationParams(params) {
  * @returns {Promise<Object>}
  */
 async function simulateOrThrow(params) {
-  validateSimulationParams(params);
+  try {
+    validateSimulationParams(params);
+  } catch (validationError) {
+    // Return a structured failure result instead of propagating the throw,
+    // so callers can inspect result.status / result.error uniformly.
+    return {
+      status: SIMULATION_STATUS.FAILURE,
+      footprint: null,
+      cached: false,
+      errorType: SIMULATION_ERROR_TYPES.VALIDATION_ERROR,
+      error: validationError,
+    };
+  }
 
   const { operation, invoiceId, funderPublicKey, transactionXdr, options = {} } = params;
   const useCache = options.useCache !== false;

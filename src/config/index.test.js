@@ -25,16 +25,25 @@ describe('Config Validation', () => {
     expect(config.NODE_ENV).toBe('development');
     expect(config.PORT).toBe(3001);
     expect(config.JWT_SECRET).toBe(process.env.JWT_SECRET);
+    expect(config.JWT_ISSUER).toBe('liquifact-platform');
+    expect(config.JWT_AUDIENCE).toBe('liquifact-client');
+    expect(config.JWT_ALGORITHMS).toBe('HS256');
   });
 
   test('overrides defaults', () => {
     process.env.PORT = '8080';
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = 'prod-secret-32-chars-minimum-required';
+    process.env.JWT_ISSUER = 'custom-issuer';
+    process.env.JWT_AUDIENCE = 'custom-audience';
+    process.env.JWT_ALGORITHMS = 'HS256,HS384';
 
     const config = validate();
     expect(config.PORT).toBe(8080);
     expect(config.NODE_ENV).toBe('production');
+    expect(config.JWT_ISSUER).toBe('custom-issuer');
+    expect(config.JWT_AUDIENCE).toBe('custom-audience');
+    expect(config.JWT_ALGORITHMS).toBe('HS256,HS384');
   });
 
   test('rejects short JWT_SECRET', () => {
@@ -49,7 +58,7 @@ describe('Config Validation', () => {
 
   test('rejects invalid NODE_ENV', () => {
     process.env.NODE_ENV = 'invalid';
-    expect(() => validate()).toThrow(/Enum/i);
+    expect(() => validate()).toThrow(/Invalid option/i);
   });
 
   test('get() throws if not validated', () => {

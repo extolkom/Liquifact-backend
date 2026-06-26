@@ -25,11 +25,13 @@ function setSharedWorker(worker) {
 let client;
 try {
   client = require('prom-client');
-} catch (e) {
+} catch (_e) {
   // In test environments where prom-client may not be installed, provide a noop shim
   client = {
     Counter: class {
+      /** No-op constructor for the prom-client shim. @returns {void} */
       constructor() { }
+      /** No-op increment for the prom-client shim. @returns {void} */
       inc() { }
     },
   };
@@ -142,7 +144,7 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
 
     // shouldRetry: only on network/timeouts or 5xx
     const shouldRetry = (err) => {
-      if (!err) return false;
+      if (!err) { return false; }
       // network/socket errors often have a code
       if (err.code) {
         return ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(err.code) || err.name === 'AbortError';
@@ -246,7 +248,7 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
       // emit delivery-failure metric
       try {
         emitWebhook._failureCounter.inc();
-      } catch (e) {
+      } catch (_e) {
         // ignore metric errors
       }
 

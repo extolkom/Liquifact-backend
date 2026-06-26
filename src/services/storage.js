@@ -1,4 +1,4 @@
-/**
+﻿/**
  * S3-compatible storage service for invoice file uploads and presigned URLs.
  * Handles MIME validation, size enforcement, tenant scoping, and path traversal prevention.
  *
@@ -62,6 +62,9 @@ const s3Client = new S3Client({
 });
 
 class StorageService {
+  /**
+   * Creates a new StorageService instance, reading bucket name and max file size from env.
+   */
   constructor() {
     this.bucket = process.env.S3_BUCKET || 'liquifact-invoices';
     this.maxFileSize = MAX_FILE_SIZE;
@@ -74,7 +77,6 @@ class StorageService {
    * @param {string} filename - Raw filename from user input.
    * @returns {string} Sanitized filename safe for S3 key generation.
    */
- 
   _sanitizeFilename(filename) {
   if (!filename || typeof filename !== 'string') {
     const err = new Error('Invalid filename');
@@ -113,14 +115,12 @@ class StorageService {
   }
 
   /**
- * Validates tenant identifiers.
- * Only alphanumeric characters, underscores, and hyphens are allowed.
- *
- * @param {string} tenantId
- * @returns {boolean}
- */
-
-
+   * Validates tenant identifiers.
+   * Only alphanumeric characters, underscores, and hyphens are allowed.
+   *
+   * @param {string} tenantId
+   * @returns {boolean}
+   */
   _validateTenantId(tenantId) {
     return (
       typeof tenantId === 'string' &&
@@ -130,14 +130,12 @@ class StorageService {
 
 
   /**
- * Validates invoice identifiers.
- * Prevents path traversal and cross-tenant key manipulation.
- *
- * @param {string} invoiceId
- * @returns {boolean}
- */
-
-
+   * Validates invoice identifiers.
+   * Prevents path traversal and cross-tenant key manipulation.
+   *
+   * @param {string} invoiceId
+   * @returns {boolean}
+   */
   _validateInvoiceId(invoiceId) {
     return (
       typeof invoiceId === 'string' &&
@@ -153,7 +151,6 @@ class StorageService {
    * @param {string} safeName - Sanitized filename.
    * @returns {string} S3 object key.
    */
-
   _generateKey(tenantId, invoiceId, safeName) {
 
   if (!this._validateTenantId(tenantId)) {

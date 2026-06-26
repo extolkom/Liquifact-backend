@@ -151,10 +151,10 @@ function validateAsset(asset) {
  * Fetches token metadata from Stellar Horizon for traditional assets.
  *
  * @param {string} code - Asset code.
- * @param {string} issuer - Asset issuer public key.
+ * @param {string} _issuer - Asset issuer public key.
  * @returns {Promise<Object>} Token metadata.
  */
-async function fetchFromHorizon(code, issuer) {
+async function fetchFromHorizon(code, _issuer) {
   // TODO: Replace with actual Horizon API call
   // const response = await fetch(`${HORIZON_URL}/assets?asset_code=${code}&asset_issuer=${issuer}`);
   // const data = await response.json();

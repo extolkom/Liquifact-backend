@@ -32,6 +32,10 @@
 const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
 
 class EscrowNotFoundError extends Error {
+  /**
+   * Creates an EscrowNotFoundError for the given invoiceId.
+   * @param {string} invoiceId - The invoice ID that had no active mapping.
+   */
   constructor(invoiceId) {
     super(`No active escrow contract mapped for invoiceId: ${invoiceId}`);
     this.name = 'EscrowNotFoundError';
@@ -40,6 +44,10 @@ class EscrowNotFoundError extends Error {
 }
 
 class EscrowMapConfigError extends Error {
+  /**
+   * Creates an EscrowMapConfigError with the given message.
+   * @param {string} message - Description of the configuration problem.
+   */
   constructor(message) {
     super(message);
     this.name = 'EscrowMapConfigError';
@@ -90,6 +98,12 @@ function _parseConfig() {
 // Simple module-level in-memory cache
 let _cache = null;
 
+/**
+ * Returns the parsed and cached escrow map config.
+ * Parses and caches on first call; returns cached value on subsequent calls.
+ *
+ * @returns {{ mappings: Array, defaultEnvironment: string, allowlistEnabled: boolean }}
+ */
 function _getConfig() {
   if (!_cache) {
     _cache = _parseConfig();
@@ -111,7 +125,7 @@ function _resetCache() {
  * @throws {EscrowMapConfigError} when the config JSON is malformed
  */
 function resolveEscrowAddress(invoiceId) {
-  const { mappings, defaultEnvironment, allowlistEnabled } = _getConfig();
+  const { mappings, defaultEnvironment, allowlistEnabled: _allowlistEnabled } = _getConfig();
   const env = process.env.NODE_ENV || defaultEnvironment;
 
   const match = mappings.find(
