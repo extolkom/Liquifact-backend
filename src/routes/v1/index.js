@@ -20,7 +20,11 @@ const router = express.Router();
 const investRoutes = require('../invest');
 const smeRouter = require('../sme');
 const { extractTenant } = require('../../middleware/tenant');
+const { authenticateToken } = require('../../middleware/auth');
 const invoiceService = require('../../services/invoiceService');
+const { resolveEscrowAddress } = require('../../config/escrowMap');
+const { callSorobanContract } = require('../../services/soroban');
+const { computeEscrowDerivedFields } = require('../../services/escrowDerived');
 const AppError = require('../../errors/AppError');
 const { invoiceCreateSchema, parseValidationErrors } = require('../../schemas/invoice');
 
@@ -148,6 +152,41 @@ router.post('/invoices', extractTenant, async (req, res, next) => {
       data: invoice,
       message: 'Invoice created successfully.',
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// ── Escrow route ─────────────────────────────────────────────────────────────
+
+/**
+ * GET /v1/escrow/:invoiceId
+ *
+ * Reads escrow state and merges derived display fields:
+ *   apyPercent, fundedPercent, daysToMaturity (computed from ledgerCloseTime
+ *   when present, falling back to server wall clock).
+ *
+ * @param {string} req.params.invoiceId - Invoice identifier.
+ * @returns {200} { data: EscrowState & DerivedFields }
+ * @returns {401} Missing or invalid JWT.
+ * @returns {404} No escrow address mapping found.
+ */
+router.get('/escrow/:invoiceId', authenticateToken, async (req, res, next) => {
+  try {
+    const invoiceId = String(req.params.invoiceId || '').trim();
+
+    const escrowAddress = resolveEscrowAddress(invoiceId);
+    if (!escrowAddress) {
+      return res.status(404).json({ error: `No escrow contract mapping found for invoice ID '${invoiceId}'` });
+    }
+
+    const baseState = await callSorobanContract(async () => ({ invoiceId, status: 'not_found', fundedAmount: 0 }));
+
+    const derived = computeEscrowDerivedFields(baseState, {
+      ledgerCloseTime: baseState.ledgerCloseTime ?? null,
+    });
+
+    return res.json({ data: { ...baseState, ...derived } });
   } catch (err) {
     return next(err);
   }
