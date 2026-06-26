@@ -117,8 +117,145 @@ async function findCommitments(investorAddress, invoiceId) {
   return db(TABLE).where({ investor_address: investorAddress, invoice_id: invoiceId }).orderBy('created_at', 'desc');
 }
 
+// ── In-memory investor lock store ─────────────────────────────────────────────
+// Keys are "${invoiceId}:${funderAddress}" for O(1) lookup.
+
+/** @type {Map<string, Object>} */
+const _lockStore = new Map();
+
+/**
+ * Validates a Stellar account address (G... or C..., 56 chars, base32).
+ *
+ * @param {string} address
+ * @returns {{ valid: boolean, reason?: string }}
+ */
+function validateAddress(address) {
+  if (!address || typeof address !== 'string') {
+    return { valid: false, reason: 'funderAddress is required and must be a string' };
+  }
+  if (!/^[GC][A-Z2-7]{55}$/.test(address)) {
+    return { valid: false, reason: `invalid Stellar address: "${address}"` };
+  }
+  return { valid: true };
+}
+
+/**
+ * Upsert a lock record into the in-memory store.
+ *
+ * @param {Object} params
+ * @param {string} params.funderAddress
+ * @param {string} params.claimNotBefore
+ * @param {number} params.investorEffectiveYieldBps
+ * @param {string} params.invoiceId
+ * @returns {Object} The stored lock record.
+ */
+function setInvestorLock({ funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId }) {
+  const key = `${invoiceId}:${funderAddress}`;
+  const record = { funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId, stale: true };
+  _lockStore.set(key, record);
+  return record;
+}
+
+/**
+ * Retrieve a single lock by invoiceId and funderAddress.
+ *
+ * @param {string} invoiceId
+ * @param {string} funderAddress
+ * @returns {Object|undefined}
+ */
+function getInvestorLock(invoiceId, funderAddress) {
+  return _lockStore.get(`${invoiceId}:${funderAddress}`);
+}
+
+/**
+ * Returns all locks, optionally filtered by invoiceId, with offset pagination.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.invoiceId]  - Optional invoiceId filter.
+ * @param {number} [opts.limit=20]   - Page size (1–100).
+ * @param {number} [opts.page=1]     - 1-based page number.
+ * @returns {{ data: Object[], meta: { total: number, page: number, limit: number, totalPages: number, hasMore: boolean } }}
+ */
+function getAllInvestorLocks({ invoiceId, limit = 20, page = 1 } = {}) {
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const safePage = Math.max(1, page);
+  let items = [..._lockStore.values()];
+  if (invoiceId) {
+    items = items.filter((l) => l.invoiceId === invoiceId);
+  }
+  const total = items.length;
+  const offset = (safePage - 1) * safeLimit;
+  const data = items.slice(offset, offset + safeLimit);
+  return {
+    data,
+    meta: {
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit) || 1,
+      hasMore: offset + data.length < total,
+    },
+  };
+}
+
+/**
+ * Returns all locks for a specific funderAddress, optionally filtered by invoiceId,
+ * with offset pagination.
+ *
+ * @param {string} funderAddress
+ * @param {Object} [opts]
+ * @param {string} [opts.invoiceId]  - Optional invoiceId filter.
+ * @param {number} [opts.limit=20]   - Page size (1–100).
+ * @param {number} [opts.page=1]     - 1-based page number.
+ * @returns {{ data: Object[], meta: { total: number, page: number, limit: number, totalPages: number, hasMore: boolean } }}
+ */
+function getInvestorLocksByAddress(funderAddress, { invoiceId, limit = 20, page = 1 } = {}) {
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const safePage = Math.max(1, page);
+  let items = [..._lockStore.values()].filter((l) => l.funderAddress === funderAddress);
+  if (invoiceId) {
+    items = items.filter((l) => l.invoiceId === invoiceId);
+  }
+  const total = items.length;
+  const offset = (safePage - 1) * safeLimit;
+  const data = items.slice(offset, offset + safeLimit);
+  return {
+    data,
+    meta: {
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit) || 1,
+      hasMore: offset + data.length < total,
+    },
+  };
+}
+
+/** Clear all locks (test helper). */
+function clearInvestorLocks() {
+  _lockStore.clear();
+}
+
+/** Seed representative test fixtures (test helper). */
+function seedInvestorLocks() {
+  const addr1 = 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK';
+  const addr2 = 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL';
+
+  for (let i = 1; i <= 5; i++) {
+    setInvestorLock({ funderAddress: addr1, claimNotBefore: `2026-0${i}-01T00:00:00Z`, investorEffectiveYieldBps: 500 + i * 50, invoiceId: `inv_${7788 + i - 1}` });
+  }
+  setInvestorLock({ funderAddress: addr2, claimNotBefore: '2026-06-01T00:00:00Z', investorEffectiveYieldBps: 800, invoiceId: 'inv_9900' });
+}
+
 module.exports = {
   persistCommitment,
   updateCommitment,
   findCommitments,
+  validateAddress,
+  setInvestorLock,
+  getInvestorLock,
+  getAllInvestorLocks,
+  getInvestorLocksByAddress,
+  clearInvestorLocks,
+  seedInvestorLocks,
 };
