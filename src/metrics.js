@@ -498,6 +498,26 @@ const readinessGauge = new client.Gauge({
   registers: [registry],
 });
 
+/**
+ * Counter: operator alerts raised when `contractListRefresh` detects an on-chain
+ * LiquifactEscrow wasm `SCHEMA_VERSION` that diverges from the expected/known
+ * registry version.
+ *
+ * Labelled by the comparison `status` (`ahead` — contract is newer than anything
+ * the backend tracks; `unknown` — version not present in the registry) so ops can
+ * distinguish an upgrade from an unexpected/rolled-back deployment. A non-zero
+ * value is an actionable signal that the backend may not yet support the on-chain
+ * contract — see `docs/wasm-ops.md`.
+ *
+ * @type {import('prom-client').Counter}
+ */
+const contractWasmVersionMismatchAlertsTotal = new client.Counter({
+  name: 'contract_wasm_version_mismatch_alerts_total',
+  help: 'Total operator alerts raised when contractListRefresh detects an on-chain wasm SCHEMA_VERSION mismatch',
+  labelNames: ['status'],
+  registers: [registry],
+});
+
 module.exports = {
   registry,
   metricsAuth,
@@ -506,4 +526,5 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
+  contractWasmVersionMismatchAlertsTotal,
 };
