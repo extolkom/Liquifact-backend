@@ -10,6 +10,7 @@
 
 const db = require('../db/knex');
 const logger = require('../logger');
+const { createCacheStore } = require('./cacheStore');
 
 const KYC_STATUSES = {
   PENDING: 'pending',
@@ -17,6 +18,36 @@ const KYC_STATUSES = {
   REJECTED: 'rejected',
   EXEMPTED: 'exempted',
 };
+
+/**
+ * Default TTL (in seconds) for the external KYC status cache when
+ * `KYC_STATUS_CACHE_TTL_SECONDS` is not set. Kept deliberately short so that
+ * status changes propagate quickly even in the (theoretical) absence of an
+ * invalidating event.
+ *
+ * @constant {number}
+ */
+const DEFAULT_STATUS_CACHE_TTL_SECONDS = 30;
+
+/**
+ * Cache key prefix for per-SME external KYC status entries.
+ *
+ * @constant {string}
+ */
+const STATUS_CACHE_KEY_PREFIX = 'kyc:status:';
+
+/**
+ * Short-TTL cache for external KYC provider status reads.
+ *
+ * Only results sourced from the external provider are cached, and entries are
+ * explicitly invalidated whenever the SME's record is written (including KYC
+ * webhook updates and revocations). This guarantees a revocation event always
+ * wins over a previously cached approval. See {@link readProviderStatusCached}
+ * and {@link invalidateKycStatusCache}.
+ *
+ * @type {import('./cacheStore').MemoryCacheStore}
+ */
+const kycStatusCache = createCacheStore();
 
 const PROVIDER_STATUS_MAP = {
   pending: KYC_STATUSES.PENDING,
@@ -54,6 +85,95 @@ const getKycProviderConfig = () => {
     apiSecret: process.env.KYC_PROVIDER_SECRET || null, // optional secondary key used for webhook HMAC verification
   };
 };
+
+/**
+ * Resolves the configured TTL (in milliseconds) for the external KYC status
+ * cache from `KYC_STATUS_CACHE_TTL_SECONDS`.
+ *
+ * A non-positive, non-numeric, or zero value disables caching entirely (the
+ * provider is consulted on every read). This makes it possible to switch the
+ * cache off in environments that require strict freshness without code changes.
+ *
+ * @returns {number} TTL in milliseconds, or 0 when caching is disabled.
+ */
+function getStatusCacheTtlMs() {
+  const raw = process.env.KYC_STATUS_CACHE_TTL_SECONDS;
+  if (raw === undefined || raw === null || raw === '') {
+    return DEFAULT_STATUS_CACHE_TTL_SECONDS * 1000;
+  }
+
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0;
+  }
+
+  return Math.floor(seconds * 1000);
+}
+
+/**
+ * Builds the cache key for an SME's external KYC status entry.
+ *
+ * @param {string} smeId - The SME identifier.
+ * @returns {string} The namespaced cache key.
+ */
+function statusCacheKey(smeId) {
+  return `${STATUS_CACHE_KEY_PREFIX}${smeId}`;
+}
+
+/**
+ * Invalidates the cached external KYC status for an SME.
+ *
+ * Called on every persisted status write (verification, rejection, exemption,
+ * provider refresh, and KYC webhook ingestion) so that a cached approval can
+ * never outlive a subsequent revocation or status change event.
+ *
+ * @param {string} smeId - The SME identifier whose cache entry to drop.
+ * @returns {void}
+ */
+function invalidateKycStatusCache(smeId) {
+  if (!smeId || typeof smeId !== 'string') {
+    return;
+  }
+  kycStatusCache.del(statusCacheKey(smeId));
+}
+
+/**
+ * Reads an SME's external KYC status through a short-TTL cache.
+ *
+ * On a cache hit (within TTL) the cached status object is returned and the
+ * `loader` — which performs the external provider call — is **not** invoked,
+ * avoiding redundant provider traffic and rate-limit pressure. On a miss (or
+ * when caching is disabled via TTL) the `loader` is awaited and its result is
+ * cached for the configured TTL.
+ *
+ * Security: the cache is never a source of stale "approved" data past an event.
+ * The `loader` ({@link verifyWithExternalProvider}) persists the fresh status,
+ * which invalidates this key via {@link invalidateKycStatusCache} before the
+ * new value is stored, and any later webhook/manual write invalidates it again.
+ *
+ * @param {string} smeId - The SME identifier (used as the cache key).
+ * @param {function(): Promise<{status: string, recordId: (string|null), verifiedAt: (string|null)}>} loader
+ *   Async loader that fetches the authoritative status from the provider.
+ * @returns {Promise<{status: string, recordId: (string|null), verifiedAt: (string|null)}>}
+ *   The cached or freshly-loaded KYC status object.
+ */
+async function readProviderStatusCached(smeId, loader) {
+  const ttlMs = getStatusCacheTtlMs();
+  if (ttlMs <= 0) {
+    // Caching disabled — always hit the provider.
+    return loader();
+  }
+
+  const key = statusCacheKey(smeId);
+  const cached = kycStatusCache.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const fresh = await loader();
+  kycStatusCache.set(key, fresh, ttlMs);
+  return fresh;
+}
 
 /**
  * Normalizes provider-specific status values to internal KYC statuses.
@@ -133,6 +253,10 @@ async function persistKycRecord({ smeId, status, providerRecordId = null, verifi
   } else {
     await db('kyc_records').insert(record);
   }
+
+  // Drop any cached provider status so a revocation/status change always wins
+  // over a previously cached approval.
+  invalidateKycStatusCache(smeId);
 
   return {
     smeId,
@@ -214,6 +338,12 @@ async function verifyWithExternalProvider(smeId, _smeData) {
  * Gets KYC status for an SME.
  * Checks external provider if available, falls back to persisted DB record or mock store.
  *
+ * When the external provider is enabled, status reads are served through a
+ * short-TTL cache ({@link readProviderStatusCached}) to avoid hammering the
+ * provider during hot funding flows. Cache entries are invalidated on any
+ * persisted status change (including KYC webhooks), so a revocation always
+ * supersedes a cached approval.
+ *
  * @param {string} smeId - The SME identifier.
  * @returns {Promise<{status: string, recordId?: string, verifiedAt?: string}>}
  */
@@ -226,7 +356,7 @@ async function getKycStatus(smeId) {
 
   if (config.enabled) {
     try {
-      return await verifyWithExternalProvider(smeId, {});
+      return await readProviderStatusCached(smeId, () => verifyWithExternalProvider(smeId, {}));
     } catch (error) {
       logger.warn({ smeId, error: error.message }, 'KYC provider lookup failed, falling back to persisted status');
       const record = await readKycRecord(smeId);
@@ -388,13 +518,14 @@ function canFundWithKycStatus(kycStatus) {
 }
 
 /**
- * Clears the in-memory mock KYC record store.
+ * Clears the in-memory mock KYC record store and the external KYC status cache.
  * Intended for tests/dev usage.
  *
  * @returns {void}
  */
 function resetMockRecords() {
   mockKycRecords.clear();
+  kycStatusCache.clear();
 }
 
 module.exports = {
@@ -409,4 +540,6 @@ module.exports = {
   canFundWithKycStatus,
   resetMockRecords,
   getKycProviderConfig,
+  getStatusCacheTtlMs,
+  invalidateKycStatusCache,
 };
