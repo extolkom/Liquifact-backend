@@ -50,6 +50,7 @@ const marketplaceRoutes = require('./routes/marketplace');
 const retentionRoutes = require('./routes/retention');
 const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
 const adminEscrowRoutes = require('./routes/adminEscrow');
+const reconciliationRoutes = require('./routes/reconciliation');
 const kycRoutes = require('./routes/kyc');
 const v1Routes = require('./routes/v1');
 
