@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const db = require('../db/knex');
 const JobQueue = require('../workers/jobQueue');
 const BackgroundWorker = require('../workers/worker');
@@ -112,6 +113,25 @@ async function getEligibleInvoices(tenantId, policy, batchSize) {
 }
 
 /**
+ * Generates a salted SHA-256 hash of a PII field value.
+ * Uses the invoice ID as a local salt and the system JWT_SECRET as a global salt
+ * to protect against dictionary attacks.
+ * @param {string} value - Clear text PII value
+ * @param {string} salt - Local salt (invoice UUID)
+ * @returns {string|null} - Hex-encoded salted SHA-256 hash, or null if value is null/undefined
+ */
+function hashPiiValue(value, salt) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const systemSalt = process.env.JWT_SECRET || 'default-retention-salt';
+  return crypto
+    .createHash('sha256')
+    .update(`${salt}:${systemSalt}:${value}`)
+    .digest('hex');
+}
+
+/**
  * Purges PII from an invoice (or simulates for dry run)
  * @param {string} invoiceId - Invoice UUID
  * @param {string[]} piiFields - PII fields to purge
@@ -128,7 +148,7 @@ async function purgeInvoicePii(invoiceId, piiFields, dryRun = false) {
     if (current) {
       piiFields.forEach(field => {
         if (current[field] !== null) {
-          oldValues[field] = current[field];
+          oldValues[field] = hashPiiValue(current[field], invoiceId);
         }
       });
     }
@@ -202,6 +222,7 @@ async function createJobExecution(executionData) {
  * Updates retention job execution record
  * @param {string} executionId - Execution UUID
  * @param {Object} updateData - Update data
+ * @returns {Promise<void>} - Resolves when complete
  */
 async function updateJobExecution(executionId, updateData) {
   try {
@@ -332,7 +353,8 @@ retentionWorker.registerHandler('retention_purge', async (job) => {
               metadata: {
                 policyId: policy.id,
                 dryRun: result.dryRun,
-                invoiceNumber: invoice.invoice_number
+                invoiceNumber: invoice.invoice_number,
+                purgedFieldsCount: result.purgedFields.length
               }
             });
 
@@ -415,6 +437,10 @@ function scheduleRetentionPurge(options) {
     batchSize = 100,
     delayMs = 0
   } = options;
+
+  if (piiFields) {
+    validatePiiFields(piiFields);
+  }
 
   const payload = {
     tenantId,
@@ -509,6 +535,9 @@ module.exports = {
   getEligibleInvoices,
   purgeInvoicePii,
   logRetentionOperation,
+  createJobExecution,
+  updateJobExecution,
+  hashPiiValue,
   jobExecutions,
   retentionQueue,
   retentionWorker

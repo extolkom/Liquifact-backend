@@ -36,7 +36,7 @@ The LiquiFact data retention system provides automated PII (Personally Identifia
 - `invoice_id` - Reference to affected invoice
 - `operation` - Type of operation performed
 - `pii_fields` - PII fields affected
-- `old_values` - Original PII values before purging
+- `old_values` - Salted SHA-256 hashes of original PII values (for real purges) or clear-text values (for dry runs) before purging
 - `performed_by` - User who initiated the operation
 
 #### Job Executions (`retention_job_executions`)
@@ -78,6 +78,15 @@ The system currently supports purging the following PII fields from invoices:
 - Validates eligibility and legal hold status
 - Provides detailed preview of what would be purged
 - Essential for compliance validation
+
+### Forensic Audit Snapshots
+- For destructive (non-dry-run) purges, the before-state of purged PII values is captured as salted SHA-256 hashes inside `old_values`.
+- Prevents storing clear-text PII in audit logs while still providing a provable forensic record of what was redacted.
+- Hashing details:
+  - Algorithm: SHA-256
+  - Local Salt: Invoice UUID (prevents cross-invoice rainbow table attacks)
+  - Global Salt: System `JWT_SECRET` (prevents dictionary attacks if database is compromised)
+  - Computation: `sha256(invoiceId + ":" + JWT_SECRET + ":" + clearTextValue)`
 
 ## Usage Examples
 
