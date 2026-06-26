@@ -16,8 +16,6 @@
 'use strict';
 
 const db = require('../db/knex');
-const { getSharedStore } = require('./cacheStore');
-const { invalidatePrefix } = require('../middleware/cache');
 
 const TABLE = 'investor_commitments';
 
@@ -34,6 +32,7 @@ const MAX_STROOP_AMOUNT = 10n ** 18n;
  */
 class CommitmentValidationError extends Error {
   /**
+   * Constructs a CommitmentValidationError.
    * @param {string} message - Human-readable description.
    * @param {string} code    - Machine-readable error code.
    */

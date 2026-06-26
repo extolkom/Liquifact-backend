@@ -387,7 +387,7 @@ if (!this._validateInvoiceId(invoiceId)) {
   async getFile({ key }) {
     if (process.env.NODE_ENV === 'test') {
       const entry = this._inMemoryStore.get(key);
-      if (!entry) throw new Error('File not found');
+      if (!entry) { throw new Error('File not found'); }
       return entry.body;
     }
     const command = new GetObjectCommand({ Bucket: this.bucket, Key: key });
