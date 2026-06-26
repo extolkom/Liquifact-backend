@@ -12,6 +12,7 @@
  */
 
 const crypto = require('crypto');
+const metrics = require('../metrics');
 
 /**
  * Job status enumeration
@@ -60,6 +61,8 @@ class JobQueue {
     
     // Retry queue: separate queue for jobs that need retrying
     this.retryQueue = [];
+
+    metrics.registerJobQueue(this);
   }
 
   /**

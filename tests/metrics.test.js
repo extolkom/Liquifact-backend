@@ -2,12 +2,20 @@
 
 const request = require('supertest');
 const { createApp } = require('../src/app');
+const metrics = require('../src/metrics');
+const JobQueue = require('../src/workers/jobQueue');
+const BackgroundWorker = require('../src/workers/worker');
 
 describe('GET /metrics', () => {
   let app;
 
   beforeAll(() => {
     app = createApp();
+  });
+
+  beforeEach(() => {
+    metrics.resetMetricsForTests();
+    metrics.registry.resetMetrics();
   });
 
   afterEach(() => {
@@ -56,6 +64,59 @@ describe('GET /metrics', () => {
       const res = await request(app).get('/metrics');
       expect(res.status).toBe(200);
       expect(res.text).toMatch(/# HELP/);
+    });
+
+    it('includes queue and worker metrics when registered', async () => {
+      const queue = new JobQueue();
+      const worker = new BackgroundWorker({ jobQueue: queue, pollIntervalMs: 50, maxConcurrency: 1 });
+      worker.registerHandler('test', async () => {});
+
+      const jobId = worker.enqueue('test', { data: 'test' });
+      const queuedJob = queue.getJob(jobId);
+      expect(queuedJob).toBeDefined();
+
+      metrics.refreshMetrics();
+
+      const res = await request(app).get('/metrics');
+      expect(res.status).toBe(200);
+      expect(res.text).toMatch(/liquifact_job_queue_depth/);
+      expect(res.text).toMatch(/liquifact_job_retry_queue_size/);
+      expect(res.text).toMatch(/liquifact_worker_inflight_count/);
+      expect(res.text).toMatch(/liquifact_job_queue_depth \d+/);
+    });
+  });
+
+  describe('metrics instrumentation', () => {
+    it('updates queue depth and retry queue size from job queue stats', () => {
+      const queue = new JobQueue();
+      const jobId = queue.enqueue('test', { data: 'pending' });
+      metrics.registerJobQueue(queue);
+
+      queue.dequeue();
+      queue.retry(jobId, new Error('failed'));
+      metrics.refreshMetrics();
+
+      const output = metrics.registry.metrics();
+      expect(output).toMatch(/liquifact_job_queue_depth \d+/);
+      expect(output).toMatch(/liquifact_job_retry_queue_size 1/);
+    });
+
+    it('updates worker in-flight count from worker stats', async () => {
+      const queue = new JobQueue();
+      const worker = new BackgroundWorker({ jobQueue: queue, pollIntervalMs: 50, maxConcurrency: 2 });
+      worker.registerHandler('test', async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      });
+      worker.start();
+      worker.enqueue('test', { data: 1 });
+      worker.enqueue('test', { data: 2 });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      metrics.refreshMetrics();
+
+      const output = metrics.registry.metrics();
+      expect(output).toMatch(/liquifact_worker_inflight_count [12]/);
+      await worker.stop();
     });
   });
 

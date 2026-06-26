@@ -67,6 +67,16 @@ Environment variables:
 
 Do not store secrets in source control. Use `.env` locally and deployment secrets in production.
 
+### Prometheus metrics
+
+The application exposes Prometheus metrics on `GET /metrics` (subject to the same auth rules). Additional gauges added for background job observability:
+
+- `liquifact_job_queue_depth`: Number of pending jobs currently waiting in background queues (includes main queue across registered job queues).
+- `liquifact_job_retry_queue_size`: Number of jobs currently waiting in retry queues across registered job queues.
+- `liquifact_worker_inflight_count`: Number of jobs currently being processed by registered background workers.
+
+These gauges are updated by sampling registered `JobQueue` and `BackgroundWorker` instances and are intentionally bounded to avoid high-cardinality labels.
+
 ---
 
 ## Development
