@@ -1400,59 +1400,76 @@ WHERE id = 'your-tenant-id';
 
 ---
 
-## Soroban transaction submission queue
+## Job Queue Durability
 
-Background Soroban transaction submissions are processed by `src/workers/txSubmitter.js` using the shared `BackgroundWorker` loop. By default, queued submissions are persisted to the `tx_submissions` table so in-flight jobs survive process restarts.
+The background job queue (`src/workers/jobQueue.js`) is in-memory by default. An optional
+durable backing persists every job transition to the `background_jobs` table so that queued
+and in-flight jobs survive a process crash.
+
+### Enabling persistence
+
+```bash
+# .env
+JOB_QUEUE_PERSISTENCE_ENABLED=true
+DATABASE_URL=postgresql://user:pass@localhost:5432/liquifact
+```
+
+Run the migration before starting the server:
+
+```bash
+npm run db:migrate   # applies migrations/20260625000000_create_background_jobs.sql
+```
 
 ### How it works
 
-1. **Enqueue** — `createTxSubmitterWorker(...).enqueueTxSubmission(payload)` writes a row to `tx_submissions` with a SHA-256 payload fingerprint and a sanitized JSON payload.
-2. **Process** — the worker dequeues jobs, runs the existing retry classifier / fee-bump logic in `submitWithRetry`, and updates row status (`processing`, `completed`, `retrying`, `failed`).
-3. **Restart** — on startup, `restore()` reloads non-terminal rows (`pending`, `processing`, `retrying`), resets interrupted `processing` jobs back to `pending`, and requeues them idempotently.
+| Event | In-memory | With persistence |
+|-------|-----------|-----------------|
+| `enqueue` | adds to queue | + INSERT into `background_jobs` |
+| `dequeue` | marks PROCESSING | + UPDATE status → processing |
+| `ack` | marks COMPLETED | + UPDATE status + stamps `acked_at` |
+| `retry` | marks RETRYING / FAILED | + UPDATE status |
+| **restart** | queue is empty | unacked rows are requeued automatically |
 
-Apply the migration before enabling durable mode in production:
+On startup, `worker.start()` calls `JobQueue.restoreFromPersistence()` which SELECTs rows
+where `status IN ('pending','processing','retrying') AND acked_at IS NULL`, then requeues
+them into the in-memory structures before the poll loop begins.
 
-```bash
-npm run db:migrate
+### Guarantees and limits
+
+- **At-least-once delivery** — jobs that were dequeued but never acked (in-flight at crash
+  time) are requeued on the next startup.
+- **No double-run of acked jobs** — `acked_at` is stamped atomically with status=completed;
+  recovery unconditionally skips any row with `acked_at IS NOT NULL`.
+- **Bounded recovery** — at most `JOB_QUEUE_MAX_RECOVERY_ROWS` (default 1 000) rows are
+  fetched per startup, preventing an unbounded DB scan from blocking the process.
+- **Hard retry cap preserved** — `maxRetries` (default 3, hard max 10) is enforced
+  identically whether persistence is on or off.
+- **Payload validation on restore** — each recovered payload is round-tripped through
+  `JSON.parse(JSON.stringify())` before re-enqueueing; rows with corrupt payloads are
+  skipped and logged.
+- **DB failures are non-fatal** — all persistence calls are fire-and-forget with internal
+  error logging. A DB outage degrades to the in-memory path; it never crashes the worker.
+
+### Architecture
+
+```
+JobQueue (options.persistence = adapter)
+    │
+    ├── enqueue()  ──► persistJob(job)
+    ├── dequeue()  ──► updateJobStatus(job)   status → processing
+    ├── ack()      ──► ackJob(jobId)          status → completed, acked_at = now
+    ├── retry()    ──► updateJobStatus(job)   status → retrying | failed
+    └── restoreFromPersistence()
+              └──► recoverUnackedJobs()  SELECT … WHERE acked_at IS NULL
+
+BackgroundWorker.start()
+    └── if queue._persistence → restoreFromPersistence() → then _poll()
 ```
 
-Migration file: `migrations/20260618000000_create_tx_submissions.sql`
-
-### Usage
-
-```js
-const { createTxSubmitterWorker } = require('./src/workers/txSubmitter');
-
-const submitter = createTxSubmitterWorker(submitToHorizon, {
-  retryConfig: {
-    maxRetries: 3,
-    baseDelayMs: 500,
-    maxDelayMs: 20000,
-    feeBumpMultiplier: 2,
-  },
-});
-
-await submitter.start();
-const jobId = await submitter.enqueueTxSubmission({ signedTransactionXdr: '<signed-xdr>' });
-```
-
-Pass `{ durable: false }` for in-memory-only queues (local tests and ephemeral environments).
-
-### Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SOROBAN_TX_SUBMIT_MAX_RETRIES` | `3` | Max in-handler retry attempts for transient Soroban errors |
-| `SOROBAN_TX_SUBMIT_BASE_DELAY_MS` | `500` | Base exponential backoff delay (ms) |
-| `SOROBAN_TX_SUBMIT_MAX_DELAY_MS` | `20000` | Backoff cap (ms) |
-| `SOROBAN_TX_FEE_BUMP_MULTIPLIER` | `2` | Fee-bump multiplier forwarded to submit handler |
-
-### Security notes
-
-- Raw secret keys and other sensitive fields (`secretKey`, `privateKey`, `seed`, `apiKey`, etc.) are redacted before persistence.
-- Only signed transaction envelopes and non-secret metadata are stored in `payload`.
-- `restore()` is idempotent — repeated startup calls do not duplicate in-memory jobs.
-- Attempt counts remain bounded by the existing retry classifier and queue retry limits.
+The persistence adapter is created by `createJobPersistence(db, options)` from
+`src/workers/jobPersistence.js` and injected into `JobQueue` via `options.persistence`.
+The feature flag wiring lives in whichever bootstrap file initialises the queue
+(e.g. `src/jobs/webhookDelivery.js`, `src/jobs/retentionPurge.js`).
 
 ---
 
