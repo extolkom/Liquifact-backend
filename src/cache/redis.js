@@ -44,6 +44,10 @@ function getRedisClient() {
 module.exports = {
   getRedisClient,
 };
+const DEFAULT_TIMEOUT_MS = 500;
+const MIN_TIMEOUT_MS = 50;
+const MAX_TIMEOUT_MS = 5000;
+
 
 /**
  * Parses a raw value into a positive integer within a specified range.
