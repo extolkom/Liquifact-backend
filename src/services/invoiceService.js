@@ -302,6 +302,67 @@ async function deleteInvoice(id, tenantId) {
   return db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
 }
 
+/**
+ * Aggregates invoice counts by status/category, scoped to tenant and SME owner.
+ *
+ * Scopes queries to tenant_id and sme_id, excluding soft-deleted invoices.
+ * Categories are mapped as follows:
+ * - open: pending_verification, verified
+ * - funded: funded
+ * - settled: settled, paid
+ * - defaulted: defaulted
+ * Other statuses (e.g. withdrawn) are excluded.
+ *
+ * @param {string} tenantId - Tenant identifier.
+ * @param {string} smeId - SME owner identifier.
+ * @returns {Promise<Object>} Object mapping categories to counts.
+ * @throws {TypeError} When tenantId or smeId is missing.
+ */
+async function getSmeInvoiceCounts(tenantId, smeId) {
+  if (!tenantId) {
+    throw new TypeError('tenantId is required');
+  }
+  if (!smeId) {
+    throw new TypeError('smeId is required');
+  }
+
+  const rows = await db('invoices')
+    .select('status')
+    .count('* as count')
+    .where({ tenant_id: tenantId, sme_id: smeId })
+    .whereNull('deleted_at')
+    .groupBy('status');
+
+  const metrics = {
+    open: 0,
+    funded: 0,
+    settled: 0,
+    defaulted: 0,
+  };
+
+  const OPEN_STATUSES = ['pending_verification', 'verified'];
+  const FUNDED_STATUSES = ['funded'];
+  const SETTLED_STATUSES = ['settled', 'paid'];
+  const DEFAULTED_STATUSES = ['defaulted'];
+
+  rows.forEach((row) => {
+    const status = row.status;
+    const count = Number(row.count) || 0;
+
+    if (OPEN_STATUSES.includes(status)) {
+      metrics.open += count;
+    } else if (FUNDED_STATUSES.includes(status)) {
+      metrics.funded += count;
+    } else if (SETTLED_STATUSES.includes(status)) {
+      metrics.settled += count;
+    } else if (DEFAULTED_STATUSES.includes(status)) {
+      metrics.defaulted += count;
+    }
+  });
+
+  return metrics;
+}
+
 // ---------------------------------------------------------------------------
 // KYC helpers (in-memory — retained for backward compat with existing tests)
 // ---------------------------------------------------------------------------
@@ -369,6 +430,7 @@ module.exports = {
   createInvoice,
   updateInvoice,
   deleteInvoice,
+  getSmeInvoiceCounts,
   // KYC helpers (in-memory)
   getInvoicesByKycStatus,
   updateInvoiceKycStatus,

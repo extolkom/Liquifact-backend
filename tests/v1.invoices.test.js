@@ -26,8 +26,8 @@
 // integration tests talk to a real in-memory SQLite database.
 // ---------------------------------------------------------------------------
 jest.mock('../src/db/knex', () => {
-  const knex = require('knex');
-  const config = require('../knexfile')['test'];
+  const knex = jest.requireActual('knex');
+  const config = jest.requireActual('../knexfile')['test'];
   return knex(config);
 });
 
@@ -109,6 +109,9 @@ function postInvoice(tenantId, overrides = {}) {
   const body = {
     amount: 500,
     customer: 'Acme Corp',
+    seller: 'Seller Corp',
+    currency: 'USD',
+    dueDate: '2026-12-31',
     ...overrides,
   };
   return request(app)
@@ -155,7 +158,13 @@ describe('POST /v1/invoices — creation', () => {
     const res = await request(app)
       .post('/v1/invoices')
       .set('x-tenant-id', TENANT_A)
-      .send({ amount: 200, buyer: 'Buyer Name Ltd' });
+      .send({
+        amount: 200,
+        buyer: 'Buyer Name Ltd',
+        seller: 'Seller Corp',
+        currency: 'USD',
+        dueDate: '2026-12-31'
+      });
 
     expect(res.status).toBe(201);
     expect(res.body.data.customer).toBe('Buyer Name Ltd');

@@ -8,51 +8,25 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../../middleware/auth');
-const { mockInvoices } = require('../../services/invoiceService');
+const { extractTenant } = require('../../middleware/tenant');
+const invoiceService = require('../../services/invoiceService');
 
-/**
- * Categorizes a raw invoice status into dashboard metrics categories.
- * 
- * Mapping follows LiquifactEscrow contract invariants:
- * - Open: Invoices awaiting or having passed verification but not yet funded.
- * - Funded: Invoices with an active on-chain escrow.
- * - Settled: Invoices that have been fully paid or settled.
- * - Defaulted: Invoices that failed to meet payment terms.
- * 
- * @param {string} status - Raw invoice status from the database.
- * @returns {string|null} Dashboard category or null if it should be excluded (e.g., 'withdrawn').
- */
-function mapStatusToCategory(status) {
-  const OPEN_STATUSES = ['pending_verification', 'verified'];
-  const FUNDED_STATUSES = ['funded'];
-  const SETTLED_STATUSES = ['settled', 'paid'];
-  const DEFAULTED_STATUSES = ['defaulted'];
-
-  if (OPEN_STATUSES.includes(status)) {
-    return 'open';
-  }
-  if (FUNDED_STATUSES.includes(status)) {
-    return 'funded';
-  }
-  if (SETTLED_STATUSES.includes(status)) {
-    return 'settled';
-  }
-  if (DEFAULTED_STATUSES.includes(status)) {
-    return 'defaulted';
-  }
-  
-  return null; // Exclude 'withdrawn' and others
-}
 
 /**
  * @swagger
  * /api/sme/metrics:
  *   get:
  *     summary: Get SME dashboard metrics
- *     description: Returns aggregated invoice metrics for the authenticated SME user
+ *     description: Returns aggregated, tenant- and owner-scoped invoice metrics for the authenticated SME user.
  *     tags: [SME]
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: header
+ *         name: x-tenant-id
+ *         schema:
+ *           type: string
+ *         description: Tenant identifier (optional if supplied via JWT claim)
  *     responses:
  *       200:
  *         description: Metrics retrieved successfully
@@ -76,35 +50,51 @@ function mapStatusToCategory(status) {
  *                     defaulted:
  *                       type: integer
  *                       description: Number of defaulted invoices
+ *                 meta:
+ *                   type: object
+ *                   properties:
+ *                     timestamp:
+ *                       type: string
+ *                       format: date-time
+ *                     version:
+ *                       type: string
+ *                 error:
+ *                   type: object
+ *                   nullable: true
  *                 timestamp:
  *                   type: string
  *                   format: date-time
+ *       400:
+ *         description: Bad Request - Missing tenant context
  *       401:
  *         description: Unauthorized
  */
-router.get('/metrics', authenticateToken, (req, res) => {
-  const userId = req.user.id || req.user.sub;
-  
-  const userInvoices = mockInvoices.filter(inv => inv.ownerId === userId);
-  
-  const metrics = {
-    open: 0,
-    funded: 0,
-    settled: 0,
-    defaulted: 0
-  };
+router.get('/metrics', authenticateToken, extractTenant, async (req, res, next) => {
+  try {
+    const userId = req.user.id || req.user.sub;
+    const tenantId = req.tenantId;
 
-  userInvoices.forEach(inv => {
-    const category = mapStatusToCategory(inv.status);
-    if (category) {
-      metrics[category]++;
+    if (!tenantId) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Tenant context required'
+      });
     }
-  });
 
-  return res.json({
-    data: metrics,
-    timestamp: new Date().toISOString()
-  });
+    const metrics = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
+
+    return res.json({
+      data: metrics,
+      meta: {
+        timestamp: new Date().toISOString(),
+        version: '0.1.0'
+      },
+      error: null,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 module.exports = router;
