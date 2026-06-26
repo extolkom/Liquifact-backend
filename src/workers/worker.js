@@ -20,7 +20,8 @@
  */
 
 const JobQueue = require('./jobQueue');
-const logger   = require('../logger');
+const logger = require('../logger');
+const metrics = require('../metrics');
 
 /**
  * Background worker that processes queued jobs.
@@ -58,7 +59,11 @@ class BackgroundWorker {
 
     this.isRunning      = false;
     this.processingCount = 0;
-    this.pollTimer      = null;
+    this.pollTimer = null;
+
+    metrics.registerWorker(this);
+    this.processingCount = 0;
+    this.pollTimer = null;
   }
 
   // ---------------------------------------------------------------------------
