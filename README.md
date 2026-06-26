@@ -608,6 +608,113 @@ liquifact-backend/
 
 For the full end-to-end model (indexer → projection → `GET /api/escrow`, funding via `escrowSubmit`, reconciliation, signing modes, and env contracts), see **[`docs/escrow-integration-overview.md`](./docs/escrow-integration-overview.md)**.
 
+---
+
+## Escrow Reconciliation
+
+Nightly reconciliation compares the DB-side `fundedTotal` against the on-chain `funded_amount` for every invoice in `linked_escrow`, `funded`, or `partially_funded` state. Each run is persisted to the `reconciliation_runs` table and metrics are emitted to Prometheus.
+
+### Architecture
+
+| Component | Location | Notes |
+|-----------|----------|-------|
+| Job | `src/jobs/reconcileEscrow.js` | Injectable `dbClient` and `escrowAdapter` for testability |
+| Metrics | `src/metrics.js` | Four new Prometheus instruments (see below) |
+| History API | `GET /api/admin/reconciliation/runs` | Admin-only, tenant-scoped, paginated |
+| Migration | `migrations/20260429000000_create_reconciliation_runs.js` | One row per run; `reconciled_at` indexed |
+| Ops guide | `docs/ops-reconcile.md` | Full architecture, alerting rules, troubleshooting |
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `escrow_reconciliation_mismatches_total` | Counter | Cumulative per-invoice mismatch count (use with `increase()` in alerts) |
+| `escrow_reconciliation_mismatched_invoices` | Gauge | Mismatch count in the **most recent** run |
+| `escrow_reconciliation_drift_magnitude` | Gauge | Sum of `|DB − on-chain|` across all mismatches in the most recent run |
+| `escrow_reconciliation_drift_alerts_total` | Counter | Runs that breached `RECONCILIATION_DRIFT_THRESHOLD` |
+
+Suggested Prometheus alert rules:
+
+```promql
+# Alert on any drift detected in the last 26 hours:
+increase(escrow_reconciliation_mismatches_total[26h]) > 0
+
+# Alert when a run explicitly exceeded the configured threshold:
+increase(escrow_reconciliation_drift_alerts_total[26h]) > 0
+```
+
+### Drift threshold alerting
+
+Set `RECONCILIATION_DRIFT_THRESHOLD` (integer, default `1`) to control when a run is treated as a threshold breach. When the number of mismatches in a single run meets or exceeds this value:
+
+1. `escrow_reconciliation_drift_alerts_total` is incremented.
+2. An **error-level** structured log is emitted with `mismatches`, `threshold`, `totalDrift`, and `reconciledAt` fields.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RECONCILIATION_DRIFT_THRESHOLD` | `1` | Mismatch count that triggers a drift alert log and counter increment |
+
+### History endpoint
+
+```
+GET /api/admin/reconciliation/runs
+Authorization: Bearer <admin-token>   (or X-API-Key)
+X-Tenant-Id: <tenant-id>
+```
+
+Returns a paginated list of recent reconciliation run summaries, newest first. Per-invoice `results` are excluded from list rows — raw on-chain values are never leaked here.
+
+**Query parameters**
+
+| Param | Default | Range | Description |
+|-------|---------|-------|-------------|
+| `limit` | 20 | 1–100 | Rows per page |
+| `page` | 1 | ≥ 1 | 1-based page number |
+
+**Example response**
+
+```json
+{
+  "data": [
+    {
+      "id": "b1c2d3e4-...",
+      "total": 150,
+      "matches": 148,
+      "mismatches": 2,
+      "errors": 0,
+      "reconciled_at": "2026-06-25T02:00:00.000Z",
+      "created_at": "2026-06-25T02:00:01.000Z"
+    }
+  ],
+  "meta": {
+    "total": 42,
+    "page": 1,
+    "limit": 20,
+    "totalPages": 3,
+    "hasMore": true,
+    "timestamp": "...",
+    "version": "0.1.0"
+  },
+  "message": "Reconciliation runs retrieved successfully."
+}
+```
+
+**Security**
+
+- Admin-only: requires a valid JWT bearer token or API key.
+- Tenant-scoped: `x-tenant-id` header or JWT `tenantId` claim required.
+- No raw on-chain values (contract addresses, XDR, ledger keys) are surfaced in any response or error.
+
+### Running reconciliation manually
+
+```bash
+node -e "require('./src/jobs/reconcileEscrow').performReconciliation().then(s => console.log(s))"
+```
+
+For full ops guidance (cron scheduling, Soroban RPC config, error handling, troubleshooting), see [`docs/ops-reconcile.md`](./docs/ops-reconcile.md).
+
+---
+
 ## Escrow Address Mapping
 
 The API supports invoice-to-escrow contract address resolution using environment-based configuration for early phases. This allows mapping invoice IDs to their corresponding Stellar escrow contract addresses without requiring on-chain registry lookups.

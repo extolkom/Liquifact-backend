@@ -256,6 +256,42 @@ const escrowReconciliationMismatches = new client.Counter({
 });
 
 /**
+ * Gauge: Number of mismatched invoices in the most recent reconciliation run.
+ * Set to the `mismatches` count after each `performReconciliation()` completes.
+ * Use this to alert on a per-run basis rather than tracking cumulative drift.
+ * @type {import('prom-client').Gauge}
+ */
+const escrowReconciliationMismatchedInvoicesGauge = new client.Gauge({
+  name: 'escrow_reconciliation_mismatched_invoices',
+  help: 'Number of invoices with escrow drift detected in the most recent reconciliation run',
+  registers: [registry],
+});
+
+/**
+ * Gauge: Total drift magnitude (sum of absolute differences) across all
+ * mismatched invoices in the most recent reconciliation run.
+ * Set after each `performReconciliation()` completes.
+ * @type {import('prom-client').Gauge}
+ */
+const escrowReconciliationDriftMagnitudeGauge = new client.Gauge({
+  name: 'escrow_reconciliation_drift_magnitude',
+  help: 'Sum of absolute funding differences (DB − on-chain) across all mismatched invoices in the most recent run',
+  registers: [registry],
+});
+
+/**
+ * Counter: Runs whose mismatch count exceeded the configured drift threshold.
+ * Incremented once per `performReconciliation()` run that breaches
+ * `RECONCILIATION_DRIFT_THRESHOLD`. Alerts on sustained or large-scale drift.
+ * @type {import('prom-client').Counter}
+ */
+const escrowReconciliationDriftAlertsTotal = new client.Counter({
+  name: 'escrow_reconciliation_drift_alerts_total',
+  help: 'Total number of reconciliation runs that exceeded the configured mismatch drift threshold',
+  registers: [registry],
+});
+
+/**
  * Counter: Maturity reminder email delivery attempts.
  * Incremented for each attempt to send a maturity reminder email (including retries).
  * @type {import('prom-client').Counter}
@@ -346,7 +382,9 @@ module.exports = {
   footprintCacheHitsTotal,
   footprintCacheMissesTotal,
   footprintCacheEvictionsTotal,
-  sorobanCircuitBreakerStateTransitionsTotal,
   escrowReconciliationMismatches,
+  escrowReconciliationMismatchedInvoicesGauge,
+  escrowReconciliationDriftMagnitudeGauge,
+  escrowReconciliationDriftAlertsTotal,
   readinessGauge,
 };
