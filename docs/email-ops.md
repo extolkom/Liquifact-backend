@@ -127,3 +127,55 @@ Direct upload via multipart form (multer), validated server-side.
 | `AWS_SECRET_ACCESS_KEY` | - | S3 secret key |
 | `S3_BUCKET` | `liquifact-invoices` | S3 bucket name |
 | `BODY_LIMIT_INVOICE` | `512kb` | Max invoice file size |
+
+---
+
+## Observability — Prometheus Metrics
+
+Two counters are emitted per delivery attempt. Both carry **bounded** label sets to prevent Prometheus time-series cardinality explosion.
+
+### `maturity_reminder_delivery_attempts_total`
+
+Incremented once per attempt, regardless of outcome.
+
+**Labels:**
+
+| Label      | Allowed values                                          |
+|------------|---------------------------------------------------------|
+| `reason`   | `smtp_timeout`, `smtp_reject`, `template_error`, `unknown` |
+| `job_type` | `maturity_reminder`, `unknown`                          |
+
+On a successful send the `reason` label is `unknown` (no failure to categorise).
+
+### `maturity_reminder_dead_letter_total`
+
+Incremented only when the job handler throws (i.e. the message is dead-lettered).
+
+**Labels:** same as above, with `reason` populated by the failure class.
+
+### Reason normalisation
+
+Raw SMTP error strings are **never** written directly to a label. The `normalizeReminderReason` helper (in `src/metrics.js`) maps them to one of the four bounded values:
+
+| Raw error pattern                             | Label value      |
+|-----------------------------------------------|------------------|
+| "timeout", "ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "connect" | `smtp_timeout` |
+| "reject", "550"–"554", "421"–"452", "EAUTH"  | `smtp_reject`    |
+| "template"                                    | `template_error` |
+| Everything else / non-string / empty          | `unknown`        |
+
+**PII guarantee:** the raw error message is never stored in any label value. No recipient email address or invoice content can appear in Prometheus time series.
+
+### Dashboard / alert queries
+
+```promql
+# Delivery failure rate (5 m window)
+rate(maturity_reminder_dead_letter_total[5m])
+
+# SMTP timeouts in the last hour
+increase(maturity_reminder_dead_letter_total{reason="smtp_timeout"}[1h])
+
+# Total attempts by job type
+rate(maturity_reminder_delivery_attempts_total[5m])
+```
+

@@ -620,3 +620,57 @@ Before production deployment:
 **Last Updated**: May 28, 2026  
 **Maintained By**: LiquiFact Backend Team  
 **Related Issues**: #222 — Enforce KYC gating on all capital-movement endpoints
+
+---
+
+## Audit-Trail Per-Invoice Authorization (Issue #426)
+
+### Problem
+
+The audit-trail endpoint previously scoped queries only by `req.tenantId`. A tenant member could iterate `invoiceId` values and read audit logs for invoices they had no relationship to within the same tenant.
+
+### Authorization rule
+
+Before streaming audit events, the endpoint enforces three conditions via `assertInvoiceEntitlement`:
+
+1. **Invoice exists** — the invoice must be present and not soft-deleted.
+2. **Tenant ownership** — the invoice's `tenant_id` must match the caller's `req.tenantId`.
+3. **Role check** — the caller's JWT `role` claim must be `admin` or `owner`. Any other role (e.g. `investor`, `viewer`, absent) is denied.
+
+**All failure cases return `404 Not Found`** — not `403 Forbidden`. This prevents existence leakage: a caller cannot distinguish "invoice doesn't exist" from "invoice belongs to another tenant" from "insufficient role".
+
+### Middleware stack
+
+```
+GET /api/audit-trail/:invoiceId
+  → authenticateToken   (401 if missing/invalid JWT)
+  → extractTenant       (400 if no tenant context)
+  → assertInvoiceEntitlement  (404 for any entitlement failure)
+  → stream audit events
+```
+
+### Security properties
+
+- **Enumeration resistance**: foreign invoices and nonexistent invoices return the same `404` response with no distinguishing body fields.
+- **No tenant leakage**: the response body never includes the `tenant_id` of the requested invoice.
+- **Role minimum**: only `admin` and `owner` may read audit trails. The role check is performed before the DB query so an unpermitted role never triggers a lookup.
+
+### Test coverage
+
+File: `tests/auditTrail.api.test.js`
+
+| Scenario | Expected |
+|---|---|
+| admin role, own tenant invoice | 200 with events |
+| owner role, own tenant invoice | 200 with events |
+| investor role | 404 |
+| no role claim in JWT | 404 |
+| invoice from different tenant | 404 |
+| nonexistent invoice | 404 |
+| foreign vs nonexistent indistinguishable | both 404, same body shape |
+| no Authorization header | 401 |
+| tampered token | 401 |
+| no tenant context | 400 |
+
+**Last Updated**: June 2026
+**Relates to**: Issue #426 — Enforce per-invoice authorization on the audit-trail endpoint

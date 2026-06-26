@@ -3,6 +3,12 @@
 const nodemailer = require('nodemailer');
 const JobQueue = require('../workers/jobQueue');
 const BackgroundWorker = require('../workers/worker');
+const {
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeadLetterTotal,
+  normalizeReminderReason,
+  normalizeJobType,
+} = require('../metrics');
 
 /**
  * The internal mapping of invoice IDs to job IDs.
@@ -60,19 +66,28 @@ LiquiFact Settlement Team
  */
 emailWorker.registerHandler('maturity_reminder', async (job) => {
   const { invoiceId, customer, amount, email, targetDate } = job.payload;
-  
-  const transport = getTransport();
-  const text = templates.maturityReminder(customer, amount, targetDate);
+  const jobType = normalizeJobType(job.type);
 
-  await transport.sendMail({
-    from: process.env.SMTP_FROM || 'noreply@liquifact.com',
-    to: email,
-    subject: `Settlement Reminder: Invoice ${invoiceId}`,
-    text,
-  });
+  maturityReminderDeliveryAttemptsTotal.inc({ reason: 'unknown', job_type: jobType });
 
-  // Since it succeeded, we can clear the job from the map if it hadn't been replaced
-  invoiceJobs.delete(invoiceId);
+  try {
+    const transport = getTransport();
+    const text = templates.maturityReminder(customer, amount, targetDate);
+
+    await transport.sendMail({
+      from: process.env.SMTP_FROM || 'noreply@liquifact.com',
+      to: email,
+      subject: `Settlement Reminder: Invoice ${invoiceId}`,
+      text,
+    });
+
+    // Since it succeeded, we can clear the job from the map if it hadn't been replaced
+    invoiceJobs.delete(invoiceId);
+  } catch (err) {
+    const reason = normalizeReminderReason(err);
+    maturityReminderDeadLetterTotal.inc({ reason, job_type: jobType });
+    throw err;
+  }
 });
 
 /**
