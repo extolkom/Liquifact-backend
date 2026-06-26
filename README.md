@@ -1108,6 +1108,7 @@ All API failures now return a consistent structured error payload:
 - The API returns it in both the response body and the `X-Correlation-Id` header.
 - If a client sends `X-Correlation-Id` and it matches the accepted pattern, the value is echoed back.
 - Invalid client-supplied IDs are ignored and replaced with a generated ID.
+- Each request also gets a per-request child logger attached to `req.log`, which carries the request ID and correlation ID in structured log fields without binding secrets or request payloads.
 
 ### Structured failure behavior
 

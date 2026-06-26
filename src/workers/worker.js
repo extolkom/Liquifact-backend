@@ -244,38 +244,35 @@ class BackgroundWorker {
   }
 }
 
+
 /**
- * Builds a safe logging context from a job object.
- * Only explicitly allowed payload fields are included; all others are omitted
- * to prevent accidental logging of sensitive data.
+ * Build a compact execution context object for logging from a job record.
+ * Only a safe subset of payload keys are copied to avoid leaking secrets.
  *
- * @param {Object} job - The job object.
- * @param {string} job.id - Job identifier.
- * @param {string} job.type - Job type name.
- * @param {number} [job.attempts] - Number of execution attempts.
- * @param {Object} [job.payload] - Job payload data.
- * @returns {Object} A plain object safe for logging.
+ * @param {Object} job - Job record from the queue
+ * @returns {Object} Context with jobId, jobType, attempt, and allowed payload keys
  */
 function buildJobContext(job) {
-  if (!job || typeof job !== 'object') {
-    return {};
-  }
-
+  if (!job || typeof job !== 'object') return {};
   const ctx = {
     jobId: job.id,
     jobType: job.type,
-    attempt: job.attempts,
+    attempt: job.attempts ?? job.attempt ?? 1,
   };
 
-  if (job.payload && typeof job.payload === 'object' && !Array.isArray(job.payload)) {
-    const ALLOWED_KEYS = ['tenantId', 'invoiceId', 'correlationId'];
-    for (const key of ALLOWED_KEYS) {
-      if (key in job.payload) {
-        ctx[key] = job.payload[key];
+  const CONTEXT_KEYS = new Set(['tenantId', 'invoiceId', 'correlationId', 'performedBy', 'policyId', 'batchSize']);
+  const payload = job.payload || {};
+  if (payload && typeof payload === 'object') {
+    for (const k of CONTEXT_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(payload, k)) {
+        const v = payload[k];
+        // only include primitive values to avoid leaking nested secrets
+        if (v === null || ['string', 'number', 'boolean'].includes(typeof v)) {
+          ctx[k] = v;
+        }
       }
     }
   }
-
   return ctx;
 }
 

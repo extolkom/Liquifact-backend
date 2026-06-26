@@ -46,4 +46,27 @@ const logger = pino({
   },
 }, transport ? pino.transport(transport) : undefined);
 
+/**
+ * Create a per-request child logger bound only with safe correlation fields.
+ *
+ * @param {import('express').Request | undefined} req - Express request object.
+ * @returns {import('pino').Logger} A child logger scoped to the request.
+ */
+function createRequestLogger(req) {
+  const bindings = {};
+
+  if (typeof req?.id === 'string' && req.id) {
+    bindings.requestId = req.id;
+  }
+
+  if (typeof req?.correlationId === 'string' && req.correlationId) {
+    bindings.correlationId = req.correlationId;
+  }
+
+  return logger.child(bindings);
+}
+
+logger.createRequestLogger = createRequestLogger;
+
 module.exports = logger;
+module.exports.createRequestLogger = createRequestLogger;

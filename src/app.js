@@ -22,6 +22,8 @@ const express = require('express');
 const cors = require('cors');
 const { createSecurityMiddleware } = require('./middleware/security');
 const { auditMiddleware } = require('./middleware/audit');
+const requestId = require('./middleware/requestId');
+const { correlationIdMiddleware } = require('./middleware/correlationId');
 const invoiceService = require('./services/invoiceService');
 const { resolveEscrowAddress } = require('./config/escrowMap');
 const { getEscrowStateWithProjection } = require('./services/escrowRead');
@@ -135,6 +137,8 @@ function createApp() {
   // Apply security headers middleware
   app.use(createSecurityMiddleware());
   app.use(auditMiddleware);
+  app.use(requestId);
+  app.use(correlationIdMiddleware);
 
   // ── 4. Routes ────────────────────────────────────────────────────────────
 

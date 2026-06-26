@@ -131,22 +131,21 @@ function computeFundedPercent(fundedAmount, totalAmount) {
  * @param {Date|null|undefined} [refOrOpts.now] - Explicit reference time.
  * @returns {number|null} Null when maturityDate is absent or unparseable.
  */
-function computeDaysToMaturity(maturityDate, refOrOpts) {
-  if (maturityDate == null) {return null;}
-  const maturity =
-    maturityDate instanceof Date ? maturityDate : new Date(maturityDate);
-  if (isNaN(maturity.getTime())) {return null;}
-
-  let nowMs;
-  if (refOrOpts instanceof Date) {
-    nowMs = refOrOpts.getTime();
-  } else if (refOrOpts && typeof refOrOpts === 'object') {
-    nowMs = resolveReferenceTime(refOrOpts).getTime();
-  } else {
-    nowMs = Date.now();
+function computeDaysToMaturity(maturityDate, opts = {}) {
+  if (maturityDate == null) {
+    return null;
   }
 
-  return Math.floor((maturity.getTime() - nowMs) / MS_PER_DAY);
+  const maturity = maturityDate instanceof Date ? maturityDate : new Date(maturityDate);
+  if (isNaN(maturity.getTime())) {
+    return null;
+  }
+
+  // Backwards-compat: callers may pass a Date as the second argument.
+  const options = opts instanceof Date ? { now: opts } : opts || {};
+
+  const reference = resolveReferenceTime(options);
+  return Math.floor((maturity.getTime() - reference.getTime()) / MS_PER_DAY);
 }
 
 /**

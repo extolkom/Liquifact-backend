@@ -11,6 +11,7 @@
  */
 
 const { randomUUID } = require('crypto');
+const { createRequestLogger } = require('../logger');
 
 /**
  * Attaches a unique request ID to the request and response objects.
@@ -25,6 +26,7 @@ const requestId = (req, res, next) => {
 
   // Attach to request object for use in subsequent middleware/handlers
   req.id = id;
+  req.log = createRequestLogger(req);
 
   // Set the response header so clients/proxies can see the ID
   res.setHeader('X-Request-Id', id);

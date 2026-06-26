@@ -196,6 +196,17 @@ async function _readBaseStateFromProjection(safeId, dbClient = db) {
         projection.latest_event_type) ||
       "unknown";
 
+    const hasMeaningfulProjection =
+      status !== "unknown" ||
+      Object.prototype.hasOwnProperty.call(eventBody, "fundedAmount") ||
+      Object.prototype.hasOwnProperty.call(eventBody, "ledgerCloseTime") ||
+      Object.prototype.hasOwnProperty.call(eventBody, "maturityDate") ||
+      Object.prototype.hasOwnProperty.call(eventBody, "maturityTimestamp");
+
+    if (!hasMeaningfulProjection) {
+      return null;
+    }
+
     const latestLedger = Number(projection.latest_ledger_sequence);
     return {
       invoiceId: safeId,

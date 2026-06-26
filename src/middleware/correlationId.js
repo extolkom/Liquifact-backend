@@ -1,4 +1,5 @@
 const { randomUUID } = require('crypto');
+const { createRequestLogger } = require('../logger');
 
 const CORRELATION_HEADER = 'x-correlation-id';
 const CORRELATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
@@ -19,6 +20,7 @@ function correlationIdMiddleware(req, res, next) {
       : `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
 
   req.correlationId = correlationId;
+  req.log = createRequestLogger(req);
   res.setHeader('X-Correlation-Id', correlationId);
   next();
 }

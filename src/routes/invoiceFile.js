@@ -148,15 +148,12 @@ router.post('/:id/file/verify', express.raw({ type: 'application/pdf', limit: '5
   try {
     const currentHash = computeHash(req.body);
     const isValid = currentHash === meta.sha256;
-    return res.json({
-      data: { invoiceId: id, isValid, storedHash: meta.sha256, currentHash, verifiedAt: new Date().toISOString() },
-      message: isValid ? 'File integrity verified' : 'File integrity check failed',
-    });
+    return res.json({ data: { invoiceId: id, isValid, storedHash: meta.sha256, currentHash, verifiedAt: new Date().toISOString() }, message: isValid ? 'File integrity verified' : 'File integrity check failed' });
   } catch (err) {
-    logger.error({ err, invoiceId: id }, 'Failed to verify invoice file');
-    return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to verify invoice file' });
+    logger.error({ err, invoiceId: id }, 'Failed to verify provided invoice file');
+    return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to verify provided invoice file' });
   }
+
 });
 
 module.exports = router;
-
