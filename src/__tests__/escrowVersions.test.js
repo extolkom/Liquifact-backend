@@ -10,13 +10,13 @@
  */
 
 jest.mock('../services/soroban');
-jest.mock('../middleware/apiKey');
+jest.mock('../middleware/apiKeyAuth', () => ({
+  authenticateApiKey: jest.fn(() => (req, res, next) => next()),
+  API_KEY_HEADER: 'x-api-key',
+  timingSafeStringEqual: (a, b) => a === b,
+}));
 
 const { callSorobanContract } = require('../services/soroban');
-const { apiKeyAuth } = require('../middleware/apiKey');
-
-// apiKeyAuth always passes in tests (JWT path is used for most tests)
-apiKeyAuth.mockImplementation((req, res, next) => next());
 
 const {
   REGISTRY,

@@ -27,14 +27,14 @@ jest.mock('../src/services/escrowRead', () => ({
   getEscrowStateWithProjection: jest.fn(),
 }));
 
-jest.mock('../src/middleware/apiKey', () => ({
-  apiKeyAuth: jest.fn((req, res, next) => {
+jest.mock('../src/middleware/apiKeyAuth', () => ({
+  authenticateApiKey: jest.fn(() => jest.fn((req, res, next) => {
     const err = new Error('Invalid API key');
     err.status = 401;
     next(err);
-  }),
-  hashApiKey: jest.fn((k) => k),
-  initDb: jest.fn(),
+  })),
+  API_KEY_HEADER: 'x-api-key',
+  timingSafeStringEqual: (a, b) => a === b,
 }));
 
 jest.mock('../src/services/escrowSubmit', () => ({

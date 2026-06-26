@@ -725,4 +725,103 @@ describe('escrowIndexer ordering and idempotency', () => {
       ).rejects.toThrow('Horizon events request failed (503)');
     });
   });
+
+  describe('real escrowMap reverse lookup integration', () => {
+    const actualEscrowMap = jest.requireActual('../../src/config/escrowMap');
+    const ADDR = 'C' + 'Z'.repeat(55);
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalConfig = process.env.ESCROW_ADDR_BY_INVOICE;
+
+    beforeEach(() => {
+      process.env.NODE_ENV = 'test';
+      process.env.ESCROW_ADDR_BY_INVOICE = JSON.stringify({
+        mappings: [
+          { invoiceId: 'inv_contract_only', escrowAddress: ADDR, environment: 'test', isActive: true },
+        ],
+        defaultEnvironment: 'test',
+        allowlistEnabled: true,
+      });
+      actualEscrowMap._resetCache();
+    });
+
+    afterEach(() => {
+      process.env.NODE_ENV = originalNodeEnv;
+      if (originalConfig === undefined) {
+        delete process.env.ESCROW_ADDR_BY_INVOICE;
+      } else {
+        process.env.ESCROW_ADDR_BY_INVOICE = originalConfig;
+      }
+      actualEscrowMap._resetCache();
+    });
+
+    test('deriveInvoiceId resolves address-only records through escrowMap', () => {
+      expect(
+        deriveInvoiceId({ contract_id: ADDR }, actualEscrowMap.resolveInvoiceByAddress),
+      ).toBe('inv_contract_only');
+    });
+
+    test('deriveInvoiceId returns null for allowlist-disabled unknown addresses', () => {
+      expect(
+        deriveInvoiceId(
+          { contract_id: 'C' + 'Y'.repeat(55) },
+          actualEscrowMap.resolveInvoiceByAddress,
+        ),
+      ).toBeNull();
+    });
+
+    test('prefers explicit record invoice_id over reverse lookup', () => {
+      expect(
+        deriveInvoiceId(
+          { invoice_id: 'inv_explicit', contract_id: ADDR },
+          actualEscrowMap.resolveInvoiceByAddress,
+        ),
+      ).toBe('inv_explicit');
+    });
+
+    test('runEscrowIndexerCycle processes contract-only Horizon events via reverse lookup', async () => {
+      const originalFetch = global.fetch;
+      const ADDR_CYCLE = 'C' + 'M'.repeat(55);
+
+      resolveInvoiceByAddress.mockImplementation((addr) =>
+        addr === ADDR_CYCLE ? 'inv_cycle' : null
+      );
+
+      global.fetch = jest.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          _embedded: {
+            records: [
+              {
+                id: 'evt_contract_only',
+                contract_id: ADDR_CYCLE,
+                type: 'contract',
+                ledger: 100,
+                paging_token: '100-1',
+              },
+            ],
+          },
+        }),
+      }));
+
+      const store = createInMemoryStore();
+      const summary = await runEscrowIndexerCycle({
+        store,
+        fetchEscrowEvents: (params) =>
+          fetchEscrowEventsFromHorizon({
+            baseUrl: 'https://horizon.example',
+            cursor: params.cursor,
+            limit: params.limit,
+          }),
+        transactionRunner: createTransactionRunner(),
+        log: { warn: jest.fn(), info: jest.fn(), error: jest.fn() },
+      });
+
+      expect(summary.processed).toBe(1);
+      expect(summary.skipped).toBe(0);
+      expect(store._state.eventsById.size).toBe(1);
+      expect([...store._state.eventsById.values()][0].invoiceId).toBe('inv_cycle');
+
+      global.fetch = originalFetch;
+    });
+  });
 });

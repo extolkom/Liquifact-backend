@@ -2,6 +2,9 @@
  * Invoice State Transition Routes
  * Handles invoice lifecycle state transitions with audit logging.
  *
+ * Invoices are resolved and persisted through invoiceService (Knex), scoped
+ * to the authenticated tenant from extractTenant middleware.
+ *
  * Capital-movement routes are protected by the KYC gate:
  *   - POST /:id/link-escrow   — initiates escrow funding lifecycle
  *   - POST /:id/transition     — when targetState is 'funded' or 'settled'
@@ -13,13 +16,15 @@ const express = require('express');
 const router = express.Router();
 const {
   INVOICE_STATES,
-  executeTransition,
   getAllowedTransitions,
   getTransitionHistory,
   canLinkToEscrow,
 } = require('../services/invoiceStateMachine');
+const invoiceService = require('../services/invoiceService');
 const { getAuditLogs } = require('../services/auditLog');
 const { requireKycForFunding } = require('../middleware/kycGating');
+const { extractTenant } = require('../middleware/tenant');
+const responseHelper = require('../utils/responseHelper');
 
 /**
  * States that initiate or settle capital movement and therefore require
@@ -32,10 +37,11 @@ const CAPITAL_MOVING_STATES = new Set([
   INVOICE_STATES.SETTLED,
 ].filter(Boolean));
 
+router.use(extractTenant);
+
 /**
  * Helper to extract actor from request
- * In production, this would come from JWT middleware
- * 
+ *
  * @param {import('express').Request} req Express request object
  * @returns {string} Actor identifier
  */
@@ -46,61 +52,66 @@ function getActorFromRequest(req) {
   if (req.user && req.user.sub) {
     return req.user.sub;
   }
-  // Fallback to IP for unauthenticated requests (should not happen in production)
   return req.ip || req.socket.remoteAddress || 'unknown';
 }
 
 /**
- * Mock invoice database
- * In production, this would be replaced with actual database queries
+ * Sends a standardized 404 when an invoice is unknown or belongs to another tenant.
+ *
+ * @param {import('express').Response} res Express response object
+ * @returns {import('express').Response}
  */
-const mockInvoices = new Map([
-  ['inv-001', { id: 'inv-001', status: 'pending', amount: 1000, customer: 'Acme Corp' }],
-  ['inv-002', { id: 'inv-002', status: 'approved', amount: 2000, customer: 'TechCo' }],
-  ['inv-003', { id: 'inv-003', status: 'linked_escrow', amount: 5000, customer: 'GlobalInc' }],
-]);
+function sendInvoiceNotFound(res) {
+  return res.status(404).json(responseHelper.error('Invoice not found', 'INVOICE_NOT_FOUND'));
+}
+
+/**
+ * Sends a standardized error envelope for state-machine validation failures.
+ *
+ * @param {import('express').Response} res Express response object
+ * @param {Error & { code?: string, allowedTransitions?: string[], statusCode?: number }} error
+ * @returns {import('express').Response}
+ */
+function sendTransitionError(res, error) {
+  const status = error.statusCode || 400;
+  const details = error.allowedTransitions
+    ? { allowedTransitions: error.allowedTransitions }
+    : null;
+
+  return res.status(status).json(responseHelper.error(error.message, error.code, details));
+}
 
 /**
  * GET /api/invoices/:id/state
  * Get current state and allowed transitions for an invoice
  */
-router.get('/:id/state', (req, res) => {
+router.get('/:id/state', async (req, res, next) => {
   const { id } = req.params;
 
-  // Get invoice from database
-  const invoice = mockInvoices.get(id);
+  try {
+    const invoice = await invoiceService.resolveInvoiceForTenant(id, req.tenantId);
 
-  if (!invoice) {
-    return res.status(404).json({
-      error: 'Invoice not found',
-      code: 'INVOICE_NOT_FOUND',
+    if (!invoice) {
+      return sendInvoiceNotFound(res);
+    }
+
+    const currentState = invoice.status;
+    const allowedTransitions = getAllowedTransitions(currentState);
+
+    return res.json({
+      ...responseHelper.success({
+        invoiceId: id,
+        currentState,
+        allowedTransitions,
+        isTerminal: allowedTransitions.length === 0,
+      }),
+      message: 'Invoice state retrieved successfully',
     });
+  } catch (error) {
+    return next(error);
   }
-
-  const currentState = invoice.status;
-  const allowedTransitions = getAllowedTransitions(currentState);
-
-  res.json({
-    data: {
-      invoiceId: id,
-      currentState,
-      allowedTransitions,
-      isTerminal: allowedTransitions.length === 0,
-    },
-    message: 'Invoice state retrieved successfully',
-  });
 });
 
-/**
- * POST /api/invoices/:id/transition
- * Execute a state transition
- * 
- * Request body:
- * {
- *   "targetState": "approved",
- *   "reason": "Invoice verified and approved by finance team"
- * }
- */
 /**
  * KYC gate selector for transition endpoint.
  * Runs `requireKycForFunding` only when the requested targetState is a
@@ -119,39 +130,32 @@ function conditionalKycGate(req, res, next) {
   return next();
 }
 
+/**
+ * POST /api/invoices/:id/transition
+ * Execute a state transition
+ *
+ * Request body:
+ * {
+ *   "targetState": "approved",
+ *   "reason": "Invoice verified and approved by finance team"
+ * }
+ */
 router.post('/:id/transition', conditionalKycGate, async (req, res, next) => {
   const { id } = req.params;
   const { targetState, reason } = req.body;
 
   try {
-    // Validate request body
     if (!targetState) {
-      return res.status(400).json({
-        error: 'Target state is required',
-        code: 'MISSING_TARGET_STATE',
-      });
+      return res.status(400).json(
+        responseHelper.error('Target state is required', 'MISSING_TARGET_STATE'),
+      );
     }
 
-    // Get invoice from database
-    const invoice = mockInvoices.get(id);
-
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
-
-    const currentState = invoice.status;
     const actor = getActorFromRequest(req);
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
-    // Execute transition
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState,
+    const result = await invoiceService.transitionInvoice(id, targetState, req.tenantId, {
       actor,
       reason,
       ipAddress,
@@ -162,13 +166,8 @@ router.post('/:id/transition', conditionalKycGate, async (req, res, next) => {
       },
     });
 
-    // Update invoice in database
-    invoice.status = targetState;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
+    return res.status(200).json({
+      ...responseHelper.success({
         invoiceId: id,
         previousState: result.previousState,
         currentState: result.newState,
@@ -176,21 +175,14 @@ router.post('/:id/transition', conditionalKycGate, async (req, res, next) => {
         transitionedBy: result.transitionedBy,
         reason,
         auditLogId: result.auditLog.id,
-      },
+      }),
       message: `Invoice transitioned from ${result.previousState} to ${result.newState}`,
     });
   } catch (error) {
-    // Handle validation errors
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error);
     }
-
-    // Pass unexpected errors to error handler
-    next(error);
+    return next(error);
   }
 });
 
@@ -203,24 +195,11 @@ router.post('/:id/approve', async (req, res, next) => {
   const { reason } = req.body;
 
   try {
-    const invoice = mockInvoices.get(id);
-
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
-
-    const currentState = invoice.status;
     const actor = getActorFromRequest(req);
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState: INVOICE_STATES.APPROVED,
+    const result = await invoiceService.transitionInvoice(id, INVOICE_STATES.APPROVED, req.tenantId, {
       actor,
       reason: reason || 'Invoice approved',
       ipAddress,
@@ -232,30 +211,22 @@ router.post('/:id/approve', async (req, res, next) => {
       },
     });
 
-    invoice.status = INVOICE_STATES.APPROVED;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
+    return res.status(200).json({
+      ...responseHelper.success({
         invoiceId: id,
         previousState: result.previousState,
         currentState: result.newState,
         transitionedAt: result.transitionedAt,
         transitionedBy: result.transitionedBy,
         auditLogId: result.auditLog.id,
-      },
+      }),
       message: 'Invoice approved successfully',
     });
   } catch (error) {
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error);
     }
-    next(error);
+    return next(error);
   }
 });
 
@@ -271,37 +242,29 @@ router.post('/:id/link-escrow', requireKycForFunding, async (req, res, next) => 
   const { escrowId, reason } = req.body;
 
   try {
-    const invoice = mockInvoices.get(id);
+    const invoice = await invoiceService.resolveInvoiceForTenant(id, req.tenantId);
 
     if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
+      return sendInvoiceNotFound(res);
     }
 
-    // Validate business rules
     const linkValidation = canLinkToEscrow(invoice);
     if (!linkValidation.canLink) {
-      return res.status(400).json({
-        error: linkValidation.reason,
-        code: 'CANNOT_LINK_TO_ESCROW',
-      });
+      return res.status(400).json(
+        responseHelper.error(linkValidation.reason, 'CANNOT_LINK_TO_ESCROW'),
+      );
     }
 
-    const currentState = invoice.status;
     const actor = getActorFromRequest(req);
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState: INVOICE_STATES.LINKED_ESCROW,
+    const result = await invoiceService.transitionInvoice(id, INVOICE_STATES.LINKED_ESCROW, req.tenantId, {
       actor,
       reason: reason || 'Invoice linked to escrow',
       ipAddress,
       userAgent,
+      escrowId: escrowId || null,
       metadata: {
         method: req.method,
         path: req.path,
@@ -310,13 +273,8 @@ router.post('/:id/link-escrow', requireKycForFunding, async (req, res, next) => 
       },
     });
 
-    invoice.status = INVOICE_STATES.LINKED_ESCROW;
-    invoice.escrowId = escrowId;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
+    return res.status(200).json({
+      ...responseHelper.success({
         invoiceId: id,
         previousState: result.previousState,
         currentState: result.newState,
@@ -324,18 +282,14 @@ router.post('/:id/link-escrow', requireKycForFunding, async (req, res, next) => 
         transitionedAt: result.transitionedAt,
         transitionedBy: result.transitionedBy,
         auditLogId: result.auditLog.id,
-      },
+      }),
       message: 'Invoice linked to escrow successfully',
     });
   } catch (error) {
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error);
     }
-    next(error);
+    return next(error);
   }
 });
 
@@ -343,30 +297,30 @@ router.post('/:id/link-escrow', requireKycForFunding, async (req, res, next) => 
  * GET /api/invoices/:id/history
  * Get state transition history for an invoice
  */
-router.get('/:id/history', async (req, res) => {
+router.get('/:id/history', async (req, res, next) => {
   const { id } = req.params;
 
-  // Check if invoice exists
-  const invoice = mockInvoices.get(id);
+  try {
+    const invoice = await invoiceService.resolveInvoiceForTenant(id, req.tenantId);
 
-  if (!invoice) {
-    return res.status(404).json({
-      error: 'Invoice not found',
-      code: 'INVOICE_NOT_FOUND',
+    if (!invoice) {
+      return sendInvoiceNotFound(res);
+    }
+
+    const history = await getTransitionHistory(id, getAuditLogs);
+
+    return res.json({
+      ...responseHelper.success({
+        invoiceId: id,
+        currentState: invoice.status,
+        transitions: history,
+        totalTransitions: history.length,
+      }),
+      message: 'Invoice transition history retrieved successfully',
     });
+  } catch (error) {
+    return next(error);
   }
-
-  const history = await getTransitionHistory(id, getAuditLogs);
-
-  res.json({
-    data: {
-      invoiceId: id,
-      currentState: invoice.status,
-      transitions: history,
-      totalTransitions: history.length,
-    },
-    message: 'Invoice transition history retrieved successfully',
-  });
 });
 
 /**
@@ -379,30 +333,16 @@ router.post('/:id/reject', async (req, res, next) => {
 
   try {
     if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
-      return res.status(400).json({
-        error: 'Reason is required for rejection',
-        code: 'MISSING_TRANSITION_REASON',
-      });
+      return res.status(400).json(
+        responseHelper.error('Reason is required for rejection', 'MISSING_TRANSITION_REASON'),
+      );
     }
 
-    const invoice = mockInvoices.get(id);
-
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
-
-    const currentState = invoice.status;
     const actor = getActorFromRequest(req);
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState: INVOICE_STATES.REJECTED,
+    const result = await invoiceService.transitionInvoice(id, INVOICE_STATES.REJECTED, req.tenantId, {
       actor,
       reason,
       ipAddress,
@@ -414,12 +354,8 @@ router.post('/:id/reject', async (req, res, next) => {
       },
     });
 
-    invoice.status = INVOICE_STATES.REJECTED;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
+    return res.status(200).json({
+      ...responseHelper.success({
         invoiceId: id,
         previousState: result.previousState,
         currentState: result.newState,
@@ -427,20 +363,15 @@ router.post('/:id/reject', async (req, res, next) => {
         transitionedAt: result.transitionedAt,
         transitionedBy: result.transitionedBy,
         auditLogId: result.auditLog.id,
-      },
+      }),
       message: 'Invoice rejected successfully',
     });
   } catch (error) {
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error);
     }
-    next(error);
+    return next(error);
   }
 });
 
 module.exports = router;
-module.exports.mockInvoices = mockInvoices; // Export for testing

@@ -120,3 +120,11 @@ describe('OpenAPI document', () => {
     }
   });
 });
+
+
+it('problem schema rejects undocumented fields', () => {
+  const schema =
+    spec.components.schemas.Problem;
+
+  expect(schema.additionalProperties).toBe(false);
+});

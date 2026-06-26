@@ -2,6 +2,7 @@
 
 const db = require('../db/knex');
 const logger = require('../logger');
+const { resolveInvoiceByAddress } = require('../config/escrowMap');
 const {
   escrowIndexerEventsProcessedTotal,
   escrowIndexerEventsSkippedTotal,

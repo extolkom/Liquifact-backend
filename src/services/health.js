@@ -11,7 +11,22 @@ const db = require('../db/knex');
 const cfg = require('../config');
 
 /**
- * Checks if the Soroban RPC endpoint is reachable.
+ * Classify Soroban RPC latency against configurable thresholds.
+ * Returns "healthy" for latency <= warn, "degraded" for latency > warn && <= fail,
+ * and "unhealthy" for latency > fail.
+ * @param {number} latencyMs Measured latency in milliseconds.
+ * @returns {'healthy'|'degraded'|'unhealthy'}
+ */
+function classifySorobanLatency(latencyMs) {
+  const warnMs = parseInt(process.env.SOROBAN_LATENCY_WARN_MS, 10) || 200;
+  const failMs = parseInt(process.env.SOROBAN_LATENCY_FAIL_MS, 10) || 500;
+  if (latencyMs <= warnMs) return 'healthy';
+  if (latencyMs <= failMs) return 'degraded';
+  return 'unhealthy';
+}
+
+/**
+ * Checks if the Soroban RPC endpoint is reachable and classifies latency.
  * @returns {Promise<{status: string, latency?: number, error?: string}>}
  */
 async function checkSorobanHealth() {
@@ -36,7 +51,8 @@ async function checkSorobanHealth() {
     const latency = Date.now() - start;
 
     if (response.ok) {
-      return { status: 'healthy', latency };
+      const classification = classifySorobanLatency(latency);
+      return { status: classification, latency };
     }
     return { status: 'unhealthy', latency, error: `HTTP ${response.status}` };
   } catch (error) {
@@ -224,11 +240,20 @@ async function performReadinessChecks() {
   ]);
 
   const checks = { database, soroban };
+  // Determine overall readiness. Degraded Soroban RPC (slow) does NOT block readiness.
   const healthy =
     database.status === 'healthy' &&
-    (soroban.status === 'healthy' || soroban.status === 'unknown');
+    (soroban.status === 'healthy' || soroban.status === 'degraded' || soroban.status === 'unknown');
 
-  readinessGauge.set(healthy ? 1 : 0);
+  // Set gauge: 1 = ready, 0.5 = degraded, 0 = not ready
+  if (database.status !== 'healthy') {
+    readinessGauge.set(0);
+  } else if (soroban.status === 'degraded') {
+    readinessGauge.set(0.5);
+  } else {
+    readinessGauge.set(healthy ? 1 : 0);
+  }
+
   return { healthy, checks };
 }
 

@@ -20,9 +20,14 @@ const router = express.Router();
 const investRoutes = require('../invest');
 const smeRouter = require('../sme');
 const { extractTenant } = require('../../middleware/tenant');
+const { authenticateToken } = require('../../middleware/auth');
 const invoiceService = require('../../services/invoiceService');
+const { resolveEscrowAddress } = require('../../config/escrowMap');
+const { callSorobanContract } = require('../../services/soroban');
+const { computeEscrowDerivedFields } = require('../../services/escrowDerived');
 const AppError = require('../../errors/AppError');
-const { invoiceCreateSchema, parseValidationErrors } = require('../../schemas/invoice');
+const { invoiceCreateSchema, invoiceUpdateSchema, parseValidationErrors } = require('../../schemas/invoice');
+const { validatePatchFields, detectLockedFieldChange } = require('../../middleware/patchInvoice');
 
 // ── Sub-router mounts ────────────────────────────────────────────────────────
 router.use('/invest', investRoutes);
@@ -148,6 +153,92 @@ router.post('/invoices', extractTenant, async (req, res, next) => {
       data: invoice,
       message: 'Invoice created successfully.',
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * PATCH /v1/invoices/:id
+ *
+ * Partially updates an invoice scoped to the authenticated tenant. Field-level
+ * guards are applied via `validatePatchFields` which strips unknown keys and
+ * enforces the mutable-field set. Attempts to change locked fields for
+ * invoices in locked statuses result in a 422 AppError.
+ */
+router.patch('/invoices/:id', extractTenant, validatePatchFields, async (req, res, next) => {
+  try {
+    const invoiceId = String(req.params.id || '').trim();
+
+    // Validate sanitized payload with Zod update schema
+    const parsed = invoiceUpdateSchema.safeParse(req.sanitizedUpdate);
+    if (!parsed.success) {
+      const fieldErrors = parseValidationErrors(parsed.error);
+      return next(
+        new AppError({
+          type: 'https://liquifact.com/probs/validation-error',
+          title: 'Validation Error',
+          status: 422,
+          detail: 'Request body contains invalid or missing fields.',
+          instance: req.originalUrl,
+          code: 'VALIDATION_ERROR',
+          retryable: false,
+          fieldErrors,
+        }),
+      );
+    }
+
+    // Ensure resource exists and belongs to tenant
+    const existing = await invoiceService.getInvoiceById(invoiceId, req.tenantId);
+    if (!existing) {
+      return next(new AppError({ title: 'Not Found', status: 404, detail: 'Invoice not found' }));
+    }
+
+    // Enforce locked-field rules
+    const { locked, field } = detectLockedFieldChange(req.sanitizedUpdate, existing.status);
+    if (locked) {
+      return next(
+        new AppError({
+          type: 'https://liquifact.com/probs/validation-error',
+          title: 'Validation Error',
+          status: 422,
+          detail: `Field '${field}' cannot be modified when invoice status is '${existing.status}'.`,
+          instance: req.originalUrl,
+          code: 'LOCKED_FIELD',
+          retryable: false,
+          fieldErrors: { [field]: 'Field is locked for this invoice status' },
+        }),
+      );
+    }
+
+    const updates = parsed.data;
+    const updated = await invoiceService.updateInvoice(invoiceId, updates, req.tenantId);
+
+    if (!updated) {
+      return next(new AppError({ title: 'Not Found', status: 404, detail: 'Invoice not found' }));
+    }
+
+    return res.json({ data: updated, message: 'Invoice updated successfully.' });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * DELETE /v1/invoices/:id
+ *
+ * Soft-deletes the invoice by setting `deleted_at`. Scoped to tenant.
+ */
+router.delete('/invoices/:id', extractTenant, async (req, res, next) => {
+  try {
+    const invoiceId = String(req.params.id || '').trim();
+
+    const deleted = await invoiceService.deleteInvoice(invoiceId, req.tenantId);
+    if (!deleted) {
+      return next(new AppError({ title: 'Not Found', status: 404, detail: 'Invoice not found' }));
+    }
+
+    return res.json({ data: deleted, message: 'Invoice deleted (soft-delete) successfully.' });
   } catch (err) {
     return next(err);
   }

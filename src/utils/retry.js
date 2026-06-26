@@ -78,6 +78,87 @@ async function withRetry(operation, options = {}) {
   }
 }
 
+/**
+ * Classifies a nodemailer/SMTP error as transient or permanent.
+ * 
+ * Permanent errors (5xx SMTP codes or specific error types) should NOT be retried:
+ * - 550-554: Permanent failures (invalid recipient, policy rejection, etc.)
+ * - "Invalid recipient", "User unknown", "Mailbox not found" patterns
+ * 
+ * Transient errors (4xx codes, network errors) should be retried:
+ * - 421-429: Temporary service unavailable, try again later
+ * - ECONNREFUSED, ETIMEDOUT, EHOSTUNREACH: Network connectivity issues
+ * - Generic transport errors without a 5xx code
+ * 
+ * @param {Error} error - The error thrown by nodemailer or transport
+ * @returns {boolean} True if the error is permanent, false if transient
+ */
+function isPermanentSmtpError(error) {
+  if (!error) return false;
+
+  const message = (error.message || '').toLowerCase();
+  const response = error.response || '';
+  const code = error.code || '';
+
+  // Permanent SMTP error codes (5xx)
+  if (response && /^(550|551|552|553|554)/.test(response)) {
+    return true;
+  }
+
+  // Common permanent error patterns
+  if (/invalid recipient|user unknown|mailbox not found|domain not found/.test(message)) {
+    return true;
+  }
+
+  // Permanent system errors
+  if (code === 'EBADRQC' || code === 'EDQUOT') {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Sends an email with bounded exponential backoff retry.
+ * Automatically classifies SMTP errors as permanent or transient before deciding to retry.
+ * 
+ * Permanent errors (5xx, invalid recipient, etc.) fail immediately without retry.
+ * Transient errors (4xx, network timeouts) are retried with exponential backoff + jitter.
+ * 
+ * @param {Object} transport - nodemailer transport instance
+ * @param {Object} mailOptions - mail options (to, subject, text/html, from, etc.)
+ * @param {Object} [opts={}] - retry configuration
+ * @param {number} [opts.maxAttempts=3] - max retry attempts (capped at 10)
+ * @param {number} [opts.baseDelayMs=1000] - initial backoff delay in ms (capped at 10s)
+ * @param {Function} [opts.onRetry] - callback invoked on each retry attempt: ({ attempt, error })
+ * @returns {Promise<Object>} Result from transport.sendMail() on success
+ * @throws {Error} If all retries exhausted, or a permanent error is encountered
+ */
+async function sendMailWithRetry(transport, mailOptions, opts = {}) {
+  const {
+    maxAttempts = 3,
+    baseDelayMs = 1000,
+    onRetry = null,
+  } = opts;
+
+  const shouldRetry = (error) => {
+    const isPermanent = isPermanentSmtpError(error);
+    return !isPermanent; // retry only if NOT permanent
+  };
+
+  return withRetry(
+    () => transport.sendMail(mailOptions),
+    {
+      maxRetries: maxAttempts - 1, // withRetry counts from 0, so maxRetries = attempts - 1
+      baseDelay: baseDelayMs,
+      shouldRetry,
+      onRetry,
+    }
+  );
+}
+
 module.exports = {
-  withRetry
+  withRetry,
+  sendMailWithRetry,
+  isPermanentSmtpError,
 };

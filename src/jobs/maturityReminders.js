@@ -3,6 +3,13 @@
 const nodemailer = require('nodemailer');
 const JobQueue = require('../workers/jobQueue');
 const BackgroundWorker = require('../workers/worker');
+const { sendMailWithRetry, isPermanentSmtpError } = require('../utils/retry');
+const logger = require('../logger');
+const {
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
+  maturityReminderDeadLetterTotal,
+} = require('../metrics');
 
 /**
  * The internal mapping of invoice IDs to job IDs.
@@ -10,6 +17,13 @@ const BackgroundWorker = require('../workers/worker');
  * @type {Map<string, string>}
  */
 const invoiceJobs = new Map();
+
+/**
+ * Dead-letter queue for reminders that failed after max retries.
+ * Stores { invoiceId, email, error, timestamp, attempts } for debugging/alerting.
+ * @type {Array<Object>}
+ */
+const deadLetterQueue = [];
 
 const emailQueue = new JobQueue();
 const emailWorker = new BackgroundWorker({ jobQueue: emailQueue });
@@ -56,7 +70,7 @@ LiquiFact Settlement Team
 };
 
 /**
- * Handle sending the email
+ * Handle sending the email with retry and dead-lettering.
  */
 emailWorker.registerHandler('maturity_reminder', async (job) => {
   const { invoiceId, customer, amount, email, targetDate } = job.payload;
@@ -64,15 +78,94 @@ emailWorker.registerHandler('maturity_reminder', async (job) => {
   const transport = getTransport();
   const text = templates.maturityReminder(customer, amount, targetDate);
 
-  await transport.sendMail({
+  const mailOptions = {
     from: process.env.SMTP_FROM || 'noreply@liquifact.com',
     to: email,
     subject: `Settlement Reminder: Invoice ${invoiceId}`,
     text,
-  });
+  };
 
-  // Since it succeeded, we can clear the job from the map if it hadn't been replaced
-  invoiceJobs.delete(invoiceId);
+  const maxAttempts = Number(process.env.SMTP_MAX_RETRIES) || 3;
+
+  try {
+    // Track attempt
+    maturityReminderDeliveryAttemptsTotal.inc({ job_type: 'maturity_reminder' });
+
+    // Send with retry and backoff
+    await sendMailWithRetry(transport, mailOptions, {
+      maxAttempts,
+      baseDelayMs: 1000,
+      onRetry: ({ attempt, error }) => {
+        logger.warn({
+          msg: 'Maturity reminder delivery retry',
+          invoiceId,
+          email,
+          attempt,
+          errorCode: error.code,
+          errorMessage: error.message,
+        });
+        
+        // Count each retry attempt
+        maturityReminderDeliveryAttemptsTotal.inc({ job_type: 'maturity_reminder' });
+      },
+    });
+
+    // Success
+    maturityReminderDeliverySuccessTotal.inc({ job_type: 'maturity_reminder' });
+    logger.info({
+      msg: 'Maturity reminder delivered successfully',
+      invoiceId,
+      email,
+    });
+
+    // Clean up job mapping
+    invoiceJobs.delete(invoiceId);
+
+  } catch (error) {
+    const isPermanent = isPermanentSmtpError(error);
+    const reason = isPermanent ? 'permanent_error' : 'max_retries_exceeded';
+
+    logger.error({
+      msg: 'Maturity reminder delivery failed',
+      invoiceId,
+      email,
+      errorCode: error.code,
+      errorMessage: error.message,
+      isPermanent,
+      reason,
+    });
+
+    // Record dead-letter
+    maturityReminderDeadLetterTotal.inc({ 
+      job_type: 'maturity_reminder',
+      reason,
+    });
+
+    // Store in dead-letter queue for manual recovery
+    deadLetterQueue.push({
+      invoiceId,
+      email,
+      error: {
+        code: error.code,
+        message: error.message,
+        response: error.response,
+        isPermanent,
+      },
+      timestamp: new Date().toISOString(),
+      maxAttempts,
+    });
+
+    // Limit dead-letter queue size to prevent memory leak
+    if (deadLetterQueue.length > 1000) {
+      deadLetterQueue.shift();
+    }
+
+    // Clean up job mapping
+    invoiceJobs.delete(invoiceId);
+
+    // Re-throw so job queue marks job as failed
+    throw error;
+  }
 });
 
 /**
@@ -138,6 +231,21 @@ async function stopQueueProcessing(timeoutMs = 5000) {
   await emailWorker.stop(timeoutMs);
 }
 
+/**
+ * Retrieve the dead-letter queue for debugging and manual recovery.
+ * @returns {Array<Object>} Copy of dead-lettered reminder entries.
+ */
+function getDeadLetterQueue() {
+  return [...deadLetterQueue];
+}
+
+/**
+ * Clear the dead-letter queue (after manual recovery/investigation).
+ */
+function clearDeadLetterQueue() {
+  deadLetterQueue.length = 0;
+}
+
 module.exports = {
   scheduleReminder,
   cancelReminder,
@@ -146,5 +254,7 @@ module.exports = {
   invoiceJobs,
   emailQueue,
   templates,
-  getTransport
+  getTransport,
+  getDeadLetterQueue,
+  clearDeadLetterQueue,
 };

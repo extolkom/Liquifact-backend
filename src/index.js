@@ -13,6 +13,25 @@
 require('dotenv').config();
 
 const app = require('./app');
+const { validate, logRedactedSummary } = require('./config');
+
+/**
+ * Validates the application configuration at startup before the server starts listening.
+ * In test environment, the validation is skipped to preserve lazy loading behavior.
+ * Fails fast by logging a redacted summary of errors and exiting with a non-zero code.
+ * @returns {void}
+ */
+function runBootConfigValidation() {
+  if (process.env.NODE_ENV === 'test') {
+    return;
+  }
+  try {
+    validate();
+  } catch (error) {
+    logRedactedSummary(error);
+    process.exit(1);
+  }
+}
 
 /**
  * Starts the HTTP server on the configured port.
@@ -20,17 +39,23 @@ const app = require('./app');
  * @returns {import('http').Server} The HTTP server instance.
  */
 function startServer() {
+  runBootConfigValidation();
   const port = process.env.PORT || 3001;
   return app.listen(port);
 }
 
 /**
- * Resets in-memory state (no-op in the shim; preserved for legacy callers).
+ * Resets in-memory state (clears the shared cache store for test isolation).
  *
  * @returns {void}
  */
 function resetStore() {
-  // intentional no-op
+  try {
+    const { getSharedStore } = require('./services/cacheStore');
+    getSharedStore().clear();
+  } catch (_) {
+    // intentional no-op in environments where cacheStore is unavailable
+  }
 }
 
 const originalCreateApp = app.createApp;

@@ -24,7 +24,8 @@
     "db:migrate:down": "node-pg-migrate down",
     "db:migrate:create": "node-pg-migrate create",
     "db:migrate:reset": "node-pg-migrate reset",
-    "db:setup": "node-pg-migrate up"
+    "db:setup": "node-pg-migrate up",
+    "load:baseline": "node tests/load/run-baselines.js"
   },
   "keywords": [],
   "author": "",

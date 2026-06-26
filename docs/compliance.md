@@ -30,25 +30,16 @@ Invoice
 
 ### Database Schema
 
-A migration has been added to PostgreSQL:
+A migration has been added to create the `kyc_records` table:
 
 **File**: `src/db/migrations/20260425_add_kyc_status.js`
 
 **Changes**:
-- Adds `kycStatus` enum column (default: 'pending')
-- Adds `kycStatusUpdatedAt` timestamp
-- Adds `kycRecordId` foreign key reference
-- Adds indexes for filtering performance
+- Creates `kyc_records` table to store KYC status records keyed by `sme_id`.
+- Columns: `sme_id` (Primary Key), `status` (pending/verified/rejected/exempted), `provider_record_id`, `verified_at`, `updated_at`.
+- All mock verification functions (`verifySmeSafe`, `rejectSmeKyc`, `exemptSmeFromKyc`) and external provider lookups persist status updates directly to this table. This ensures KYC state survives process restarts and is shared across replicas.
 
-```sql
-ALTER TABLE invoices ADD COLUMN kycStatus kyc_status_enum DEFAULT 'pending' NOT NULL;
-ALTER TABLE invoices ADD COLUMN kycStatusUpdatedAt TIMESTAMP DEFAULT NOW();
-ALTER TABLE invoices ADD COLUMN kycRecordId VARCHAR(128);
-CREATE INDEX idx_kyc_status ON invoices(kycStatus);
-CREATE INDEX idx_kyc_status_date ON invoices(kycStatus, createdAt);
-```
-
-Run migration:
+Run migrations:
 ```bash
 npm run db:migrate
 ```

@@ -42,12 +42,14 @@ const smeRoutes = require('./routes/sme');
 const invoiceFileRoutes = require('./routes/invoiceFile');
 const auditTrailRoutes = require('./routes/auditTrail');
 const investRoutes = require('./routes/invest');
+const investorRoutes = require('./routes/investor');
 const marketplaceRoutes = require('./routes/marketplace');
 const retentionRoutes = require('./routes/retention');
 const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
 const adminEscrowRoutes = require('./routes/adminEscrow');
 const kycRoutes = require('./routes/kyc');
 const v1Routes = require('./routes/v1');
+const investorRoutes = require('./routes/investor');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -85,7 +87,12 @@ function handleInternalError(err, req, res, _next) {
 
   // AppError: use the status it carries
   if (err && err.status && err.status >= 400 && err.status < 500) {
-    res.status(err.status).json({ error: err.detail || err.title || err.message });
+    res.status(err.status).json({
+      error: {
+        code: err.code || String(err.status),
+        message: err.detail || err.title || err.message,
+      },
+    });
     return;
   }
 
@@ -217,9 +224,15 @@ function createApp() {
 
   // Invoices — GET (list)
   app.get('/api/invoices', async (req, res) => {
-    const { isValid, errors, validatedParams } = validateInvoiceQueryParams(req.query);
+    const { isValid, fieldErrors, validatedParams } = validateInvoiceQueryParams(req.query);
     if (!isValid) {
-      return res.status(400).json({ errors });
+      return res.status(400).json({
+        type: 'https://liquifact.io/problems/validation-error',
+        title: 'Validation Error',
+        status: 400,
+        detail: 'Query parameters contain invalid values.',
+        fieldErrors,
+      });
     }
     const invoices = await invoiceService.getInvoices(validatedParams);
     res.json({
@@ -311,11 +324,13 @@ function createApp() {
   app.use('/api/invoices', invoiceFileRoutes);
   app.use('/api/invoices', invoiceStateRoutes);
   app.use('/api/invest', investRoutes);
+  app.use('/api/investor', investorRoutes);
   app.use('/api/kyc', kycRoutes);
   app.use('/api/marketplace', marketplaceRoutes);
   app.use('/api/retention', retentionRoutes);
   app.use('/api/admin/audit', auditTrailRoutes);
   app.use('/api/admin/escrow', adminEscrowRoutes);
+  app.use('/api/investor', investorRoutes);
   app.use('/v1', v1Routes);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────

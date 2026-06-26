@@ -46,7 +46,14 @@ try {
 } catch (_e) {
   promClient = {
     Counter: class {
+      /**
+       * Creates a new mock Counter instance.
+       */
       constructor() {}
+      /**
+       * Increments the mock counter.
+       * @returns {void}
+       */
       inc() {}
     },
   };
@@ -125,9 +132,9 @@ function deadLetterCounter() {
  * @returns {boolean} True if the request should be retried.
  */
 function shouldRetry(err) {
-  if (!err) return false;
+  if (!err) {return false;}
   // Check name first (AbortError may not have a code)
-  if (err.name === 'AbortError') return true;
+  if (err.name === 'AbortError') {return true;}
   if (err.code) {
     return ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(
       err.code
@@ -212,13 +219,13 @@ async function writeDeadLetter({ tenantId, invoiceId, event, payload, lastError,
     logger.warn({ err: dbErr.message }, 'Failed to persist webhook dead-letter record');
   }
 
-  // Increment Prometheus dead-letter counter
-  try {
-    deadLetterCounter().inc();
-  } catch (_) {
-    // Ignore metric errors
-  }
-}
+      // Increment Prometheus dead-letter counter
+      try {
+        deadLetterCounter().inc();
+      } catch (_error) {
+        // Ignore metric errors
+      }
+    }
 
 // ---------------------------------------------------------------------------
 // Job handler factory

@@ -40,6 +40,13 @@ const MAX_CACHE_SIZE = 10000;
 const tokenCache = createCacheStore();
 
 /**
+ * In-flight promise tracker for single-flight deduplication.
+ *
+ * @type {Map<string, Promise<Object>>}
+ */
+const inFlightRequests = new Map();
+
+/**
  * Asset code pattern validation (1-12 alphanumeric characters).
  *
  * @constant {RegExp}
@@ -151,10 +158,10 @@ function validateAsset(asset) {
  * Fetches token metadata from Stellar Horizon for traditional assets.
  *
  * @param {string} code - Asset code.
- * @param {string} issuer - Asset issuer public key.
+ * @param {string} _issuer - Asset issuer public key.
  * @returns {Promise<Object>} Token metadata.
  */
-async function fetchFromHorizon(code, issuer) {
+async function fetchFromHorizon(code, _issuer) {
   // TODO: Replace with actual Horizon API call
   // const response = await fetch(`${HORIZON_URL}/assets?asset_code=${code}&asset_issuer=${issuer}`);
   // const data = await response.json();
@@ -275,32 +282,48 @@ async function getTokenMetadata(asset, options = {}) {
     }
   }
 
-  // Fetch from appropriate source
-  let metadata;
-  
-  if (asset.code === 'native' || asset.code === 'XLM') {
-    metadata = await fetchNativeMetadata();
-  } else if (asset.contractId) {
-    metadata = await fetchFromSoroban(asset.contractId);
-  } else {
-    metadata = await fetchFromHorizon(asset.code, asset.issuer);
+  // Check in-flight requests for single-flight deduplication
+  const inFlight = inFlightRequests.get(cacheKey);
+  if (inFlight) {
+    logger.debug({ cacheKey, asset }, 'tokenMeta: Joined in-flight request');
+    return inFlight;
   }
 
-  // Add cache timestamp
-  metadata.cachedAt = Date.now();
+  const fetchPromise = (async () => {
+    let metadata;
+    try {
+      // Fetch from appropriate source
+      if (asset.code === 'native' || asset.code === 'XLM') {
+        metadata = await fetchNativeMetadata();
+      } else if (asset.contractId) {
+        metadata = await fetchFromSoroban(asset.contractId);
+      } else {
+        metadata = await fetchFromHorizon(asset.code, asset.issuer);
+      }
 
-  // Store in cache
-  try {
-    tokenCache.set(cacheKey, metadata, ttlMs);
-    logger.debug({ cacheKey, asset, ttlMs }, 'tokenMeta: Cached metadata');
-  } catch (error) {
-    logger.warn(
-      { cacheKey, error: error.message },
-      'tokenMeta: Failed to cache metadata (cache may be full)',
-    );
-  }
+      // Add cache timestamp
+      metadata.cachedAt = Date.now();
 
-  return metadata;
+      // Store in cache
+      try {
+        tokenCache.set(cacheKey, metadata, ttlMs);
+        logger.debug({ cacheKey, asset, ttlMs }, 'tokenMeta: Cached metadata');
+      } catch (error) {
+        logger.warn(
+          { cacheKey, error: error.message },
+          'tokenMeta: Failed to cache metadata (cache may be full)',
+        );
+      }
+
+      return metadata;
+    } finally {
+      // Always remove from in-flight tracker when done
+      inFlightRequests.delete(cacheKey);
+    }
+  })();
+
+  inFlightRequests.set(cacheKey, fetchPromise);
+  return fetchPromise;
 }
 
 /**
@@ -385,10 +408,97 @@ async function batchGetTokenMetadata(assets, options = {}) {
   return Promise.all(promises);
 }
 
+/**
+ * Resolves token metadata for an array of assets with deduplication and bounded RPC concurrency.
+ *
+ * Implements:
+ * - Input deduplication (duplicate assets share the same lookup).
+ * - Cache-first access (cache hits are returned immediately without consuming concurrency slots).
+ * - Bounded concurrency (RPC fan-out for cache misses is capped to prevent stampedes).
+ * - Single-flight caching (concurrent misses for the same token share one RPC call).
+ *
+ * IMPORTANT: Cached decimals MUST NOT be used for on-chain principal computations.
+ *
+ * @param {Array<Object>} assets - Array of asset descriptors to resolve.
+ * @param {Object} [options={}] - Batch options.
+ * @param {number} [options.concurrency=5] - Maximum concurrent RPC calls.
+ * @param {number} [options.ttlMs] - Custom cache TTL.
+ * @returns {Promise<Array<Object|null>>} Array of metadata matching the input order.
+ */
+async function resolveMany(assets, options = {}) {
+  const { concurrency = 5, ttlMs = DEFAULT_CACHE_TTL_MS } = options;
+  if (!assets || !Array.isArray(assets) || assets.length === 0) {
+    return [];
+  }
+
+  const uniqueKeys = new Set();
+  const missingAssets = [];
+  const resultsByKey = new Map();
+
+  // Phase 1: Deduplicate and check cache/in-flight synchronously
+  for (const asset of assets) {
+    const validation = validateAsset(asset);
+    if (!validation.valid) {
+      continue;
+    }
+
+    const key = generateCacheKey(asset);
+    if (!uniqueKeys.has(key)) {
+      uniqueKeys.add(key);
+
+      const cached = tokenCache.get(key);
+      if (cached) {
+        resultsByKey.set(key, cached);
+      } else {
+        missingAssets.push({ asset, key });
+      }
+    }
+  }
+
+  // Phase 2: Resolve missing assets with bounded concurrency
+  const remaining = [...missingAssets];
+  
+  /**
+   * Worker function to process missing assets concurrently.
+   *
+   * @returns {Promise<void>}
+   */
+  async function worker() {
+    while (remaining.length > 0) {
+      const { asset, key } = remaining.shift();
+      try {
+        const metadata = await getTokenMetadata(asset, { ttlMs, skipCache: false });
+        resultsByKey.set(key, metadata);
+      } catch (err) {
+        logger.error({ err: err.message, key }, 'Failed to resolve token metadata in batch');
+        resultsByKey.set(key, null);
+      }
+    }
+  }
+
+  const workers = [];
+  const workerCount = Math.min(concurrency, missingAssets.length);
+  for (let i = 0; i < workerCount; i++) {
+    workers.push(worker());
+  }
+
+  await Promise.all(workers);
+
+  // Phase 3: Map results back to original array order
+  return assets.map(asset => {
+    const validation = validateAsset(asset);
+    if (!validation.valid) {
+      return null;
+    }
+    return resultsByKey.get(generateCacheKey(asset)) || null;
+  });
+}
+
 module.exports = {
   getTokenMetadata,
   getFreshTokenMetadata,
   batchGetTokenMetadata,
+  resolveMany,
   invalidateTokenMetadata,
   clearTokenCache,
   getCacheStats,

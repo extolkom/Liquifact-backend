@@ -9,6 +9,8 @@
 const { createAuditLog } = require('./auditLog');
 const logger = require('../logger');
 const { enqueueWebhookDelivery } = require('./webhooks');
+const { getSharedStore } = require('./cacheStore');
+const { invalidatePrefix } = require('../middleware/cache');
 
 
 /**
@@ -50,6 +52,12 @@ const TERMINAL_REASON_REQUIRED_STATES = [
 
 const MAX_TRANSITION_REASON_LENGTH = 1024;
 
+/**
+ * Normalizes and sanitizes a transition reason string.
+ *
+ * @param {*} reason - Raw reason input.
+ * @returns {string|null} Sanitized reason, or null if absent or empty.
+ */
 function normalizeTransitionReason(reason) {
   if (reason === null || reason === undefined) {
     return null;
@@ -304,6 +312,10 @@ async function executeTransition({
     transitionedAt: auditLog.timestamp,
     transitionedBy: actor,
   };
+
+  // Invalidate marketplace cache so that the new state is reflected
+  // immediately on the next GET /api/marketplace request.
+  invalidatePrefix(getSharedStore(), 'marketplace:');
 
   // Enqueue a signed webhook delivery job for this transition.
   // This is fire-and-forget: webhook errors must never fail the transition.

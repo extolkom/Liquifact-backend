@@ -215,7 +215,11 @@ describe('submitWithRetry', () => {
   });
 
   it('does not exceed maxRetries even for persistent transient errors', async () => {
-    const op = jest.fn(async () => { throw new Error('ECONNRESET'); });
+    const op = jest.fn(async () => {
+      const err = new Error('connection reset');
+      err.code = 'ECONNRESET';
+      throw err;
+    });
     const cfg = { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 };
     await expect(submitWithRetry(op, cfg)).rejects.toThrow();
     expect(op).toHaveBeenCalledTimes(3); // attempts 0, 1, 2
@@ -322,38 +326,225 @@ describe('createTxSubmitterWorker', () => {
       return { status: 'ok' };
     });
 
-    const { txQueue, txWorker, enqueueTxSubmission } = createTxSubmitterWorker(submitFn, {
+    const { txQueue, enqueueTxSubmission, start, stop } = createTxSubmitterWorker(submitFn, {
+      durable: false,
       pollIntervalMs: 10,
       maxConcurrency: 1,
       retryConfig: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 },
     });
 
-    txWorker.start();
-    const jobId = enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await start();
+    const jobId = await enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     expect(txQueue.getJob(jobId).status).toBe('completed');
     expect(submitFn).toHaveBeenCalledTimes(2);
 
-    await txWorker.stop();
+    await stop();
   });
 
   it('marks the job as failed on a permanent error', async () => {
     const submitFn = jest.fn(async () => { throw new Error('insufficient fee'); });
 
-    const { txQueue, txWorker, enqueueTxSubmission } = createTxSubmitterWorker(submitFn, {
+    const { txQueue, enqueueTxSubmission, start, stop } = createTxSubmitterWorker(submitFn, {
+      durable: false,
       pollIntervalMs: 10,
       maxConcurrency: 1,
       retryConfig: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 },
     });
 
-    txWorker.start();
-    const jobId = enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await start();
+    const jobId = await enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     expect(txQueue.getJob(jobId).status).toBe('failed');
     expect(submitFn).toHaveBeenCalledTimes(1); // no retry for permanent error
 
-    await txWorker.stop();
+    await stop();
+  });
+});
+
+function createInMemoryTxSubmissionStore() {
+  const rows = new Map();
+
+  const db = jest.fn(() => {
+    const query = {
+      _where: null,
+      _whereIn: null,
+      insert(data) {
+        rows.set(data.id, { ...data });
+        return Promise.resolve([data]);
+      },
+      where(criteria) {
+        query._where = criteria;
+        return query;
+      },
+      whereIn(_column, values) {
+        query._whereIn = values;
+        return query;
+      },
+      orderBy() {
+        return query;
+      },
+      update(patch) {
+        let matches = [...rows.values()];
+        if (query._whereIn) {
+          matches = matches.filter((row) => query._whereIn.includes(row.status));
+        }
+        if (query._where && query._where.id) {
+          matches = matches.filter((row) => row.id === query._where.id);
+        }
+        for (const row of matches) {
+          rows.set(row.id, { ...row, ...patch });
+        }
+        return Promise.resolve(matches.length);
+      },
+      then(resolve, reject) {
+        let matches = [...rows.values()];
+        if (query._whereIn) {
+          matches = matches.filter((row) => query._whereIn.includes(row.status));
+        }
+        matches.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        return Promise.resolve(matches).then(resolve, reject);
+      },
+    };
+    return query;
+  });
+
+  return { db, rows };
+}
+
+describe('createTxSubmitterWorker durable persistence', () => {
+  it('persists enqueue and ack transitions', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const submitFn = jest.fn(async () => ({ status: 'ok' }));
+
+    const { enqueueTxSubmission, start, stop } = createTxSubmitterWorker(submitFn, {
+      db,
+      pollIntervalMs: 10,
+      retryConfig: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    await start();
+    const jobId = await enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await stop();
+
+    const row = rows.get(jobId);
+    expect(row.status).toBe('completed');
+    expect(row.payload).toContain('signedTransactionXdr');
+    expect(row.payload_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(row.attempts).toBe(1);
+  });
+
+  it('retries transient failures, then marks the row completed', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    let attempts = 0;
+    const submitFn = jest.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('tx_bad_seq');
+      }
+      return { status: 'ok' };
+    });
+
+    const { enqueueTxSubmission, start, stop } = createTxSubmitterWorker(submitFn, {
+      db,
+      pollIntervalMs: 10,
+      retryConfig: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    await start();
+    const jobId = await enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await stop();
+
+    expect(submitFn).toHaveBeenCalledTimes(2);
+    expect(rows.get(jobId).status).toBe('completed');
+  });
+
+  it('dead-letters exhausted retries in the database', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const submitFn = jest.fn(async () => { throw new Error('tx_bad_seq'); });
+
+    const { enqueueTxSubmission, start, stop } = createTxSubmitterWorker(submitFn, {
+      db,
+      pollIntervalMs: 10,
+      retryConfig: { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    await start();
+    const jobId = await enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await stop();
+
+    const row = rows.get(jobId);
+    expect(row.status).toBe('failed');
+    expect(row.last_error).toContain('tx_bad_seq');
+  });
+
+  it('restores non-terminal jobs after restart without duplicating them', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const submitFn = jest.fn(async () => ({ status: 'ok' }));
+
+    const first = createTxSubmitterWorker(submitFn, {
+      db,
+      pollIntervalMs: 10,
+      retryConfig: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    const jobId = await first.enqueueTxSubmission({ signedTransactionXdr: 'AAABBB' });
+    await first.stop();
+
+    rows.set(jobId, {
+      ...rows.get(jobId),
+      status: 'processing',
+      attempts: 1,
+    });
+
+    const second = createTxSubmitterWorker(submitFn, {
+      db,
+      pollIntervalMs: 10,
+      retryConfig: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    const firstRestore = await second.restore();
+    const secondRestore = await second.restore();
+
+    expect(firstRestore).toEqual({ restored: 1, skipped: 0 });
+    expect(secondRestore).toEqual({ restored: 0, skipped: 0 });
+    expect(second.txQueue.getJob(jobId)).toBeTruthy();
+    expect(second.txQueue.getStats().pending + second.txQueue.getStats().retrying).toBe(1);
+
+    await second.start();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await second.stop();
+
+    expect(submitFn).toHaveBeenCalledTimes(1);
+    expect(rows.get(jobId).status).toBe('completed');
+  });
+
+  it('does not persist secret-like payload fields', async () => {
+    const { db, rows } = createInMemoryTxSubmissionStore();
+    const submitFn = jest.fn(async () => ({ status: 'ok' }));
+
+    const { enqueueTxSubmission, start, stop } = createTxSubmitterWorker(submitFn, {
+      db,
+      pollIntervalMs: 10,
+      retryConfig: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    await start();
+    const jobId = await enqueueTxSubmission({
+      signedTransactionXdr: 'AAABBB',
+      secretKey: 'SUPER-SECRET',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await stop();
+
+    const persisted = JSON.parse(rows.get(jobId).payload);
+    expect(persisted.signedTransactionXdr).toBe('AAABBB');
+    expect(persisted.secretKey).toBe('[REDACTED]');
+    expect(rows.get(jobId).payload).not.toContain('SUPER-SECRET');
   });
 });

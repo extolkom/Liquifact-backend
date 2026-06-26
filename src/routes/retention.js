@@ -5,12 +5,62 @@ const { z } = require('zod');
 const db = require('../db/knex');
 const retentionJob = require('../jobs/retentionPurge');
 const { authenticateToken } = require('../middleware/auth');
-const { apiKeyAuth } = require('../middleware/apiKey');
+const { authenticateApiKey } = require('../middleware/apiKeyAuth');
 const { sensitiveLimiter } = require('../middleware/rateLimit');
 const AppError = require('../errors/AppError');
 const logger = require('../logger');
+const { emitRetentionAuditSafely } = require('../middleware/auditLog');
 
 const router = express.Router();
+
+const _retentionApiKeyMiddleware = authenticateApiKey();
+
+/**
+ * Builds a redaction-safe snapshot of a retention policy row for audit metadata.
+ *
+ * @param {object|null} record - Database policy row.
+ * @returns {object|null}
+ */
+function snapshotRetentionPolicy(record) {
+  if (!record) {
+    return null;
+  }
+
+  return {
+    id: record.id,
+    tenant_id: record.tenant_id,
+    name: record.name,
+    description: record.description,
+    retention_days: record.retention_days,
+    pii_fields: record.pii_fields,
+    is_active: record.is_active,
+  };
+}
+
+/**
+ * Builds a redaction-safe snapshot of a legal hold row for audit metadata.
+ *
+ * @param {object|null} record - Database legal-hold row.
+ * @returns {object|null}
+ */
+function snapshotLegalHold(record) {
+  if (!record) {
+    return null;
+  }
+
+  return {
+    id: record.id,
+    tenant_id: record.tenant_id,
+    invoice_id: record.invoice_id,
+    hold_reason: record.hold_reason,
+    hold_type: record.hold_type,
+    status: record.status,
+    expires_at: record.expires_at,
+    placed_by: record.placed_by,
+    released_at: record.released_at,
+    release_reason: record.release_reason,
+  };
+}
 
 /**
  * Combined authentication middleware: allows JWT or API key for admin/service auth
@@ -21,10 +71,9 @@ const router = express.Router();
  */
 function adminAuth(req, res, next) {
   if (req.headers['x-api-key']) {
-    return apiKeyAuth(req, res, next);
-  } else {
-    return authenticateToken(req, res, next);
+    return _retentionApiKeyMiddleware(req, res, next);
   }
+  return authenticateToken(req, res, next);
 }
 
 // Validation schemas
@@ -172,6 +221,15 @@ router.post('/policies', adminAuth, sensitiveLimiter, async (req, res) => {
       policyName: policy.name
     }, 'Retention policy created');
 
+    await emitRetentionAuditSafely(req, 'retention.policy.create', {
+      targetType: 'retention_policy',
+      targetId: policy.id,
+      statusCode: 201,
+      before: null,
+      after: snapshotRetentionPolicy(policy),
+      metadata: { tenantId },
+    });
+
     res.status(201).json({
       data: policy,
       message: 'Retention policy created successfully'
@@ -254,6 +312,15 @@ router.put('/policies/:policyId', adminAuth, sensitiveLimiter, async (req, res) 
       policyName: updatedPolicy.name,
       changes: validatedData
     }, 'Retention policy updated');
+
+    await emitRetentionAuditSafely(req, 'retention.policy.update', {
+      targetType: 'retention_policy',
+      targetId: policyId,
+      statusCode: 200,
+      before: snapshotRetentionPolicy(existing),
+      after: snapshotRetentionPolicy(updatedPolicy),
+      metadata: { tenantId, changes: validatedData },
+    });
 
     res.json({
       data: updatedPolicy,
@@ -413,6 +480,18 @@ router.post('/legal-holds', adminAuth, sensitiveLimiter, async (req, res) => {
       holdType: validatedData.holdType
     }, 'Legal hold created');
 
+    await emitRetentionAuditSafely(req, 'retention.legal_hold.create', {
+      targetType: 'legal_hold',
+      targetId: hold.id,
+      statusCode: 201,
+      before: null,
+      after: snapshotLegalHold(hold),
+      metadata: {
+        tenantId,
+        invoiceId: validatedData.invoiceId,
+      },
+    });
+
     res.status(201).json({
       data: hold,
       message: 'Legal hold created successfully'
@@ -504,6 +583,19 @@ router.post('/legal-holds/:holdId/release', adminAuth, sensitiveLimiter, async (
       invoiceId: hold.invoice_id,
       releaseReason
     }, 'Legal hold released');
+
+    await emitRetentionAuditSafely(req, 'retention.legal_hold.release', {
+      targetType: 'legal_hold',
+      targetId: holdId,
+      statusCode: 200,
+      before: snapshotLegalHold(hold),
+      after: snapshotLegalHold(releasedHold),
+      metadata: {
+        tenantId,
+        invoiceId: hold.invoice_id,
+        releaseReason: releaseReason || 'Released by user',
+      },
+    });
 
     res.json({
       data: releasedHold,

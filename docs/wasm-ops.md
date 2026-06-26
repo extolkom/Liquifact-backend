@@ -29,6 +29,23 @@ Semver ordering follows the `semver` npm package (`semver.gt` / `semver.lt`).
 The registry key with the highest semver is treated as the current known
 version.
 
+### RPC implementation detail
+
+`getOnChainSchemaVersion` uses `@stellar/stellar-sdk`'s `SorobanRpc.Server` to
+read the persistent `SCHEMA_VERSION` Symbol key directly from contract storage:
+
+```js
+const server = new SorobanRpc.Server(process.env.SOROBAN_RPC_URL);
+const key = xdr.ScVal.scvSymbol('SCHEMA_VERSION');
+const ledgerKey = xdr.LedgerKey.contractData({ contract, key, durability: 'persistent' });
+const { entries } = await server.getLedgerEntries(ledgerKey);
+return entries[0].val.contractData().val().u32();
+```
+
+The call is wrapped in `callSorobanContract` for automatic exponential-backoff
+retry on transient errors (429, 502, 503, 504, ECONNRESET).  Contract-ID
+validation (`^C[A-Z2-7]{55}$`) runs before any network call.
+
 ---
 
 ## 2. Contract List Refresh Procedure

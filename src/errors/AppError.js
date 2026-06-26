@@ -20,7 +20,7 @@ class AppError extends Error {
    * @returns {AppError}
    */
   constructor(params) {
-    const { title, code, retryable, retryHint } = params || {};
+    const { title, code, retryable, retryHint, context } = params || {};
     super(title);
     this.name = this.constructor.name;
 
@@ -38,6 +38,7 @@ class AppError extends Error {
     this.code = code;
     this.retryable = retryable;
     this.retryHint = retryHint;
+    this.context = params.context || null;
 
     // Capture stack trace, excluding constructor call from it
     Error.captureStackTrace(this, this.constructor);

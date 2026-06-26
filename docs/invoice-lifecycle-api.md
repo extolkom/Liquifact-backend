@@ -4,6 +4,12 @@
 
 The Invoice Lifecycle API implements a secure state machine for managing invoice transitions through the LiquiFact platform. The state machine enforces strict transition rules and maintains a complete audit trail of all state changes.
 
+**Persistence:** Invoice state is stored in the tenant-scoped `invoices` table via Knex. All transition handlers resolve invoices with `getInvoiceById(invoice_id, tenant_id)` and persist the new `status` after a successful `executeTransition()` call. Status is never accepted from the client request body — only the state machine result is written.
+
+**Tenant isolation:** Every route requires tenant context via the `x-tenant-id` header or a `tenantId` claim in the authenticated JWT (see `extractTenant` middleware). Invoices belonging to another tenant return `404 INVOICE_NOT_FOUND` without leaking existence.
+
+**Response envelope:** Success and error responses use the standardized envelope from `responseHelper` (`data`, `meta`, `error` fields).
+
 ## State Machine
 
 ### States
@@ -45,6 +51,10 @@ Get the current state and allowed transitions for an invoice.
 
 **Endpoint**: `GET /api/invoices/:id/state`
 
+**Headers**:
+- `x-tenant-id` (required when JWT lacks `tenantId` claim)
+- `Authorization: Bearer YOUR_JWT_TOKEN` (recommended)
+
 **Response**:
 ```json
 {
@@ -54,6 +64,11 @@ Get the current state and allowed transitions for an invoice.
     "allowedTransitions": ["approved", "rejected", "cancelled"],
     "isTerminal": false
   },
+  "meta": {
+    "timestamp": "2026-04-26T10:30:00.000Z",
+    "version": "0.1.0"
+  },
+  "error": null,
   "message": "Invoice state retrieved successfully"
 }
 ```
@@ -61,7 +76,8 @@ Get the current state and allowed transitions for an invoice.
 **cURL Example**:
 ```bash
 curl -X GET http://localhost:3001/api/invoices/inv-001/state \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "x-tenant-id: tenant-alpha"
 ```
 
 ---
@@ -110,17 +126,34 @@ curl -X POST http://localhost:3001/api/invoices/inv-001/transition \
 **Error Response** (Invalid Transition):
 ```json
 {
-  "error": "Invalid state transition from pending to linked_escrow. Allowed transitions: approved, rejected, cancelled",
-  "code": "INVALID_TRANSITION",
-  "allowedTransitions": ["approved", "rejected", "cancelled"]
+  "data": null,
+  "meta": {
+    "timestamp": "2026-04-26T10:30:00.000Z",
+    "version": "0.1.0"
+  },
+  "error": {
+    "message": "Invalid state transition from pending to linked_escrow. Allowed transitions: approved, rejected, cancelled",
+    "code": "INVALID_TRANSITION",
+    "details": {
+      "allowedTransitions": ["approved", "rejected", "cancelled"]
+    }
+  }
 }
 ```
 
 **Error Response** (Missing terminal transition reason):
 ```json
 {
-  "error": "Reason is required for terminal transition to rejected",
-  "code": "MISSING_TRANSITION_REASON"
+  "data": null,
+  "meta": {
+    "timestamp": "2026-04-26T10:30:00.000Z",
+    "version": "0.1.0"
+  },
+  "error": {
+    "message": "Reason is required for terminal transition to rejected",
+    "code": "MISSING_TRANSITION_REASON",
+    "details": null
+  }
 }
 ```
 
@@ -359,6 +392,11 @@ Every state transition creates an immutable audit log entry with:
 
 ## Security Considerations
 
+### Tenant scoping
+- All routes mount `extractTenant` middleware before handlers run.
+- Invoice lookups use `invoice_id` **and** `tenant_id`; cross-tenant IDs return `404`.
+- Client-supplied `status` fields in the request body are ignored — only the state machine output is persisted.
+
 ### Authentication
 - All endpoints require valid JWT authentication
 - Actor is extracted from JWT token (`req.user.id` or `req.user.sub`)
@@ -443,6 +481,18 @@ npm run test:coverage -- tests/invoice.state.test.js
 ---
 
 ## Database Schema
+
+### Invoices Table (Knex / SQLite test profile)
+
+State transitions update the `status` column on the tenant-scoped `invoices` row:
+
+| Column | Notes |
+|--------|-------|
+| `invoice_id` | Public identifier used in API paths |
+| `tenant_id` | Required on every read/write |
+| `status` | Lifecycle state (`pending`, `approved`, `linked_escrow`, `rejected`, `cancelled`, …) |
+| `metadata` | JSON; `escrowId` stored here after link-escrow |
+| `deleted_at` | Soft-deleted invoices are excluded from state routes |
 
 ### Audit Logs Table
 

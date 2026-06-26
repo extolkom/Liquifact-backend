@@ -16,6 +16,9 @@ const ConfigSchema = z
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
     PORT: z.coerce.number().min(1).max(65535).default(3001),
     JWT_SECRET: z.string().min(32), // No default for security
+    JWT_ALGORITHMS: z.string().optional().default('HS256'), // Comma-separated allowlist, e.g. HS256,RS256
+    JWT_ISSUER: z.string().optional(), // Optional issuer claim to enforce
+    JWT_AUDIENCE: z.string().optional(), // Optional audience claim to enforce
     CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
     NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
@@ -58,11 +61,28 @@ let config;
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
   if (!parsed.success) {
-    console.error('Config validation failed:', parsed.error.format());
-    throw new Error(`Invalid configuration: ${parsed.error.message}`);
+    throw parsed.error;
   }
   config = parsed.data;
   return config;
+}
+
+/**
+ * Format and log a redacted summary of validation issues to console.error.
+ * Never prints secret values (only key names and validation error messages).
+ * @param {z.ZodError} error - The Zod error to summarize.
+ * @returns {void}
+ */
+function logRedactedSummary(error) {
+  console.error('Configuration validation failed:');
+  if (error && Array.isArray(error.issues)) {
+    error.issues.forEach(issue => {
+      const key = issue.path.join('.');
+      console.error(`- [${key}]: ${issue.message}`);
+    });
+  } else {
+    console.error(error ? error.message : 'Unknown configuration error');
+  }
 }
 
 /**
@@ -115,6 +135,7 @@ const securityHeaders = {
 module.exports = {
   validate,
   get,
+  logRedactedSummary,
   ConfigSchema,
   securityHeaders,
 };

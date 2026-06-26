@@ -29,7 +29,10 @@ field (`escrow_events.contract_id`, which the schema already supports).
    scalars are **not** treated as invoice IDs to avoid false positives.
 3. Reverse lookup of the emitting contract address via
    `config/escrowMap.resolveInvoiceByAddress`, which maps an active escrow
-   contract address back to its invoice ID for the current environment.
+   contract address back to its invoice ID for the current environment. The
+   reverse index is built once from `ESCROW_ADDR_BY_INVOICE` mappings (respecting
+   `cacheEnabled` / `cacheTtlSeconds`) and only includes active, environment-
+   scoped entries — unknown addresses return `null` and the event is skipped.
 
 Every candidate is validated against `INVOICE_ID_REGEX`
 (`/^[a-zA-Z0-9_-]{1,128}$/`). Any record that does not yield a valid invoice —

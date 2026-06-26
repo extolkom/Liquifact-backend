@@ -87,7 +87,7 @@ async function readKycRecord(smeId) {
   }
 
   const row = await db('kyc_records').where({ sme_id: smeId }).first();
-  if (!row) {
+  if (!row || !row.status) {
     return null;
   }
 
@@ -269,15 +269,24 @@ async function verifySmeSafe(smeId, options = {}) {
   }
 
   const recordId = options.recordId || `kyc_${smeId}_${Date.now()}`;
+  const verifiedAt = new Date().toISOString();
   const record = {
     smeId,
     status: KYC_STATUSES.VERIFIED,
     recordId,
-    verifiedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
+    verifiedAt,
+    createdAt: verifiedAt,
   };
 
   mockKycRecords.set(smeId, record);
+
+  // Persist to database
+  await persistKycRecord({
+    smeId,
+    status: KYC_STATUSES.VERIFIED,
+    providerRecordId: recordId,
+    verifiedAt,
+  });
 
   logger.info({ smeId, recordId }, 'SME marked as KYC verified');
 
@@ -312,6 +321,13 @@ async function rejectSmeKyc(smeId, reason = 'Manual rejection') {
 
   mockKycRecords.set(smeId, record);
 
+  // Persist to database
+  await persistKycRecord({
+    smeId,
+    status: KYC_STATUSES.REJECTED,
+    providerRecordId: recordId,
+  });
+
   logger.warn({ smeId, recordId, reason }, 'SME KYC rejected');
 
   return {
@@ -344,6 +360,13 @@ async function exemptSmeFromKyc(smeId, reason = 'Manual exemption') {
   };
 
   mockKycRecords.set(smeId, record);
+
+  // Persist to database
+  await persistKycRecord({
+    smeId,
+    status: KYC_STATUSES.EXEMPTED,
+    providerRecordId: recordId,
+  });
 
   logger.info({ smeId, recordId, reason }, 'SME exempted from KYC');
 

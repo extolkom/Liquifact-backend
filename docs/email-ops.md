@@ -12,9 +12,71 @@ Required environment variables for real traffic:
 - `SMTP_PASS`: SMTP authenticated password.
 - `SMTP_FROM`: (Optional) Sender signature overriding `noreply@liquifact.com`.
 
+### Retry Configuration
+- `SMTP_MAX_RETRIES`: (Optional) Maximum retry attempts for transient SMTP failures. Defaults to 3.
+
+## Delivery Resiliency
+
+Maturity reminder emails include built-in resiliency to handle transient failures:
+
+### Exponential Backoff
+- Each retry uses exponential backoff with a base delay of ~1 second
+- Delay multiplies by 2 for each subsequent attempt
+- Maximum delay is capped at the configured `maxDelay` parameter
+- Jitter (±20%) is added to prevent thundering herd during traffic spikes
+
+### Error Classification
+The system distinguishes between **permanent** and **transient** SMTP errors:
+
+**Permanent Errors (no retry, dead-lettered immediately):**
+- SMTP 5xx codes (550-554): invalid recipient, policy rejection, quota exceeded
+- Specific error patterns: "Invalid recipient", "User unknown", "Mailbox not found"
+
+**Transient Errors (retried with backoff):**
+- SMTP 4xx codes (421-429): temporary service unavailable
+- Network errors: `ECONNREFUSED`, `ETIMEDOUT`, `EHOSTUNREACH`
+- Generic transport errors without a 5xx code
+
+### Dead-Lettering
+When a maturity reminder fails after exhausting all retries (or encounters a permanent error):
+1. The email is **dead-lettered** to an in-memory queue for manual inspection
+2. A Prometheus counter (`maturity_reminder_dead_letter_total`) is incremented with the failure reason
+3. Logging records the error details for debugging and alerting
+
+Dead-letter entries include:
+- `invoiceId`: Invoice associated with the failed reminder
+- `email`: Recipient email address
+- `error`: Error object with code, message, SMTP response, and permanent/transient classification
+- `timestamp`: ISO-8601 timestamp of the failure
+- `maxAttempts`: Number of retry attempts that were made
+
+## Metrics
+
+Three Prometheus counters track reminder delivery:
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `maturity_reminder_delivery_attempts_total` | `job_type=maturity_reminder` | Total delivery attempts (each retry counts) |
+| `maturity_reminder_delivery_success_total` | `job_type=maturity_reminder` | Successfully delivered reminders |
+| `maturity_reminder_dead_letter_total` | `job_type`, `reason` | Dead-lettered reminders (reason: `permanent_error` or `max_retries_exceeded`) |
+
+Example queries:
+```prometheus
+# Success rate (%)
+(rate(maturity_reminder_delivery_success_total[5m]) / rate(maturity_reminder_delivery_attempts_total[5m])) * 100
+
+# Dead-letter rate
+rate(maturity_reminder_dead_letter_total[5m])
+
+# Permanent vs transient failures
+sum by (reason) (rate(maturity_reminder_dead_letter_total[5m]))
+```
+
 ## Memory Footprint of the Invoice Map
 Our job execution manages `cancellable jobs`. E.g., if an invoice is settled well before the maturity date, we should refrain from bothering the end-user with a reminder. We achieve this with a localized map mapping `invoiceId`s to `jobId`s.
-The localized map does not pose a significant memory constraint since successful deliveries cleanly evict mapped keys, keeping state extremely lightweight. 
+The localized map does not pose a significant memory constraint since successful deliveries cleanly evict mapped keys, keeping state extremely lightweight.
+
+The dead-letter queue is also bounded to 1000 entries to prevent unbounded memory growth. When the limit is reached, the oldest entry is discarded.
 
 ## Code Interactions
 
@@ -25,6 +87,12 @@ It handles deduplication seamlessly: re-scheduling a reminder manually drops the
 ### `cancelReminder(invoiceId)`
 A straightforward utility for the Express controller. Pass the invoice ID if the invoice is successfully settled entirely, which prunes it off the BackgroundWorker's waiting block.
 
+### `getDeadLetterQueue()`
+Retrieves a copy of the dead-letter queue for debugging and manual recovery operations.
+
+### `clearDeadLetterQueue()`
+Clears the dead-letter queue after manual investigation or recovery.
+
 ## Testing manually using Node.js REPL
 
 You can test this easily manually without triggering full test suites:
@@ -32,7 +100,8 @@ You can test this easily manually without triggering full test suites:
 const {
   scheduleReminder,
   startQueueProcessing,
-  templates
+  templates,
+  getDeadLetterQueue
 } = require('./src/jobs/maturityReminders');
 
 startQueueProcessing();
@@ -40,6 +109,11 @@ startQueueProcessing();
 const simulatedInvoice = { id: 'test_123', customer: 'Alice', amount: 50 };
 // Schedules immediately (since it's in the past)
 scheduleReminder(simulatedInvoice, new Date(), 'alice@example.com');
+
+// After a few seconds, check dead-letter queue (if delivery failed)
+setTimeout(() => {
+  console.log('Dead letters:', getDeadLetterQueue());
+}, 2000);
 ```
 
 ---

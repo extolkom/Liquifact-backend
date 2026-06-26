@@ -73,6 +73,25 @@ describe('Health Service', () => {
       expect(result.error).toBe('The operation was aborted');
     });
 
+    it('should classify latency as degraded when latency exceeds warn but not fail', async () => {
+      process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
+      // Set thresholds low to force degraded
+      process.env.SOROBAN_LATENCY_WARN_MS = '0';
+      process.env.SOROBAN_LATENCY_FAIL_MS = '500';
+
+      // Mock fetch to resolve after 100ms
+      fetchMock.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve({ ok: true, status: 200 }), 100)));
+
+      jest.useFakeTimers();
+      const resultPromise = checkSorobanHealth();
+      jest.advanceTimersByTime(100);
+      const result = await resultPromise;
+      jest.useRealTimers();
+
+      expect(result.status).toBe('degraded');
+      expect(result.latency).toBeGreaterThanOrEqual(100);
+    });
+
     it('should return unhealthy when network error occurs', async () => {
       process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
       fetchMock.mockRejectedValue(new Error('Network failure'));

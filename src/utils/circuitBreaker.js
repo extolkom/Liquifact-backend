@@ -28,15 +28,32 @@ class CircuitBreaker {
    * @param {number} [options.failureThreshold=5] - Number of failures before state changes to OPEN.
    * @param {number} [options.recoveryTimeout=10000] - Time in ms before state changes from OPEN to HALF_OPEN.
    * @param {Function} [options.fallbackLogic=null] - Optional fallback function executed when circuit is OPEN.
+   * @param {Function} [options.onStateChange=null] - Optional callback triggered on state transitions `(oldState, newState)`.
    */
   constructor(options = {}) {
     this.failureThreshold = options.failureThreshold || 5;
     this.recoveryTimeout = options.recoveryTimeout || 10000;
     this.fallbackLogic = options.fallbackLogic || null;
+    this.onStateChange = options.onStateChange || null;
 
     this.state = CircuitBreakerState.CLOSED;
     this.failureCount = 0;
     this.nextAttemptTime = Date.now();
+  }
+
+  /**
+   * Updates the internal state and fires the onStateChange callback if provided.
+   * @param {string} newState - The new state to transition to.
+   * @returns {void}
+   */
+  _transitionState(newState) {
+    if (this.state !== newState) {
+      const oldState = this.state;
+      this.state = newState;
+      if (typeof this.onStateChange === 'function') {
+        this.onStateChange(oldState, newState);
+      }
+    }
   }
 
   /**
@@ -49,13 +66,15 @@ class CircuitBreaker {
     if (this.state === CircuitBreakerState.OPEN) {
       if (Date.now() >= this.nextAttemptTime) {
         // Time has elapsed, transition to HALF_OPEN to test the resource.
-        this.state = CircuitBreakerState.HALF_OPEN;
+        this._transitionState(CircuitBreakerState.HALF_OPEN);
       } else {
         // Circuit is still OPEN. Fail fast or use fallback.
         if (this.fallbackLogic) {
           return this.fallbackLogic();
         }
-        throw new Error('Circuit Breaker is OPEN. Operation failed fast.');
+        const err = new Error('Circuit Breaker is OPEN. Operation failed fast.');
+        err.code = 'CIRCUIT_OPEN';
+        throw err;
       }
     }
 
@@ -76,7 +95,7 @@ class CircuitBreaker {
   onSuccess(response) {
     this.failureCount = 0;
     if (this.state === CircuitBreakerState.HALF_OPEN) {
-      this.state = CircuitBreakerState.CLOSED;
+      this._transitionState(CircuitBreakerState.CLOSED);
     }
     return response;
   }
@@ -92,7 +111,7 @@ class CircuitBreaker {
     this.failureCount += 1;
 
     if (this.state === CircuitBreakerState.HALF_OPEN || this.failureCount >= this.failureThreshold) {
-      this.state = CircuitBreakerState.OPEN;
+      this._transitionState(CircuitBreakerState.OPEN);
       this.nextAttemptTime = Date.now() + this.recoveryTimeout;
     }
 

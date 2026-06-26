@@ -3,11 +3,30 @@
 /**
  * @fileoverview Prometheus metrics registry and /metrics route handler.
  *
- * Auth strategy (in priority order):
- *   1. If METRICS_BEARER_TOKEN is set, require `Authorization: Bearer <token>`.
- *   2. If METRICS_BEARER_TOKEN is unset, allow requests from loopback only
- *      (127.0.0.1, ::1, ::ffff:127.0.0.1) — suitable for private-network scraping.
- *   3. All other requests receive 401.
+ * ## Auth strategy (in priority order)
+ *
+ * 1. If `METRICS_BEARER_TOKEN` is set, require `Authorization: Bearer <token>`.
+ *    The token comparison uses a **constant-time** algorithm to prevent timing
+ *    side-channel attacks.
+ *
+ * 2. If `METRICS_BEARER_TOKEN` is **unset**, allow requests from loopback
+ *    addresses only (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`). This is suitable
+ *    for private-network Prometheus scraping.
+ *
+ * 3. All other requests receive a uniform `401` with no detail about _why_
+ *    (no distinction between "wrong token" and "missing token").
+ *
+ * ## Security: trusted-proxy & X-Forwarded-For
+ *
+ * Loopback detection **always** reads the direct TCP connection address from
+ * `req.socket.remoteAddress`. The `X-Forwarded-For` header is **never**
+ * consulted, so a remote attacker cannot spoof a loopback origin by setting
+ * `X-Forwarded-For: 127.0.0.1`.
+ *
+ * There is no `app.set('trust proxy', ...)` call anywhere in this application.
+ * If one is added in the future, `req.ip` could resolve to a `X-Forwarded-For`
+ * value, but this middleware **already** ignores `req.ip` for loopback checks
+ * and reads the socket directly, making it resilient to such config changes.
  *
  * @module metrics
  */
@@ -15,31 +34,70 @@
 let client;
 try {
   client = require('prom-client');
-} catch (e) {
+} catch (_e) {
   // Fallback shim for environments without prom-client (tests)
+
+  /**
+   * Minimal prom-client Registry shim for test environments.
+   * @implements {import('prom-client').Registry}
+   */
+  class RegistryShim {
+    /** @param {void} */
+    constructor() { this.contentType = 'text/plain'; }
+    /** @returns {string} */
+    metrics() { return ''; }
+  }
+
+  /**
+   * Counter shim for test environments.
+   * @implements {import('prom-client').Counter}
+   */
+  class CounterShim {
+    /** @param {void} */
+    constructor() {}
+    /** @returns {void} */
+    inc() {}
+  }
+
+  /**
+   * Gauge shim for test environments.
+   * @implements {import('prom-client').Gauge}
+   */
+  class GaugeShim {
+    /** @param {void} */
+    constructor() {}
+    /** @returns {void} */
+    set() {}
+    /** @returns {void} */
+    setToCurrentTime() {}
+  }
+
   client = {
-    Registry: class {
-      constructor() { this.contentType = 'text/plain'; }
-      metrics() { return ''; }
-    },
+    Registry: RegistryShim,
+    /**
+     * No-op default metrics collector stub.
+     * @returns {void}
+     */
     collectDefaultMetrics: () => { },
-    Counter: class {
-      constructor() {}
-      inc() {}
-    },
-    Gauge: class {
-      constructor() {}
-      set() {}
-      setToCurrentTime() {}
-    },
+    Counter: CounterShim,
+    Gauge: GaugeShim,
   };
 }
 
 /**
  * Constant-time string comparison to prevent timing attacks.
- * @param {string} a
- * @param {string} b
- * @returns {boolean}
+ *
+ * Returns `false` early when lengths differ (public info leaked by content-length
+ * rather than timing), but still performs a full-length XOR when lengths match
+ * so that a timing attacker cannot distinguish _where_ the difference occurs.
+ *
+ * @param {string} a - First string to compare.
+ * @param {string} b - Second string to compare.
+ * @returns {boolean} `true` when the strings are equal, `false` otherwise.
+ *
+ * @example
+ * safeEqual('secret', 'secret'); // true
+ * safeEqual('secret', 'wrong');  // false
  */
 function safeEqual(a, b) {
   if (a.length !== b.length) { return false; }
@@ -50,7 +108,88 @@ function safeEqual(a, b) {
   return result === 0;
 }
 
+/**
+ * Set of loopback IP addresses that are allowed when no bearer token is
+ * configured. Includes IPv4, IPv6, and IPv4-mapped IPv6 representations.
+ *
+ * @type {ReadonlySet<string>}
+ */
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+/**
+ * Extracts the direct TCP connection IP address from the request.
+ *
+ * Reads `req.socket.remoteAddress` first — this is the actual TCP socket peer
+ * and cannot be spoofed via `X-Forwarded-For` or any other HTTP header. Falls
+ * back to `req.ip` when the socket address is unavailable (edge case in some
+ * test environments or HTTP/2 proxies).
+ *
+ * @param {import('express').Request} req - Express request object.
+ * @returns {string} The client IP address string, or empty string if
+ *   neither source is available.
+ *
+ * @example
+ * extractClientIp(req); // '127.0.0.1'
+ */
+function extractClientIp(req) {
+  return (req.socket && req.socket.remoteAddress) || req.ip || '';
+}
+
+/**
+ * Express middleware that enforces metrics endpoint authentication.
+ *
+ * ## Auth decision flow
+ *
+ * ```
+ * METRICS_BEARER_TOKEN set?
+ *   ├── YES → constant-time compare Authorization header
+ *   │         ├── match  → next()
+ *   │         └── no match → 401 (no detail)
+ *   └── NO  → extractClientIp(req) in LOOPBACK set?
+ *             ├── yes → next()
+ *             └── no  → 401 (no detail)
+ * ```
+ *
+ * The response is **always** a plain `{ error: 'Unauthorized' }` with no
+ * indication of whether the failure was a missing token, wrong token, or
+ * non-loopback origin.
+ *
+ * @param {import('express').Request} req - Express request.
+ * @param {import('express').Response} res - Express response.
+ * @param {import('express').NextFunction} next - Express next callback.
+ * @returns {void}
+ */
+function metricsAuth(req, res, next) {
+  const token = process.env.METRICS_BEARER_TOKEN;
+
+  if (token) {
+    const auth = req.headers['authorization'] || '';
+    if (safeEqual(auth, `Bearer ${token}`)) { return next(); }
+    const authFallback = req.headers['Authorization'] || '';
+    if (safeEqual(authFallback, `Bearer ${token}`)) { return next(); }
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  // No token configured — allow loopback only, using the direct TCP socket IP.
+  // X-Forwarded-For is NEVER trusted for this check.
+  const ip = extractClientIp(req);
+  if (LOOPBACK.has(ip)) { return next(); }
+
+  res.status(401).json({ error: 'Unauthorized' });
+}
+
+/**
+ * Express route handler that returns Prometheus metrics in plain-text format.
+ *
+ * @param {import('express').Request} _req - Express request (unused).
+ * @param {import('express').Response} res - Express response.
+ * @returns {Promise<void>}
+ */
+async function metricsHandler(_req, res) {
+  res.set('Content-Type', registry.contentType);
+  res.end(await registry.metrics());
+}
 
 /** Shared registry — exported so tests can reset it between runs. */
 const registry = new client.Registry();
@@ -117,6 +256,42 @@ const escrowReconciliationMismatches = new client.Counter({
 });
 
 /**
+ * Counter: Maturity reminder email delivery attempts.
+ * Incremented for each attempt to send a maturity reminder email (including retries).
+ * @type {import('prom-client').Counter}
+ */
+const maturityReminderDeliveryAttemptsTotal = new client.Counter({
+  name: 'maturity_reminder_delivery_attempts_total',
+  help: 'Total number of maturity reminder email delivery attempts (each retry counts)',
+  labelNames: ['job_type'],
+  registers: [registry],
+});
+
+/**
+ * Counter: Successful maturity reminder email deliveries.
+ * Incremented when a maturity reminder email is sent successfully.
+ * @type {import('prom-client').Counter}
+ */
+const maturityReminderDeliverySuccessTotal = new client.Counter({
+  name: 'maturity_reminder_delivery_success_total',
+  help: 'Total number of maturity reminder emails delivered successfully',
+  labelNames: ['job_type'],
+  registers: [registry],
+});
+
+/**
+ * Counter: Dead-lettered maturity reminder emails.
+ * Incremented when a maturity reminder fails permanently (permanent SMTP error or max retries exceeded).
+ * @type {import('prom-client').Counter}
+ */
+const maturityReminderDeadLetterTotal = new client.Counter({
+  name: 'maturity_reminder_dead_letter_total',
+  help: 'Total number of maturity reminder emails dead-lettered due to permanent failures or retry exhaustion',
+  labelNames: ['job_type', 'reason'],
+  registers: [registry],
+});
+
+/**
  * Counter: Footprint cache hits.
  * @type {import('prom-client').Counter}
  */
@@ -147,42 +322,6 @@ const footprintCacheEvictionsTotal = new client.Counter({
 });
 
 /**
- * Express middleware that enforces metrics auth.
- *
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} next
- * @returns {void}
- */
-function metricsAuth(req, res, next) {
-  const token = process.env.METRICS_BEARER_TOKEN;
-
-  if (token) {
-    const auth = req.headers['authorization'] || '';
-    if (safeEqual(auth, `Bearer ${token}`)) {return next();}
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
-  }
-
-  // No token configured — allow loopback only
-  const ip = req.ip || req.socket.remoteAddress || '';
-  if (LOOPBACK.has(ip)) { return next(); }
-
-  res.status(401).json({ error: 'Unauthorized' });
-}
-
-/**
- * Express route handler that returns Prometheus metrics.
- *
- * @param {import('express').Request} _req
- * @param {import('express').Response} res
- */
-async function metricsHandler(_req, res) {
-  res.set('Content-Type', registry.contentType);
-  res.end(await registry.metrics());
-}
-
-/**
  * Gauge: Readiness state (1 = ready, 0 = not ready).
  * Updated by performReadinessChecks() in the health service.
  * @type {import('prom-client').Gauge}
@@ -197,6 +336,9 @@ module.exports = {
   registry,
   metricsAuth,
   metricsHandler,
+  safeEqual,
+  extractClientIp,
+  LOOPBACK,
   escrowIndexerEventsProcessedTotal,
   escrowIndexerEventsSkippedTotal,
   escrowIndexerCycleFailuresTotal,
@@ -204,6 +346,7 @@ module.exports = {
   footprintCacheHitsTotal,
   footprintCacheMissesTotal,
   footprintCacheEvictionsTotal,
+  sorobanCircuitBreakerStateTransitionsTotal,
   escrowReconciliationMismatches,
   readinessGauge,
 };

@@ -71,7 +71,7 @@ const baseDefinition = {
           },
           message: { type: 'string' },
         },
-        additionalProperties: true,
+        additionalProperties: false,
       },
       /**
        * Successful response from `GET /api/marketplace`.
@@ -90,7 +90,7 @@ const baseDefinition = {
               limit: { type: 'integer', minimum: 1, maximum: 100 },
               totalPages: { type: 'integer', minimum: 0 },
             },
-            additionalProperties: true,
+            additionalProperties: false,
           },
           message: { type: 'string' },
         },
@@ -123,7 +123,7 @@ const baseDefinition = {
                 additionalProperties: true,
               },
             },
-            additionalProperties: true,
+            additionalProperties: false,
           },
           meta: {
             type: 'object',
@@ -134,7 +134,7 @@ const baseDefinition = {
               kycVerified: { type: 'boolean' },
               kycStatus: { type: 'string' },
             },
-            additionalProperties: true,
+            additionalProperties: false,
           },
           message: { type: 'string' },
         },
@@ -158,7 +158,7 @@ const baseDefinition = {
           retryable: { type: 'boolean' },
           retry_hint: { type: 'string' },
         },
-        additionalProperties: true,
+        additionalProperties: false,
       },
     },
     responses: {
