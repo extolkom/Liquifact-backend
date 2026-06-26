@@ -25,12 +25,17 @@ function startServer() {
 }
 
 /**
- * Resets in-memory state (no-op in the shim; preserved for legacy callers).
+ * Resets in-memory state (clears the shared cache store for test isolation).
  *
  * @returns {void}
  */
 function resetStore() {
-  // intentional no-op
+  try {
+    const { getSharedStore } = require('./services/cacheStore');
+    getSharedStore().clear();
+  } catch (_) {
+    // intentional no-op in environments where cacheStore is unavailable
+  }
 }
 
 const originalCreateApp = app.createApp;

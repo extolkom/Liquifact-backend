@@ -3,25 +3,37 @@
 const { v4: uuidv4 } = require('uuid');
 
 // Mock database with comprehensive coverage
+function asResolved(builder, data) {
+  builder.then = (onF) => Promise.resolve(data).then(onF);
+  builder.catch = (onR) => Promise.resolve(data).catch(onR);
+  return builder;
+}
+
 jest.mock('../src/db/knex', () => {
   const createMockQuery = () => ({
-    where: jest.fn().mockReturnThis(),
-    whereNotIn: jest.fn().mockReturnThis(),
-    whereNull: jest.fn().mockReturnThis(),
-    whereIn: jest.fn().mockReturnThis(),
-    whereRaw: jest.fn().mockReturnThis(),
-    leftJoin: jest.fn().mockReturnThis(),
-    orderBy: jest.fn().mockReturnThis(),
-    limit: jest.fn().mockReturnThis(),
+    where: jest.fn(function() { return this; }),
+    whereNotIn: jest.fn(function() { return this; }),
+    whereNull: jest.fn(function() { return this; }),
+    whereIn: jest.fn(function() { return this; }),
+    whereRaw: jest.fn(function() { return this; }),
+    leftJoin: jest.fn(function() { return this; }),
+    orderBy: jest.fn(function() { return this; }),
+    limit: jest.fn(function() { return this; }),
     del: jest.fn().mockResolvedValue(1),
     select: jest.fn().mockResolvedValue([]),
     insert: jest.fn(function() { return this; }),
     update: jest.fn(function() { return this; }),
     first: jest.fn().mockResolvedValue(null),
-    andWhere: jest.fn().mockReturnThis(),
-    orWhere: jest.fn().mockReturnThis(),
+    andWhere: jest.fn(function() { return this; }),
+    orWhere: jest.fn(function() { return this; }),
     returning: jest.fn(function(fields) { 
       return Promise.resolve(Array.isArray(fields) ? [] : [{}]);
+    }),
+    then: jest.fn(function(onFulfilled) {
+      return Promise.resolve(this._resolveValue !== undefined ? this._resolveValue : []).then(onFulfilled);
+    }),
+    catch: jest.fn(function(onRejected) {
+      return Promise.resolve(this._resolveValue !== undefined ? this._resolveValue : []).catch(onRejected);
     }),
   });
 

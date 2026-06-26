@@ -38,7 +38,7 @@ class AppError extends Error {
     this.code = code;
     this.retryable = retryable;
     this.retryHint = retryHint;
-    this.context = context;
+    this.context = params.context || null;
 
     // Capture stack trace, excluding constructor call from it
     Error.captureStackTrace(this, this.constructor);

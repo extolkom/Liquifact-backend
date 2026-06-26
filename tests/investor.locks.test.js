@@ -1,17 +1,18 @@
 'use strict';
 
 const request = require('supertest');
-const { createApp } = require('../src/index');
+const { createApp, resetStore } = require('../src/index');
 const jwt = require('jsonwebtoken');
 const investorCommitmentService = require('../src/services/investorCommitment');
 
 const TEST_SECRET = process.env.JWT_SECRET || 'test-secret';
-const validToken = jwt.sign({ id: 'user_investor', role: 'investor' }, TEST_SECRET, { expiresIn: '1h' });
+const validToken = jwt.sign({ id: 'user_investor', role: 'investor', tenantId: 'test-tenant' }, TEST_SECRET, { expiresIn: '1h' });
 
 describe('Investor Locks API', () => {
   let app;
 
   beforeAll(() => {
+    resetStore();
     investorCommitmentService.clearInvestorLocks();
     investorCommitmentService.seedInvestorLocks();
     app = createApp({ enableTestRoutes: true });

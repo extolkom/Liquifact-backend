@@ -42,6 +42,7 @@ const smeRoutes = require('./routes/sme');
 const invoiceFileRoutes = require('./routes/invoiceFile');
 const auditTrailRoutes = require('./routes/auditTrail');
 const investRoutes = require('./routes/invest');
+const investorRoutes = require('./routes/investor');
 const marketplaceRoutes = require('./routes/marketplace');
 const retentionRoutes = require('./routes/retention');
 const invoiceStateRoutes = require('./routes/invoiceStateRoutes');

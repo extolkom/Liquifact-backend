@@ -11,9 +11,18 @@ const marketplaceService = require('../services/marketplaceService');
 const { validateMarketplaceQueryParams } = require('../utils/validators');
 const { CursorError } = require('../utils/cursorPagination');
 const { authenticatedTenantStack } = require('../middleware/stacks');
+const { cacheResponse, makeMarketplaceKey } = require('../middleware/cache');
+const { getSharedStore } = require('../services/cacheStore');
 const logger = require('../logger');
 
 router.use(...authenticatedTenantStack);
+
+const CACHE_TTL_MS = 15000;
+const cacheMiddleware = cacheResponse({
+  ttl: CACHE_TTL_MS,
+  store: getSharedStore(),
+  keyFn: makeMarketplaceKey,
+});
 
 /**
  * @swagger
@@ -167,7 +176,7 @@ router.use(...authenticatedTenantStack);
  *       401:
  *         $ref: '#/components/responses/Problem401'
  */
-router.get('/', async (req, res, next) => {
+router.get('/', cacheMiddleware, async (req, res, next) => {
   try {
     const { isValid, errors, validatedParams } = validateMarketplaceQueryParams(req.query);
 

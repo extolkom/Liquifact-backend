@@ -8,8 +8,23 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
+const { extractTenant } = require('../middleware/tenant');
+const { cacheResponse, makeInvestorLocksKey, makeInvestorLockKey } = require('../middleware/cache');
+const { getSharedStore } = require('../services/cacheStore');
 const investorCommitmentService = require('../services/investorCommitment');
 const logger = require('../logger');
+
+const CACHE_TTL_MS = 15000;
+const cacheLocks = cacheResponse({
+  ttl: CACHE_TTL_MS,
+  store: getSharedStore(),
+  keyFn: makeInvestorLocksKey,
+});
+const cacheLock = cacheResponse({
+  ttl: CACHE_TTL_MS,
+  store: getSharedStore(),
+  keyFn: makeInvestorLockKey,
+});
 
 /**
  * @swagger
@@ -64,7 +79,7 @@ const logger = require('../logger');
  *       400:
  *         description: Invalid address format
  */
-router.get('/locks', authenticateToken, async (req, res, next) => {
+router.get('/locks', authenticateToken, extractTenant, cacheLocks, async (req, res, next) => {
   try {
     const { funderAddress, invoiceId } = req.query;
 
@@ -137,7 +152,7 @@ router.get('/locks', authenticateToken, async (req, res, next) => {
  *       404:
  *         description: Lock not found
  */
-router.get('/locks/:invoiceId', authenticateToken, async (req, res, next) => {
+router.get('/locks/:invoiceId', authenticateToken, extractTenant, cacheLock, async (req, res, next) => {
   try {
     const { invoiceId } = req.params;
     const { funderAddress } = req.query;

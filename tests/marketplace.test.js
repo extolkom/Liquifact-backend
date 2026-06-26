@@ -18,7 +18,7 @@
  */
 
 const request = require('supertest');
-const { createApp } = require('../src/index');
+const { createApp, resetStore } = require('../src/index');
 const jwt = require('jsonwebtoken');
 const db = require('../src/db/knex');
 const { encodeCursor, decodeCursor, CursorError } = require('../src/utils/cursorPagination');
@@ -99,6 +99,7 @@ describe('Marketplace API', () => {
   });
 
   beforeEach(() => {
+    resetStore();
     jest.clearAllMocks();
     // Default: count returns 1, data returns one sample row
     mockQuery.first.mockResolvedValue({ total: 1 });

@@ -15,7 +15,9 @@
 
 'use strict';
 
-const db = require('../db/knex'); // project's shared Knex instance
+const db = require('../db/knex');
+const { getSharedStore } = require('./cacheStore');
+const { invalidatePrefix } = require('../middleware/cache');
 
 const TABLE = 'investor_commitments';
 
@@ -225,125 +227,183 @@ async function updateCommitment(id, fields) {
   return row;
 }
 
-/**
- * Find commitments for a given investor and invoice.
- *
- * @param {string} investorAddress
- * @param {string} invoiceId
- * @returns {Promise<CommitmentRecord[]>}
- */
-async function findCommitments(investorAddress, invoiceId) {
-  return db(TABLE).where({ investor_address: investorAddress, invoice_id: invoiceId }).orderBy('created_at', 'desc');
-}
-
-// ─── In-memory investor lock store ───────────────────────────────────────────
-// Mirrors on-chain lock data (claimNotBefore, yield) into a local cache.
-// Marked stale=true because they are read from a DB mirror, not live chain state.
-
-/** @type {Map<string, Object>} key: `${invoiceId}:${funderAddress}` */
-const investorLocks = new Map();
-
-/** @param {string} invoiceId @param {string} funderAddress @returns {string} */
-function lockKey(invoiceId, funderAddress) {
-  return `${invoiceId}:${funderAddress}`;
-}
-
-/** Wipe all in-memory lock records (used in tests). */
-function clearInvestorLocks() {
-  investorLocks.clear();
-}
-
-/** Pre-populate the store with representative seed data for testing. */
-function seedInvestorLocks() {
-  setInvestorLock({
-    funderAddress: 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK',
-    claimNotBefore: '2026-01-01T00:00:00Z',
-    investorEffectiveYieldBps: 800,
-    invoiceId: 'inv_7788',
-  });
-  setInvestorLock({
-    funderAddress: 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL',
-    claimNotBefore: '2026-02-01T00:00:00Z',
-    investorEffectiveYieldBps: 750,
-    invoiceId: 'inv_9900',
-  });
-}
-
-/**
- * Upsert a lock record. Overwrites an existing entry for the same
- * (invoiceId, funderAddress) pair.
- *
- * @param {Object} params
- * @param {string} params.funderAddress
- * @param {string} params.claimNotBefore
- * @param {number} params.investorEffectiveYieldBps
- * @param {string} params.invoiceId
- * @returns {Object} The stored lock record.
- */
-function setInvestorLock({ funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId }) {
-  const key = lockKey(invoiceId, funderAddress);
-  const record = { funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId, stale: true };
-  investorLocks.set(key, record);
-  return record;
-}
-
-/**
- * Retrieve a single lock by invoice and funder.
- *
- * @param {string} invoiceId
- * @param {string} funderAddress
- * @returns {Object|undefined}
- */
-function getInvestorLock(invoiceId, funderAddress) {
-  return investorLocks.get(lockKey(invoiceId, funderAddress));
-}
-
-/**
- * Retrieve all locks for a given funder address, with optional invoiceId filter.
- *
- * @param {string} funderAddress
- * @param {{ invoiceId?: string }} [opts]
- * @returns {Object[]}
- */
-function getInvestorLocksByAddress(funderAddress, opts = {}) {
-  const results = [];
-  for (const lock of investorLocks.values()) {
-    if (lock.funderAddress !== funderAddress) continue;
-    if (opts.invoiceId && lock.invoiceId !== opts.invoiceId) continue;
-    results.push(lock);
+  /**
+   * Find commitments for a given investor and invoice.
+   *
+   * @param {string} investorAddress
+   * @param {string} invoiceId
+   * @returns {Promise<CommitmentRecord[]>}
+   */
+  async function findCommitments(investorAddress, invoiceId) {
+    return db(TABLE).where({ investor_address: investorAddress, invoice_id: invoiceId }).orderBy('created_at', 'desc');
   }
-  return results;
-}
 
-/**
- * Retrieve all locks, with optional invoiceId filter.
- *
- * @param {{ invoiceId?: string }} [opts]
- * @returns {Object[]}
- */
-function getAllInvestorLocks(opts = {}) {
-  const results = [];
-  for (const lock of investorLocks.values()) {
-    if (opts.invoiceId && lock.invoiceId !== opts.invoiceId) continue;
-    results.push(lock);
+  // ── In-memory lock helpers (used by investor route and tests) ──────────────
+
+  /**
+   * Validates a Stellar public key (G... or C... 56-char format).
+   *
+   * @param {string} address
+   * @returns {{ valid: boolean, reason?: string }}
+   */
+  function validateAddress(address) {
+    if (typeof address !== 'string' || address.trim() === '') {
+      return { valid: false, reason: 'address must be a non-empty string' };
+    }
+    const trimmed = address.trim();
+    if (!/^[GC][A-Z0-9]{55}$/.test(trimmed)) {
+      return {
+        valid: false,
+        reason: 'invalid Stellar address format (expected G... or C... with 56 chars)',
+      };
+    }
+    return { valid: true };
   }
-  return results;
-}
 
-module.exports = {
-  // Validation
-  CommitmentValidationError,
-  validateAmountStroops,
-  validateAddress,
-  // DB persistence
-  persistCommitment,
-  updateCommitment,
-  findCommitments,
-  // In-memory lock store
-  clearInvestorLocks,
-  seedInvestorLocks,
-  setInvestorLock,
-  getInvestorLock,
-  getInvestorLocksByAddress,
-  getAllInvestorLocks,
-};
+  const investorLocks = [];
+
+  /**
+   * Creates or updates an in-memory lock record.
+   *
+   * @param {object} lock
+   * @param {string} lock.funderAddress
+   * @param {string} lock.claimNotBefore
+   * @param {number} lock.investorEffectiveYieldBps
+   * @param {string} lock.invoiceId
+   * @returns {object} The stored lock record.
+   */
+  function setInvestorLock({ funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId }) {
+    const existingIndex = investorLocks.findIndex(
+      (l) => l.funderAddress === funderAddress && l.invoiceId === invoiceId,
+    );
+
+    const lock = {
+      funderAddress,
+      claimNotBefore,
+      investorEffectiveYieldBps,
+      invoiceId,
+      stale: true,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (existingIndex >= 0) {
+      investorLocks[existingIndex] = lock;
+    } else {
+      investorLocks.push(lock);
+    }
+
+    return lock;
+  }
+
+  /**
+   * Returns locks for a given funder address, optionally filtered by invoiceId.
+   *
+   * @param {string} funderAddress
+   * @param {{ invoiceId?: string }} [options]
+   * @returns {object[]}
+   */
+  function getInvestorLocksByAddress(funderAddress, options) {
+    const { invoiceId } = options || {};
+    let locks = investorLocks.filter((l) => l.funderAddress === funderAddress);
+    if (invoiceId) {
+      locks = locks.filter((l) => l.invoiceId === invoiceId);
+    }
+    return locks;
+  }
+
+  /**
+   * Returns all locks, optionally filtered by invoiceId.
+   *
+   * @param {{ invoiceId?: string }} [options]
+   * @returns {object[]}
+   */
+  function getAllInvestorLocks(options) {
+    const { invoiceId } = options || {};
+    if (invoiceId) {
+      return investorLocks.filter((l) => l.invoiceId === invoiceId);
+    }
+    return [...investorLocks];
+  }
+
+  /**
+   * Returns a single lock by invoice ID and funder address.
+   *
+   * @param {string} invoiceId
+   * @param {string} funderAddress
+   * @returns {object|undefined}
+   */
+  function getInvestorLock(invoiceId, funderAddress) {
+    return investorLocks.find((l) => l.invoiceId === invoiceId && l.funderAddress === funderAddress);
+  }
+
+  /**
+   * Removes all in-memory lock records (test helper).
+   *
+   * @returns {void}
+   */
+  function clearInvestorLocks() {
+    investorLocks.length = 0;
+  }
+
+  /**
+   * Seeds sample lock records (test helper).
+   *
+   * @returns {void}
+   */
+  function seedInvestorLocks() {
+    const samples = [
+      {
+        funderAddress: 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK',
+        claimNotBefore: '2026-01-01T00:00:00Z',
+        investorEffectiveYieldBps: 850,
+        invoiceId: 'inv_7788',
+      },
+      {
+        funderAddress: 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL',
+        claimNotBefore: '2026-02-01T00:00:00Z',
+        investorEffectiveYieldBps: 700,
+        invoiceId: 'inv_2244',
+      },
+    ];
+    samples.forEach((s) => setInvestorLock(s));
+  }
+
+  // ── Cache invalidation wrappers ────────────────────────────────────────────
+
+  /**
+   * Persists a commitment and invalidates the investor locks cache.
+   *
+   * @param {Object} params - Same as {@link persistCommitment}.
+   * @returns {Promise<CommitmentRecord>} The persisted commitment record.
+   */
+  async function persistCommitmentAndInvalidate(params) {
+    const result = await persistCommitment(params);
+    invalidatePrefix(getSharedStore(), 'investor:');
+    return result;
+  }
+
+  /**
+   * Updates a commitment and invalidates the investor locks cache.
+   *
+   * @param {string} id - Commitment UUID.
+   * @param {Partial<CommitmentRecord>} fields - Fields to update.
+   * @returns {Promise<CommitmentRecord>} The updated commitment record.
+   */
+  async function updateCommitmentAndInvalidate(id, fields) {
+    const result = await updateCommitment(id, fields);
+    invalidatePrefix(getSharedStore(), 'investor:');
+    return result;
+  }
+
+  module.exports = {
+    persistCommitment: persistCommitmentAndInvalidate,
+    updateCommitment: updateCommitmentAndInvalidate,
+    findCommitments,
+    validateAddress,
+    setInvestorLock,
+    getInvestorLocksByAddress,
+    getAllInvestorLocks,
+    getInvestorLock,
+    clearInvestorLocks,
+    seedInvestorLocks,
+  };

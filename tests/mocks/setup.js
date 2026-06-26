@@ -1,5 +1,12 @@
 
 process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long-string-for-jest';
+process.env.ESCROW_ADDR_BY_INVOICE = JSON.stringify({
+  mappings: [{ invoiceId: 'inv_001', escrowAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', environment: 'test', isActive: true }],
+  defaultEnvironment: 'test',
+  allowlistEnabled: true,
+  cacheEnabled: true,
+  cacheTtlSeconds: 300,
+});
 require('../../src/config').validate();
 
 let mockInMemoryDb = [];
@@ -9,10 +16,14 @@ jest.mock('../../src/db/knex', () => {
   const auditLogEvents = [];
   let queryWheres = {};
   let mockCurrentTable;
+  let _lastInserted = null;
+  let _lastUpdateFields = null;
 
   const m = jest.fn((table) => {
     mockCurrentTable = table;
     queryWheres = {};
+    _lastInserted = null;
+    _lastUpdateFields = null;
     return m;
   });
 
@@ -32,28 +43,32 @@ jest.mock('../../src/db/knex', () => {
   m.select = jest.fn().mockReturnThis();
   m.insert = jest.fn((data) => {
     const rows = Array.isArray(data) ? data : [data];
-
     const inserted = rows.map((r) => ({
       id: Math.random().toString(),
       created_at: new Date().toISOString(),
       ...r,
     }));
-
+    _lastInserted = inserted;
     auditLogEvents.push(...inserted);
-
     if (mockCurrentTable === "audit_log_events") {
       mockInMemoryDb.push(...inserted);
     }
-
-    return Promise.resolve(inserted);
+    return m;
   });
-  m.update = jest.fn().mockReturnThis();
+  m.update = jest.fn((fields) => {
+    _lastUpdateFields = fields;
+    const updatedRows = [{ id: 'updated-id', ...fields, updated_at: new Date().toISOString() }];
+    m._resolveValue = Promise.resolve(updatedRows);
+    return m;
+  });
   m.del = jest.fn(() => {
     auditLogEvents.length = 0;
     return Promise.resolve(1);
   });
   m.first = jest.fn().mockResolvedValue({ id: 'test', kyc_status: 'approved' });
-  m.returning = jest.fn().mockReturnThis();
+  m.returning = jest.fn(() => {
+    return Promise.resolve(_lastInserted || []);
+  });
   m.delete = jest.fn(() => {
     auditLogEvents.length = 0;
     return Promise.resolve(1);
@@ -63,6 +78,11 @@ jest.mock('../../src/db/knex', () => {
   m.count = jest.fn().mockResolvedValue([{ count: 25 }]);
   m.raw = jest.fn();
   m.then = jest.fn((onFulfilled) => {
+    if (m._resolveValue) {
+      const rv = m._resolveValue;
+      m._resolveValue = null;
+      return rv.then(onFulfilled);
+    }
     if (mockCurrentTable === "audit_log_events") {
       return Promise.resolve(mockInMemoryDb).then(onFulfilled);
     }

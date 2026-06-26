@@ -187,13 +187,14 @@ function parseSimulationError(error) {
 function createSimulationError(error, context = {}) {
   const errorType = parseSimulationError(error);
   const isRetryable = errorType === SIMULATION_ERROR_TYPES.NETWORK_ERROR;
+  const code = error instanceof AppError ? error.code : `SIMULATION_${errorType.toUpperCase()}`;
 
   return new AppError({
     type: 'https://liquifact.com/probs/soroban-simulation-failed',
     title: 'Soroban Transaction Simulation Failed',
     status: isRetryable ? 503 : 400,
     detail: error.message || 'Transaction simulation failed',
-    code: `SIMULATION_${errorType.toUpperCase()}`,
+    code,
     retryable: isRetryable,
     retryHint: isRetryable
       ? 'Transient network error during simulation. Retry the request.'
@@ -267,38 +268,27 @@ function validateSimulationParams(params) {
  * @returns {Promise<Object>}
  */
 async function simulateOrThrow(params) {
+  const { operation, invoiceId, funderPublicKey, transactionXdr, options = {} } = params;
+
   try {
     validateSimulationParams(params);
-  } catch (validationError) {
-    // Return a structured failure result instead of propagating the throw,
-    // so callers can inspect result.status / result.error uniformly.
-    return {
-      status: SIMULATION_STATUS.FAILURE,
-      footprint: null,
-      cached: false,
-      errorType: SIMULATION_ERROR_TYPES.VALIDATION_ERROR,
-      error: validationError,
-    };
-  }
 
-  const { operation, invoiceId, funderPublicKey, transactionXdr, options = {} } = params;
-  const useCache = options.useCache !== false;
-  const currentLedger = options.currentLedger ?? null;
-  const cacheKey = generateCacheKey(operation, invoiceId, funderPublicKey);
+    const useCache = options.useCache !== false;
+    const currentLedger = options.currentLedger ?? null;
+    const cacheKey = generateCacheKey(operation, invoiceId, funderPublicKey);
 
-  if (useCache) {
-    const cached = getCachedFootprint(cacheKey, currentLedger);
-    if (cached) {
-      return {
-        status: SIMULATION_STATUS.SUCCESS,
-        footprint: cached,
-        cached: true,
-        errorType: null,
-      };
+    if (useCache) {
+      const cached = getCachedFootprint(cacheKey, currentLedger);
+      if (cached) {
+        return {
+          status: SIMULATION_STATUS.SUCCESS,
+          footprint: cached,
+          cached: true,
+          errorType: null,
+        };
+      }
     }
-  }
 
-  try {
     const simulationOperation = async () => {
       if (!transactionXdr || transactionXdr.length < 10) {
         throw new Error('Invalid transaction XDR: too short');
