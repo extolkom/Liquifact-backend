@@ -50,6 +50,12 @@ Part of the LiquiFact stack: frontend (Next.js) | backend (this repo) | contract
 
 ---
 
+## Configuration Reference
+
+For a complete, tested mapping of every environment variable to its type, default, consumer, and secret status, see [`docs/configuration.md`](./docs/configuration.md).
+
+---
+
 ## Observability
 
 Optional Sentry error tracking is supported through the `SENTRY_DSN` environment variable. When enabled, the server scrubs sensitive values before sending events, including:
