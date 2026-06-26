@@ -143,7 +143,7 @@ function refreshMetrics() {
         queueLength += Number(stats.queueLength || 0);
         retryQueueLength += Number(stats.retryQueueLength || 0);
       }
-    } catch (err) {
+    } catch (_err) {
       // Preserve existing metrics if a registered queue becomes invalid.
     }
   }
@@ -155,7 +155,7 @@ function refreshMetrics() {
       if (stats && typeof stats.processingCount === 'number') {
         workerInFlight += stats.processingCount;
       }
-    } catch (err) {
+    } catch (_err) {
       // Preserve existing metrics if a registered worker becomes invalid.
     }
   }
@@ -178,6 +178,12 @@ function refreshMetrics() {
     `liquifact_worker_inflight_count ${workerInFlight}\n`;
 }
 
+/**
+ * Start the periodic metrics refresh interval.
+ * Each tick calls {@link refreshMetrics} and updates the cached text
+ * exposition for synchronous consumers.
+ * @returns {void}
+ */
 function startMetricsRefresh() {
   if (refreshTimer) {
     return;
@@ -189,6 +195,10 @@ function startMetricsRefresh() {
   }
 }
 
+/**
+ * Stop the periodic metrics refresh interval.
+ * @returns {void}
+ */
 function stopMetricsRefresh() {
   if (!refreshTimer) {
     return;
@@ -236,6 +246,12 @@ function registerWorker(worker) {
   startMetricsRefresh();
 }
 
+/**
+ * Reset all metric state for test isolation.
+ * Clears registered queues/workers, zeros gauges, and stops the refresh
+ * timer so a subsequent test starts from a clean slate.
+ * @returns {void}
+ */
 function resetMetricsForTests() {
   registeredJobQueues.clear();
   registeredWorkers.clear();
