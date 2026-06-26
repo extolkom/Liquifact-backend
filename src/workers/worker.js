@@ -239,5 +239,40 @@ class BackgroundWorker {
   }
 }
 
+/**
+ * Builds a safe logging context from a job object.
+ * Only explicitly allowed payload fields are included; all others are omitted
+ * to prevent accidental logging of sensitive data.
+ *
+ * @param {Object} job - The job object.
+ * @param {string} job.id - Job identifier.
+ * @param {string} job.type - Job type name.
+ * @param {number} [job.attempts] - Number of execution attempts.
+ * @param {Object} [job.payload] - Job payload data.
+ * @returns {Object} A plain object safe for logging.
+ */
+function buildJobContext(job) {
+  if (!job || typeof job !== 'object') {
+    return {};
+  }
+
+  const ctx = {
+    jobId: job.id,
+    jobType: job.type,
+    attempt: job.attempts,
+  };
+
+  if (job.payload && typeof job.payload === 'object' && !Array.isArray(job.payload)) {
+    const ALLOWED_KEYS = ['tenantId', 'invoiceId', 'correlationId'];
+    for (const key of ALLOWED_KEYS) {
+      if (key in job.payload) {
+        ctx[key] = job.payload[key];
+      }
+    }
+  }
+
+  return ctx;
+}
+
 module.exports = BackgroundWorker;
 module.exports.buildJobContext = buildJobContext;

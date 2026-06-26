@@ -303,7 +303,9 @@ if (!this._validateInvoiceId(invoiceId)) {
       Key: key,
     });
     return await getSignedUrl(s3Client, command, { expiresIn: expiry });
-    /**
+  }
+
+  /**
    * Saves file metadata to the database.
    * @param {Object} params
    * @param {string} params.tenantId
@@ -338,9 +340,6 @@ if (!this._validateInvoiceId(invoiceId)) {
       .where({ tenant_id: tenantId, invoice_id: invoiceId })
       .first();
   }
-}
-
-}
 
   // In-memory fallback for testing environments
   _inMemoryStore = new Map();
@@ -366,12 +365,10 @@ if (!this._validateInvoiceId(invoiceId)) {
    * @param {string} params.mimeType
    */
   async uploadFile({ key, body, mimeType }) {
-    // Simple in-memory storage for test environment
     if (process.env.NODE_ENV === 'test') {
       this._inMemoryStore.set(key, { body, mimeType });
       return;
     }
-    // Production upload via S3
     const command = new PutObjectCommand({
       Bucket: this.bucket,
       Key: key,
@@ -390,18 +387,21 @@ if (!this._validateInvoiceId(invoiceId)) {
   async getFile({ key }) {
     if (process.env.NODE_ENV === 'test') {
       const entry = this._inMemoryStore.get(key);
-      if (!entry) throw new Error('File not found');
+      if (!entry) { throw new Error('File not found'); }
       return entry.body;
     }
     const command = new GetObjectCommand({ Bucket: this.bucket, Key: key });
     const response = await s3Client.send(command);
-    // Convert stream to Buffer
     const chunks = [];
     for await (const chunk of response.Body) {
       chunks.push(chunk);
     }
     return Buffer.concat(chunks);
   }
-module.exports.StorageService = StorageService;
-module.exports.ALLOWED_MIME_TYPES = ALLOWED_MIME_TYPES;
-module.exports.DEFAULT_MAX_FILE_SIZE = DEFAULT_MAX_FILE_SIZE;
+}
+
+module.exports = {
+  StorageService,
+  ALLOWED_MIME_TYPES,
+  DEFAULT_MAX_FILE_SIZE,
+};

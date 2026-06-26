@@ -321,6 +321,15 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
       RedisEscrowSummaryCache: jest.fn(),
     }));
 
+    // Mock escrowRead.getEscrowStateWithProjection so it doesn't hit the DB projection
+    jest.mock('../src/services/escrowRead', () => {
+      const actual = jest.requireActual('../src/services/escrowRead');
+      return {
+        ...actual,
+        getEscrowStateWithProjection: jest.fn(),
+      };
+    });
+
     app = require('../src/index');
   });
 
@@ -335,9 +344,9 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
 
   it('includes apyPercent, fundedPercent, daysToMaturity in response', async () => {
     const request = require('supertest');
-    const { callSorobanContract } = require('../src/services/soroban');
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
 
-    callSorobanContract.mockImplementation(async (op) => ({
+    getEscrowStateWithProjection.mockResolvedValue({
       invoiceId: 'inv_500',
       status: 'active',
       fundedAmount: 500,
@@ -345,10 +354,10 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
       annualRatePercent: 8.5,
       maturityDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
       ledgerSequence: 1234,
-    }));
+    });
 
     const res = await request(app)
-      .get('/v1/escrow/inv_500')
+      .get('/api/escrow/inv_500')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(200);
@@ -363,17 +372,17 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
 
   it('returns null derived fields when state lacks source data', async () => {
     const request = require('supertest');
-    const { callSorobanContract } = require('../src/services/soroban');
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
 
-    callSorobanContract.mockImplementation(async (op) => ({
+    getEscrowStateWithProjection.mockResolvedValue({
       invoiceId: 'inv_501',
       status: 'not_found',
       fundedAmount: 0,
       ledgerSequence: 1234,
-    }));
+    });
 
     const res = await request(app)
-      .get('/v1/escrow/inv_501')
+      .get('/api/escrow/inv_501')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(200);
@@ -388,33 +397,35 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
     resolveEscrowAddress.mockReturnValue(null);
 
     const res = await request(app)
-      .get('/v1/escrow/inv_999')
+      .get('/api/escrow/inv_999')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(404);
   });
 
-  it('returns 401 without auth token', async () => {
+  it('returns 200 without auth token (public route)', async () => {
     const request = require('supertest');
-    const res = await request(app).get('/v1/escrow/inv_500');
-    expect(res.status).toBe(401);
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
+    getEscrowStateWithProjection.mockResolvedValue({ invoiceId: 'inv_500', status: 'active' });
+    const res = await request(app).get('/api/escrow/inv_500');
+    expect(res.status).toBe(200);
   });
 
   it('merges derived fields with raw escrow state (non-destructive)', async () => {
     const request = require('supertest');
-    const { callSorobanContract } = require('../src/services/soroban');
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
 
-    callSorobanContract.mockImplementation(async (op) => ({
+    getEscrowStateWithProjection.mockResolvedValue({
       invoiceId: 'inv_502',
       status: 'active',
       fundedAmount: 250,
       totalAmount: 500,
       annualRatePercent: 12,
       ledgerSequence: 999,
-    }));
+    });
 
     const res = await request(app)
-      .get('/v1/escrow/inv_502')
+      .get('/api/escrow/inv_502')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(200);

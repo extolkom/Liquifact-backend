@@ -121,19 +121,31 @@ function computeFundedPercent(fundedAmount, totalAmount) {
  * server wall clock.
  *
  * @param {Date|string|number|null|undefined} maturityDate
- * @param {object|Date} [opts={}] - Options object **or** a legacy `Date`
- *   (accepted for backwards compatibility when callers pass `new Date()` directly).
- * @param {number|Date|null|undefined} [opts.ledgerCloseTime] - Stellar ledger
- *   close time in Unix epoch **seconds**.  Takes precedence over `opts.now`.
- * @param {Date|null|undefined} [opts.now] - Explicit reference time override.
+ * @param {Date|Object} [refOrOpts] - A `Date` reference time **or** an options
+ *   object with `ledgerCloseTime` / `now` fields.  When a `Date` is passed it
+ *   is used directly.  When an object is passed, time is resolved via
+ *   {@link resolveReferenceTime} with `ledgerCloseTime` taking precedence
+ *   over `now`.
+ * @param {number|Date|null|undefined} [refOrOpts.ledgerCloseTime] - Stellar
+ *   ledger close time in Unix epoch **seconds**.  Takes precedence.
+ * @param {Date|null|undefined} [refOrOpts.now] - Explicit reference time.
  * @returns {number|null} Null when maturityDate is absent or unparseable.
  */
-function computeDaysToMaturity(maturityDate, now = new Date()) {
+function computeDaysToMaturity(maturityDate, refOrOpts) {
   if (maturityDate == null) {return null;}
   const maturity =
     maturityDate instanceof Date ? maturityDate : new Date(maturityDate);
   if (isNaN(maturity.getTime())) {return null;}
-  const nowMs = (now instanceof Date ? now : new Date()).getTime();
+
+  let nowMs;
+  if (refOrOpts instanceof Date) {
+    nowMs = refOrOpts.getTime();
+  } else if (refOrOpts && typeof refOrOpts === 'object') {
+    nowMs = resolveReferenceTime(refOrOpts).getTime();
+  } else {
+    nowMs = Date.now();
+  }
+
   return Math.floor((maturity.getTime() - nowMs) / MS_PER_DAY);
 }
 
@@ -174,7 +186,7 @@ function computeEscrowDerivedFields(state, opts = {}) {
   return {
     apyPercent: computeApyPercent(annualRatePercent),
     fundedPercent: computeFundedPercent(fundedAmount, totalAmount),
-    daysToMaturity: computeDaysToMaturity(maturity, opts),
+    daysToMaturity: computeDaysToMaturity(maturity, resolveReferenceTime(opts)),
   };
 }
 

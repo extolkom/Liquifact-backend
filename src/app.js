@@ -27,6 +27,7 @@ const { resolveEscrowAddress } = require('./config/escrowMap');
 const { getEscrowStateWithProjection } = require('./services/escrowRead');
 const { createCorsOptions, isCorsOriginRejectedError } = require('./config/cors');
 const { validateInvoiceQueryParams } = require('./utils/validators');
+const { computeEscrowDerivedFields } = require('./services/escrowDerived');
 const { invoiceCreateSchema, parseValidationErrors } = require('./schemas/invoice');
 const {
   invoiceBodyLimit,
@@ -49,7 +50,6 @@ const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
 const adminEscrowRoutes = require('./routes/adminEscrow');
 const kycRoutes = require('./routes/kyc');
 const v1Routes = require('./routes/v1');
-const reconciliationRoutes = require('./routes/reconciliation');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -281,8 +281,11 @@ function createApp() {
       // Read from projection, cache, or live read fallback
       const state = await getEscrowStateWithProjection(invoiceId);
 
+      const derived = computeEscrowDerivedFields(state);
+
       const data = {
         ...state,
+        ...derived,
         escrowAddress
       };
 

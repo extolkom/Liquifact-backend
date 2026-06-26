@@ -10,8 +10,6 @@ const storageService = require('../services/storage');
 const logger = require('../logger');
 const router = express.Router();
 
-const invoiceFiles = new Map();
-
 /**
  * Computes the SHA-256 hash of a buffer.
  * @param {Buffer} buffer The input buffer.
@@ -146,4 +144,19 @@ router.post('/:id/file/verify', express.raw({ type: 'application/pdf', limit: '5
   }
   if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
     return res.status(400).json({ error: 'Bad Request', message: 'No file data provided for verification' });
+  }
+  try {
+    const currentHash = computeHash(req.body);
+    const isValid = currentHash === meta.sha256;
+    return res.json({
+      data: { invoiceId: id, isValid, storedHash: meta.sha256, currentHash, verifiedAt: new Date().toISOString() },
+      message: isValid ? 'File integrity verified' : 'File integrity check failed',
+    });
+  } catch (err) {
+    logger.error({ err, invoiceId: id }, 'Failed to verify invoice file');
+    return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to verify invoice file' });
+  }
+});
+
+module.exports = router;
 
