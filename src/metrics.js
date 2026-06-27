@@ -137,18 +137,7 @@ try {
   };
 }
 
-/**
- * Shared Prometheus registry. Declared BEFORE the counter/gauge
- * constructors so `registers: [registry]` does not hit a TDZ
- * ReferenceError. Issue #424 + pre-existing fix: the original code
- * placed `const registry` near the bottom of the file, which meant
- * every counter construction referenced a binding that had not yet
- * been initialized. The error was masked only because every consumer
- * of this module (`tests/invest.list.test.js`, `tests/health.readiness.test.js`,
- * etc.) `jest.mock`s the module before evaluation.
- *
- * @type {import('prom-client').Registry}
- */
+/** Shared registry - exported so tests can reset it between runs. */
 const registry = new client.Registry();
 
 if (typeof client.collectDefaultMetrics === 'function') {
@@ -227,9 +216,7 @@ const JOB_TYPE_ENUM = Object.freeze(['maturity_reminder', 'unknown']);
 }
 
 /**
- * Start the periodic metrics refresh interval.
- * Each tick calls {@link refreshMetrics} and updates the cached text
- * exposition for synchronous consumers.
+ * Starts periodic background sampling for registered queues and workers.
  * @returns {void}
  */
 function startMetricsRefresh() {
@@ -244,7 +231,7 @@ function startMetricsRefresh() {
 }
 
 /**
- * Stop the periodic metrics refresh interval.
+ * Stops periodic background metric sampling when it is active.
  * @returns {void}
  */
 function stopMetricsRefresh() {
@@ -297,9 +284,7 @@ const maturityReminderDeadLetterTotal = new client.Counter({
 }
 
 /**
- * Reset all metric state for test isolation.
- * Clears registered queues/workers, zeros gauges, and stops the refresh
- * timer so a subsequent test starts from a clean slate.
+ * Clears registered metric sources and resets sampled gauges for tests.
  * @returns {void}
  */
 function resetMetricsForTests() {
@@ -709,12 +694,17 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
-  // Issue #424 — explicit exports for the new fail-closed-aware counters
-  // and their increment helpers. `incrementMetric` is retained for the
-  // pre-existing `legalHoldGate.js` call site.
-  incrementMetric,
-  incrementLegalHoldBlocks,
-  incrementLegalHoldUnknownBlocks,
-  legalHoldBlocksTotal,
-  legalHoldUnknownBlocksTotal,
+  escrowIndexerEventsProcessedTotal,
+  escrowIndexerEventsSkippedTotal,
+  escrowIndexerCycleFailuresTotal,
+  escrowIndexerLastCursorAdvanceTimestampSeconds,
+  escrowReconciliationMismatches,
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
+  maturityReminderDeadLetterTotal,
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+  sorobanCircuitBreakerStateTransitionsTotal,
+  readinessGauge,
 };

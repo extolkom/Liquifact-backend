@@ -46,91 +46,19 @@
  * @module middleware/rateLimit
  */
 
-const expressRateLimit = require('express-rate-limit');
-const logger = require('../logger');
+const rateLimit = require('express-rate-limit');
 
 /**
- * @typedef {object} RateLimitScopeOptions
- * @property {object|null} [redisClient] - Optional Redis client. Must
- *   expose `sendCommand` (compatible with `node-redis` v4+) or `.call`
- *   (compatible with `ioredis`).
+ * Parse environment variable as positive integer.
+ * @param {string} envVar - Environment variable name.
+ * @param {number} defaultValue - Default value if parse fails.
+ * @returns {number} Parsed integer value.
  */
-
-// ============================================================================
-// Test-only state and helpers (issue #429)
-//
-// The functions and `let`s below are referenced by the test suite. They are
-// declared at module scope (not as methods) so the production call sites
-// remain readable. Production callers should NOT depend on any identifier
-// prefixed with `_`.
-// ============================================================================
-
-let _redisStoreCtor = null;
-let _allowClusterWarnInTests = false;
-let _sharedMemoryWarningEmitted = false;
-
-/**
- * Test-only: enable or disable the cluster-warning emitter while NODE_ENV=test.
- * @param {boolean} value
- * @returns {void}
- */
-function _setClusterWarningsAllowedInTestsForTests(value) {
-  _allowClusterWarnInTests = !!value;
-}
-
-/**
- * Test-only: returns the singleton logger so spies can attach to its methods.
- * @returns {object}
- */
-function _loggerForTests() {
-  return logger;
-}
-
-/**
- * Test-only: resets the "summary warning already emitted" latch.
- * @returns {void}
- */
-function _resetMemoryWarningLatchForTests() {
-  _sharedMemoryWarningEmitted = false;
-}
-
-/**
- * Test-only: clears the cached Redis-store constructor.
- * @returns {void}
- */
-function _resetRedisStoreCtorCacheForTests() {
-  _redisStoreCtor = null;
-}
-
-// ============================================================================
-// Helpers (hoisted function declarations)
-// ============================================================================
-
-/**
- * Reads the direct TCP socket peer address. The `req.ip` fallback is
- * retained for legacy test-contract compatibility. Under express-rate-limit
- * v7's `validate.xForwardedForHeader:false`, requests bearing an
- * `X-Forwarded-For` header are rejected before keying, so the fallback
- * path cannot spoof a forwarded IP in practice.
- *
- * Spoofing-safety contract: every `createRateLimiter` instance is
- * constructed with `validate.xForwardedForHeader: false`. If you flip
- * that flag to `true`, REMOVE the `req.ip` fallback below too — otherwise
- * an operator that turns on `app.set('trust proxy', 'true')` silently
- * re-introduces XFF spoofing.
- *
- * @param {object|undefined} req - Express request.
- * @returns {string}
- */
-function socketPeerAddress(req) {
-  const sock = req && req.socket;
-  if (sock && typeof sock.remoteAddress === 'string' && sock.remoteAddress.length > 0) {
-    return sock.remoteAddress;
-  }
-  if (req && typeof req.ip === 'string' && req.ip.length > 0) {
-    return req.ip;
-  }
-  return '127.0.0.1';
+function parseRateLimitEnv(envVar, defaultValue) {
+  const value = process.env[envVar];
+  if (!value) { return defaultValue; }
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) || parsed < 0 ? defaultValue : parsed;
 }
 
 /**
@@ -470,37 +398,4 @@ module.exports = {
   keyGenerator,
   apiKeyKeyGenerator,
   getApiKey,
-  // Test-only seams (issue #429)
-  _loggerForTests,
-  _resetMemoryWarningLatchForTests,
-  _detectClusterForTests: _detectClusterForTestsImpl,
-  _resetRedisStoreCtorCacheForTests,
-  _setClusterWarningsAllowedInTestsForTests,
 };
-
-/**
- * Test-only: re-evaluates `detectClusteredDeployment()` and overwrites the
- * captured `CLUSTER_SIGNAL` value.
- * @returns {{clustered: boolean, signal: string|null, value: number}}
- */
-function _detectClusterForTestsImpl() {
-  const refreshed = detectClusteredDeployment();
-  CLUSTER_SIGNAL.clustered = refreshed.clustered;
-  CLUSTER_SIGNAL.signal = refreshed.signal;
-  CLUSTER_SIGNAL.value = refreshed.value;
-  return CLUSTER_SIGNAL;
-}
-
-// ============================================================================
-// Pre-built limiters (legacy) — preserved for backward compatibility.
-// ============================================================================
-
-const globalLimiter   = createRateLimiter('global',    GLOBAL_WINDOW_MS,   GLOBAL_MAX_REQUESTS);
-const sensitiveLimiter = createRateLimiter('sensitive', SENSITIVE_WINDOW_MS, SENSITIVE_MAX);
-const apiKeyLimiter   = createRateLimiter('api-key',   API_KEY_WINDOW_MS,   API_KEY_MAX);
-
-Object.assign(module.exports, {
-  globalLimiter,
-  sensitiveLimiter,
-  apiKeyLimiter,
-});
