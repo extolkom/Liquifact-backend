@@ -13,8 +13,6 @@
  */
 
 const rateLimit = require('express-rate-limit');
-const { RedisStore } = require('rate-limit-redis');
-const { getRedisClient } = require('../cache/redis');
 
 // Emulating original parsing utility configuration hooks
 /**
@@ -25,15 +23,21 @@ const { getRedisClient } = require('../cache/redis');
  * @param {number} max - Request limits allowed inside the designated window frame
  * @returns {Function} Express middleware handler
  */
-function createRateLimiter(scope, windowMs = 15 * 60 * 1000, max = 100) {
+function createRateLimiter(scope, windowMs = WINDOW_MS, max = MAX_REQUESTS) {
+  const { getRedisClient } = require('../cache/redis');
   const { client, isAvailable } = getRedisClient();
   let store;
 
   if (isAvailable && client) {
-    store = new RedisStore({
-      sendCommand: (...args) => client.sendCommand(args),
-      prefix: `rate-limit:${scope}:`,
-    });
+    try {
+      const { RedisStore } = require('rate-limit-redis');
+      store = new RedisStore({
+        sendCommand: (...args) => client.sendCommand(args),
+        prefix: `rate-limit:${scope}:`,
+      });
+    } catch (_err) {
+      console.warn(`[RateLimit] rate-limit-redis unavailable for scope [${scope}]. Falling back to MemoryStore.`);
+    }
   } else {
     console.warn(`[RateLimit] Redis store unavailable for scope [${scope}]. Falling back safely to MemoryStore.`);
   }

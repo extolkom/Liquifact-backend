@@ -2,16 +2,54 @@
  * S3-compatible storage service for invoice file uploads and presigned URLs.
  * Handles MIME validation, size enforcement, tenant scoping, and path traversal prevention.
  *
+ * Exposes a cheap {@link probeS3Connectivity} operation that uses the S3
+ * `HeadBucket` API to verify that the configured bucket is reachable and
+ * that the credentials authorize reads against it. The probe is consumed by
+ * the readiness health check and the startup probe so misconfigured object
+ * storage is surfaced before user traffic depends on it.
+ *
  * @module services/storage
  */
 
 'use strict';
 
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadBucketCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const crypto = require('crypto');
 const path = require('path');
 const db = require('../db/knex');
+const logger = require('../logger');
+
+/** Approximate budget for the S3 health probe, in milliseconds. */
+const PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * AWS S3 error classes whose names are safe to surface to operators without
+ * leaking credentials or endpoint details. Anything outside this allowlist is
+ * collapsed into the generic `unknown` code by {@link sanitizeStorageError}.
+ *
+ * Names actionable for a `HeadBucket` call only — names like `NoSuchKey` are
+ * omitted because they cannot originate from a bucket-level probe.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const SAFE_ERROR_NAMES = new Set([
+  'NoSuchBucket',
+  'AccessDenied',
+  'InvalidAccessKeyId',
+  'InvalidBucketName',
+  'BucketAlreadyExists',
+  'BucketAlreadyOwnedByYou',
+  'NetworkingError',
+  'TimeoutError',
+  'RequestTimeout',
+  'ServiceUnavailable',
+  'SlowDown',
+  'PermanentRedirect',
+  'TemporaryRedirect',
+  'KMSAccessDenied',
+  'KMSDisabled',
+]);
 
 /** Accepted MIME types for invoice uploads. */
 const ALLOWED_MIME_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/tiff'];
@@ -238,6 +276,229 @@ class StorageService {
   }
 }
 
+/**
+ * Returns the S3 bucket name the service is configured to use. Empty string
+ * when no bucket has been configured.
+ *
+ * @returns {string} The configured bucket name, or empty string when absent.
+ */
+function getConfiguredBucket() {
+  return process.env.S3_BUCKET || '';
+}
+
+/**
+ * Determines whether in-memory fallback storage is in effect. Used to skip
+ * the connectivity probe in environments that intentionally do not talk to
+ * S3 (e.g. unit-test runs against the {@link StorageService} API).
+ *
+ * @returns {boolean} `true` when in-memory fallback is active.
+ */
+function isInMemoryFallbackActive() {
+  if (process.env.STORAGE_IN_MEMORY === 'true') {
+    return true;
+  }
+  if (process.env.STORAGE_IN_MEMORY === 'false') {
+    return false;
+  }
+  return process.env.NODE_ENV === 'test';
+}
+
+/**
+ * Determines whether the S3 connectivity probe is explicitly disabled by
+ * configuration. Operators can opt-out via `S3_HEALTHCHECK_ENABLED=false`
+ * (e.g. to silence the probe in offline dev sandboxes). Any value other
+ * than the literal string `'false'` keeps the probe enabled.
+ *
+ * @returns {boolean} `true` when the probe is disabled by configuration.
+ */
+function isProbeExplicitlyDisabled() {
+  return process.env.S3_HEALTHCHECK_ENABLED === 'false';
+}
+
+/**
+ * Determines whether credentials are configured for the S3 client. The
+ * probe will not run without at least an access key id, since the AWS SDK
+ * would otherwise emit debug logs containing unsigned request details.
+ *
+ * @returns {boolean} `true` when AWS credentials are configured.
+ */
+function hasCredentialsConfigured() {
+  return Boolean(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+}
+
+/**
+ * Sanitizes an AWS SDK error into a redacted summary safe to surface in
+ * health endpoints and log output. **Never** includes the original
+ * `err.message`, `$metadata.requestId`, endpoint URL, or any header map that
+ * may have contained a signed `Authorization` header.
+ *
+ * Only the AWS error name (allow-listed in {@link SAFE_ERROR_NAMES}) and a
+ * fixed short hint are returned.
+ *
+ * @param {unknown} err - The error thrown by the S3 client.
+ * @returns {{code: string, hint: string}} Redacted error descriptor.
+ */
+function sanitizeStorageError(err) {
+  const name = err && typeof err === 'object' && typeof err.name === 'string'
+    ? err.name
+    : 'UnknownError';
+
+  if (SAFE_ERROR_NAMES.has(name)) {
+    return { code: name, hint: STORAGE_ERROR_HINTS[name] || 'object storage unavailable' };
+  }
+  return { code: 'UnknownError', hint: 'object storage unreachable' };
+}
+
+/** Mapping of allowed AWS error names to short, actionable hints. */
+const STORAGE_ERROR_HINTS = Object.freeze({
+  NoSuchBucket: 'configured bucket not found',
+  AccessDenied: 'credentials lack permission to access bucket',
+  InvalidAccessKeyId: 'AWS access key id rejected by object storage',
+  NetworkingError: 'network error contacting object storage',
+  TimeoutError: 'object storage probe timed out',
+});
+
+/**
+ * Cheap connectivity probe for the configured S3 bucket. Issues a
+ * `HeadBucket` request via the shared {@link s3Client} and classifies the
+ * outcome.
+ *
+ * Result states:
+ *
+ * - `'healthy'` — `HeadBucket` returned 200. Bucket exists and creds work.
+ * - `'in_memory'` — In-memory fallback is active (`NODE_ENV === 'test'` or
+ *   `STORAGE_IN_MEMORY === 'true'`); the probe is a no-op.
+ * - `'disabled'` — Operator disabled the probe via
+ *   `S3_HEALTHCHECK_ENABLED=false`.
+ * - `'not_configured'` — Either `S3_BUCKET` or `AWS_ACCESS_KEY_ID` is
+ *   absent; the probe cannot run.
+ * - `'unhealthy'` — `HeadBucket` failed. `error.code` is an AWS error name,
+ *   `error.hint` is a short actionable message.
+ *
+ * Credentials, endpoint URLs, and other sensitive error fields are
+ * intentionally stripped from the returned object.
+ *
+ * @param {Object} [options] - Optional overrides.
+ * @param {typeof s3Client} [options.client] - S3 client to use (tests).
+ * @param {number} [options.timeoutMs] - Probe timeout in milliseconds.
+ * @returns {Promise<{
+ *   status: 'healthy'|'in_memory'|'disabled'|'not_configured'|'unhealthy',
+ *   latency?: number,
+ *   bucketConfigured?: boolean,
+ *   credentialsConfigured?: boolean,
+ *   error?: {code: string, hint: string}
+ * }>} Probe result.
+ */
+async function probeS3Connectivity(options = {}) {
+  if (isProbeExplicitlyDisabled()) {
+    return { status: 'disabled', bucketConfigured: Boolean(getConfiguredBucket()), credentialsConfigured: hasCredentialsConfigured() };
+  }
+
+  if (isInMemoryFallbackActive()) {
+    return { status: 'in_memory', bucketConfigured: Boolean(getConfiguredBucket()), credentialsConfigured: hasCredentialsConfigured() };
+  }
+
+  if (!getConfiguredBucket() || !hasCredentialsConfigured()) {
+    return { status: 'not_configured', bucketConfigured: Boolean(getConfiguredBucket()), credentialsConfigured: hasCredentialsConfigured() };
+  }
+
+  const client = options.client || s3Client;
+  const envTimeoutMs = parseInt(process.env.STORAGE_HEALTHCHECK_TIMEOUT_MS, 10);
+  const defaultTimeoutMs = Number.isInteger(envTimeoutMs) && envTimeoutMs > 0 ? envTimeoutMs : PROBE_TIMEOUT_MS;
+  const timeoutMs = Number.isInteger(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : defaultTimeoutMs;
+  const start = Date.now();
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error('Probe timeout');
+      err.name = 'TimeoutError';
+      reject(err);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') { timer.unref(); }
+  });
+
+  try {
+    const sendPromise = client.send(new HeadBucketCommand({ Bucket: getConfiguredBucket() }));
+    // Swallow any rejection on the loser's side so we don't trigger an
+    // unhandled-rejection warning if the timeout fires before the SDK's
+    // own retry/timeout chain finishes.
+    sendPromise.catch(() => {});
+    await Promise.race([sendPromise, timeoutPromise]);
+    return { status: 'healthy', latency: Date.now() - start, bucketConfigured: true, credentialsConfigured: true };
+  } catch (rawErr) {
+    const sanitized = sanitizeStorageError(rawErr);
+    logger.error(
+      {
+        component: 's3-healthcheck',
+        event: 'probe_failed',
+        errorCode: sanitized.code,
+        latencyMs: Date.now() - start,
+        bucketConfigured: true,
+        credentialsConfigured: true,
+      },
+      `S3 connectivity probe failed: ${sanitized.hint} (${sanitized.code})`
+    );
+    return {
+      status: 'unhealthy',
+      latency: Date.now() - start,
+      error: sanitized,
+      bucketConfigured: true,
+      credentialsConfigured: true,
+    };
+  } finally {
+    if (timer) { clearTimeout(timer); }
+  }
+}
+
+/**
+ * Runs the S3 connectivity probe once at process start. Failures are logged
+ * with a clear, actionable error but never propagated to caller code —
+ * startup should still proceed (the readiness probe surfaces storage
+ * misconfiguration to orchestrators once the HTTP server is listening).
+ *
+ * The probe function can be overridden via the optional argument so tests
+ * can substitute a deterministic fake without mocking the entire module.
+ *
+ * @param {Function} [probeFn] - Optional probe replacement (defaults to
+ *   {@link probeS3Connectivity}).
+ * @returns {Promise<{status: string}>} The probe result status.
+ */
+async function runStartupStorageProbe(probeFn = probeS3Connectivity) {
+  const result = await probeFn();
+  if (result.status === 'healthy') {
+    logger.info(
+      { component: 's3-healthcheck', event: 'startup_probe', status: result.status, latencyMs: result.latency },
+      'S3 connectivity probe succeeded'
+    );
+  } else if (result.status === 'unhealthy') {
+    logger.warn(
+      {
+        component: 's3-healthcheck',
+        event: 'startup_probe',
+        status: result.status,
+        errorCode: result.error && result.error.code,
+      },
+      `S3 connectivity probe failed at startup: ${result.error ? result.error.hint : 'unknown'}`
+    );
+  } else {
+    logger.info(
+      { component: 's3-healthcheck', event: 'startup_probe', status: result.status },
+      `S3 connectivity probe skipped at startup: ${result.status}`
+    );
+  }
+  return result;
+}
+
 module.exports.StorageService = StorageService;
 module.exports.ALLOWED_MIME_TYPES = ALLOWED_MIME_TYPES;
 module.exports.DEFAULT_MAX_FILE_SIZE = DEFAULT_MAX_FILE_SIZE;
+module.exports.probeS3Connectivity = probeS3Connectivity;
+module.exports.runStartupStorageProbe = runStartupStorageProbe;
+module.exports.sanitizeStorageError = sanitizeStorageError;
+module.exports.getConfiguredBucket = getConfiguredBucket;
+module.exports.isInMemoryFallbackActive = isInMemoryFallbackActive;
+module.exports.isProbeExplicitlyDisabled = isProbeExplicitlyDisabled;
+module.exports.hasCredentialsConfigured = hasCredentialsConfigured;
+module.exports.SAFE_ERROR_NAMES = SAFE_ERROR_NAMES;
+module.exports.PROBE_TIMEOUT_MS = PROBE_TIMEOUT_MS;
+module.exports.logger = logger;

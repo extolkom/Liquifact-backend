@@ -16,6 +16,22 @@ const app = require('./app');
 const { validate, logRedactedSummary } = require('./config');
 
 /**
+ * Runs the S3 connectivity probe at startup. Failures are logged but never
+ * block process start — the readiness probe (`/readyz`) surfaces storage
+ * misconfiguration to orchestrators once the HTTP server is listening.
+ *
+ * @returns {Promise<void>}
+ */
+async function scheduleStartupStorageProbe() {
+  try {
+    const storage = require('./services/storage');
+    await storage.runStartupStorageProbe();
+  } catch (_err) {
+    // Best-effort: a probe failure must not abort startup.
+  }
+}
+
+/**
  * Validates the application configuration at startup before the server starts listening.
  * In test environment, the validation is skipped to preserve lazy loading behavior.
  * Fails fast by logging a redacted summary of errors and exiting with a non-zero code.
@@ -41,6 +57,8 @@ function runBootConfigValidation() {
 function startServer() {
   runBootConfigValidation();
   const port = process.env.PORT || 3001;
+  // Fire-and-forget probe — do not await, so startup is not blocked.
+  scheduleStartupStorageProbe();
   return app.listen(port);
 }
 

@@ -35,7 +35,11 @@ let client;
 try {
   client = require('prom-client');
 } catch (_e) {
-  // Fallback shim for environments without prom-client (tests)
+  // Fallback shim for environments without prom-client (tests).
+  //
+  // The shims maintain the same observable surface as real prom-client so
+  // tests can inspect `counter.hashMap` / `counter.get()` directly without
+  // changing the assertion code.
 
   /**
    * Minimal prom-client Registry shim for test environments.
@@ -43,9 +47,14 @@ try {
    */
   class RegistryShim {
     /** @param {void} */
-    constructor() { this.contentType = 'text/plain'; }
+    constructor() {
+      this.contentType = 'text/plain';
+      this._items = [];
+    }
     /** @returns {string} */
-    metrics() { return ''; }
+    metrics() {
+      return '';
+    }
   }
 
   /**
@@ -96,6 +105,13 @@ const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
 let refreshTimer = null;
 
+/** Shared registry — exported so tests can reset it between runs. */
+const registry = new client.Registry();
+
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
+
 const queueDepthGauge = new client.Gauge({
   name: 'liquifact_job_queue_depth',
   help: 'Number of pending jobs currently waiting in background queues',
@@ -121,15 +137,40 @@ const workerInFlightGauge = new client.Gauge({
 let cachedMetrics = '# HELP liquifact_custom_metrics Placeholder\n';
 
 /**
- * Refresh all registered queue and worker metrics.
+ * Bounded enum of allowed `reason` label values for maturity-reminder metrics.
+ * Any raw error/reason string must be mapped through {@link normalizeReminderReason}
+ * before being used as a Prometheus label to prevent time-series cardinality explosion.
  *
- * This performs periodic sampling from existing getStats() outputs on
- * registered job queue and worker instances. It avoids adding extra hot-path
- * overhead to each enqueue/dequeue operation.
+ * | Value            | Meaning                                              |
+ * |------------------|------------------------------------------------------|
+ * | smtp_timeout     | SMTP connection or send timed out                    |
+ * | smtp_reject      | SMTP server rejected the message (4xx/5xx response)  |
+ * | template_error   | Email template rendering failed                      |
+ * | unknown          | Any other / unmapped failure                         |
  */
-function refreshMetrics() {
-  let queueLength = 0;
-  let retryQueueLength = 0;
+const REMINDER_REASON_ENUM = Object.freeze([
+  'smtp_timeout',
+  'smtp_reject',
+  'template_error',
+  'unknown',
+]);
+
+/**
+ * Bounded enum of allowed `job_type` label values.
+ * Add new job types here when introducing new background job kinds.
+ */
+const JOB_TYPE_ENUM = Object.freeze(['maturity_reminder', 'webhook_replay', 'unknown']);
+
+/**
+ * Bounded enum of allowed `outcome` label values for webhook replay metrics.
+ * @readonly
+ */
+const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
+  'success',
+  'failure',
+  'not_found',
+  'already_resolved',
+]);
 
   for (const queue of registeredJobQueues) {
     try {
@@ -219,42 +260,51 @@ function stopMetricsRefresh() {
 }
 
 /**
- * Register a job queue instance for Prometheus instrumentation.
+ * Maps a raw job type string to a bounded Prometheus label value.
  *
- * @param {Object} queue
+ * @param {unknown} raw - Raw job type string.
+ * @returns {string} Bounded label value from {@link JOB_TYPE_ENUM}.
  */
-function registerJobQueue(queue) {
-  if (!queue || typeof queue.getStats !== 'function') {
-    return;
-  }
-
-  if (registeredJobQueues.has(queue)) {
-    return;
-  }
-
-  registeredJobQueues.add(queue);
-  refreshMetrics();
-  startMetricsRefresh();
+function normalizeJobType(raw) {
+  const str = typeof raw === 'string' ? raw : '';
+  return JOB_TYPE_ENUM.includes(str) ? str : 'unknown';
 }
+
+// ── Maturity-reminder counters ────────────────────────────────────────────────
 
 /**
- * Register a worker instance for Prometheus instrumentation.
- *
- * @param {Object} worker
+ * Total maturity-reminder delivery attempts, labelled by bounded `reason` and `job_type`.
+ * @type {import('prom-client').Counter}
  */
-function registerWorker(worker) {
-  if (!worker || typeof worker.getStats !== 'function') {
-    return;
-  }
+const maturityReminderDeliveryAttemptsTotal = new client.Counter({
+  name: 'maturity_reminder_delivery_attempts_total',
+  help: 'Total number of maturity-reminder delivery attempts',
+  labelNames: ['reason', 'job_type'],
+  registers: [],
+});
 
-  if (registeredWorkers.has(worker)) {
-    return;
-  }
+/**
+ * Total maturity-reminder dead-letter events, labelled by bounded `reason` and `job_type`.
+ * @type {import('prom-client').Counter}
+ */
+const maturityReminderDeadLetterTotal = new client.Counter({
+  name: 'maturity_reminder_dead_letter_total',
+  help: 'Total number of maturity-reminder messages moved to the dead-letter queue',
+  labelNames: ['reason', 'job_type'],
+  registers: [],
+});
 
-  registeredWorkers.add(worker);
-  refreshMetrics();
-  startMetricsRefresh();
-}
+/**
+ * Total webhook replay attempts, labelled by bounded `outcome`.
+ * Outcomes: success | failure | not_found | already_resolved
+ * @type {import('prom-client').Counter}
+ */
+const webhookReplayTotal = new client.Counter({
+  name: 'webhook_replay_total',
+  help: 'Total number of webhook dead-letter replay attempts',
+  labelNames: ['outcome'],
+  registers: [],
+});
 
 /**
  * Resets all metrics state for test isolation.
@@ -293,6 +343,11 @@ function safeEqual(a, b) {
   }
   return result === 0;
 }
+
+// Register bounded counters with the shared registry
+registry.registerMetric(maturityReminderDeliveryAttemptsTotal);
+registry.registerMetric(maturityReminderDeadLetterTotal);
+registry.registerMetric(webhookReplayTotal);
 
 /**
  * Set of loopback IP addresses that are allowed when no bearer token is
@@ -383,7 +438,6 @@ async function metricsHandler(_req, res) {
   res.end(metricsText);
 }
 
-/** Shared registry — exported so tests can reset it between runs. */
 /**
  * Counter: Escrow events successfully processed by the indexer per cycle.
  * Incremented by the number of events persisted in each indexer cycle.
@@ -564,16 +618,22 @@ const readinessGauge = new client.Gauge({
 });
 
 /**
- * Counter: Body size limit rejections.
- * Incremented each time a request is rejected with 413 Payload Too Large.
- * Labelled by `type` (json, urlencoded, invoice, raw, unknown) to allow
- * detection of DoS attacks targeting specific body parsers.
+ * Counter: operator alerts raised when `contractListRefresh` detects an on-chain
+ * LiquifactEscrow wasm `SCHEMA_VERSION` that diverges from the expected/known
+ * registry version.
+ *
+ * Labelled by the comparison `status` (`ahead` — contract is newer than anything
+ * the backend tracks; `unknown` — version not present in the registry) so ops can
+ * distinguish an upgrade from an unexpected/rolled-back deployment. A non-zero
+ * value is an actionable signal that the backend may not yet support the on-chain
+ * contract — see `docs/wasm-ops.md`.
+ *
  * @type {import('prom-client').Counter}
  */
-const bodySizeLimitRejectionsTotal = new client.Counter({
-  name: 'body_size_limit_rejections_total',
-  help: 'Total number of request body-size limit rejections (413 Payload Too Large), labelled by limit type for DoS detection',
-  labelNames: ['type'],
+const contractWasmVersionMismatchAlertsTotal = new client.Counter({
+  name: 'contract_wasm_version_mismatch_alerts_total',
+  help: 'Total operator alerts raised when contractListRefresh detects an on-chain wasm SCHEMA_VERSION mismatch',
+  labelNames: ['status'],
   registers: [registry],
 });
 
@@ -585,21 +645,5 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
-  bodySizeLimitRejectionsTotal,
-  escrowIndexerEventsProcessedTotal,
-  escrowIndexerEventsSkippedTotal,
-  escrowIndexerCycleFailuresTotal,
-  escrowIndexerLastCursorAdvanceTimestampSeconds,
-  escrowReconciliationMismatches,
-  escrowReconciliationMismatchedInvoicesGauge,
-  escrowReconciliationDriftMagnitudeGauge,
-  escrowReconciliationDriftAlertsTotal,
-  footprintCacheHitsTotal,
-  footprintCacheMissesTotal,
-  footprintCacheEvictionsTotal,
-  sorobanCircuitBreakerStateTransitionsTotal,
-  readinessGauge,
-  maturityReminderDeliveryAttemptsTotal,
-  maturityReminderDeliverySuccessTotal,
-  maturityReminderDeadLetterTotal,
+  contractWasmVersionMismatchAlertsTotal,
 };

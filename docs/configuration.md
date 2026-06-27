@@ -36,6 +36,7 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `BODY_LIMIT_URLENCODED` | size string | `50kb` | No | No | [`src/middleware/bodySizeLimits.js`](../src/middleware/bodySizeLimits.js) |
 | `BODY_LIMIT_RAW` | size string | `1mb` | No | No | [`src/middleware/bodySizeLimits.js`](../src/middleware/bodySizeLimits.js) |
 | `BODY_LIMIT_INVOICE` | size string | `512kb` | No | No | [`src/middleware/bodySizeLimits.js`](../src/middleware/bodySizeLimits.js), [`src/services/storage.js`](../src/services/storage.js) |
+| `INVOICE_FILE_MAX_SIZE` | size string | `5mb` | No | No | [`src/routes/invoiceFile.js`](../src/routes/invoiceFile.js) |
 | `ESCROW_SIGNING_MODE` | enum: `delegated`, `custodial`, `stubbed` | `stubbed` in code; `delegated` in template | No | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js) |
 | `STELLAR_NETWORK_PASSPHRASE` | string | None in escrow submission | Required outside `stubbed` escrow mode | No | [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js) |
 | `NETWORK_PASSPHRASE` | string | `Test SDF Network ; September 2015` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/config/stellar.js`](../src/config/stellar.js) |
@@ -61,6 +62,9 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `AWS_ACCESS_KEY_ID` | string | None | Required for S3 uploads | **Secret** | [`src/services/storage.js`](../src/services/storage.js) |
 | `AWS_SECRET_ACCESS_KEY` | string | None | Required for S3 uploads | **Secret** | [`src/services/storage.js`](../src/services/storage.js) |
 | `S3_BUCKET` | string | `liquifact-invoices` | No | No | [`src/services/storage.js`](../src/services/storage.js) |
+| `S3_HEALTHCHECK_ENABLED` | boolean string | enabled | No | No | [`src/services/storage.js`](../src/services/storage.js), [`src/services/health.js`](../src/services/health.js) |
+| `STORAGE_IN_MEMORY` | boolean string | unset; auto-on when `NODE_ENV=test` | No | No | [`src/services/storage.js`](../src/services/storage.js) |
+| `STORAGE_HEALTHCHECK_TIMEOUT_MS` | integer milliseconds | `5000` | No | No | [`src/services/storage.js`](../src/services/storage.js) |
 | `METRICS_BEARER_TOKEN` | string | Loopback-only metrics access when unset | Recommended in production | **Secret** | [`src/metrics.js`](../src/metrics.js) |
 | `API_KEYS` | semicolon-separated JSON objects | Empty registry | Required for API-key clients | **Secret** | [`src/config/apiKeys.js`](../src/config/apiKeys.js), [`src/middleware/apiKeyAuth.js`](../src/middleware/apiKeyAuth.js) |
 | `RATE_LIMIT_WINDOW_MS` | integer milliseconds | `900000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
@@ -69,6 +73,8 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `RATE_LIMIT_SENSITIVE_MAX` | integer | `40` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
 | `RATE_LIMIT_API_KEY_WINDOW_MS` | integer milliseconds | `900000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
 | `RATE_LIMIT_API_KEY_MAX` | integer | `1000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
+| `WEB_CONCURRENCY` | integer | `1` (single-instance default) | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issues #429 cluster-detection signal |
+| `CLUSTER_WORKERS` | integer | `1` (single-instance default) | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issues #429 alt cluster-detection signal |
 | `SOROBAN_BATCH_CONCURRENCY` | integer, `1..50` | `5` | No | No | [`src/config/index.js`](../src/config/index.js) |
 | `SOROBAN_BATCH_TIMEOUT_MS` | integer milliseconds, `100..30000` | `5000` | No | No | [`src/config/index.js`](../src/config/index.js) |
 | `ESCROW_INDEXER_ENABLED` | boolean string | `false` | No | No | [`src/config/index.js`](../src/config/index.js) |

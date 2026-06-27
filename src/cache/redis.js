@@ -36,14 +36,16 @@ if (process.env.NODE_ENV !== 'test' || process.env.USE_REDIS_TEST === 'true') {
 
 /**
  * Returns the active Redis client context along with its real-time health availability flag.
+ *
+ * Used by [`src/middleware/rateLimit.js`](../middleware/rateLimit.js) to share
+ * the cache-layer Redis client for distributed counters when the operator has
+ * not passed an explicit `redisClient` to createRateLimiter(...).
+ *
+ * @returns {{client: object|null, isAvailable: boolean}} Active client + liveness.
  */
 function getRedisClient() {
   return { client: redisClient, isAvailable: isRedisConnected };
 }
-
-module.exports = {
-  getRedisClient,
-};
 const DEFAULT_TIMEOUT_MS = 500;
 const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 5000;
@@ -295,6 +297,10 @@ function createRedisEscrowSummaryCache({ env = process.env, client, RedisCtor } 
 }
 
 module.exports = {
+  // Primary public surface — kept at top of exports so existing callers that
+  // imported the cache module from an older snapshot continue to work.
+  getRedisClient,
+  // Cache layer API.
   RedisEscrowSummaryCache,
   createRedisClient,
   createRedisEscrowSummaryCache,

@@ -20,6 +20,16 @@ jest.mock('../src/services/escrowRead', () => ({
   getEscrowStateWithProjection: jest.fn(),
 }));
 
+const mockStorageProbe = jest.fn();
+jest.mock('../src/services/storage', () => {
+  const actual = jest.requireActual('../src/services/storage');
+  return {
+    ...actual,
+    probeS3Connectivity: (...args) => mockStorageProbe(...args),
+    runStartupStorageProbe: () => Promise.resolve({ status: 'in_memory' }),
+  };
+});
+
 jest.mock('../src/services/marketplaceService', () => ({
   getMarketplaceInvoices: jest.fn(),
   PUBLIC_INVESTABLE_INVOICE_STATUSES: ['open', 'funded'],
@@ -183,12 +193,136 @@ describe('Readiness probe (/readyz)', () => {
       expect(metric.values[0].value).toBe(1);
     });
 
-    it('should return 503 when performReadinessChecks throws unexpectedly', async () => {
-      db.raw.mockImplementation(() => { throw new Error('Unexpected crash'); });
+    it('should report database as not_configured when DATABASE_URL is missing', async () => {
+      delete process.env.DATABASE_URL;
+      global.fetch = jest.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ result: 'ok' }),
+        })
+      );
 
       const res = await request(app).get('/readyz');
       expect(res.status).toBe(503);
       expect(res.body.ready).toBe(false);
+      expect(res.body.checks.database.status).toBe('not_configured');
+
+      const metric = await readinessGauge.get();
+      expect(metric.values[0].value).toBe(0);
+    });
+
+    describe('S3 storage readiness (issue #452)', () => {
+      afterEach(() => {
+        mockStorageProbe.mockReset();
+      });
+
+      it('returns 503 when S3 storage probe is unhealthy', async () => {
+        mockStorageProbe.mockResolvedValue({
+          status: 'unhealthy',
+          latency: 12,
+          error: { code: 'NoSuchBucket', hint: 'configured bucket not found' },
+        });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+        global.fetch = jest.fn(() =>
+          Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ result: 'ok' }) })
+        );
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(503);
+        expect(res.body.ready).toBe(false);
+        expect(res.body.checks.storage.status).toBe('unhealthy');
+        expect(res.body.checks.storage.error).toEqual({
+          code: 'NoSuchBucket',
+          hint: 'configured bucket not found',
+        });
+        // The error string MUST NOT leak endpoint or credential material.
+        const logString = JSON.stringify(res.body);
+        expect(logString).not.toMatch(/AKIA[A-Z0-9]+/);
+        expect(logString).not.toContain('AWS_SECRET');
+        expect(logString).not.toContain('AWS_ACCESS_KEY');
+
+        const metric = await readinessGauge.get();
+        expect(metric.values[0].value).toBe(0);
+      });
+
+      it('returns 503 when S3 storage is not_configured', async () => {
+        mockStorageProbe.mockResolvedValue({
+          status: 'not_configured',
+          bucketConfigured: false,
+          credentialsConfigured: false,
+        });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+        global.fetch = jest.fn(() =>
+          Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ result: 'ok' }) })
+        );
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(503);
+        expect(res.body.ready).toBe(false);
+        expect(res.body.checks.storage.status).toBe('not_configured');
+
+        const metric = await readinessGauge.get();
+        expect(metric.values[0].value).toBe(0);
+      });
+
+      it('returns 200 when S3 storage probe is explicitly disabled', async () => {
+        mockStorageProbe.mockResolvedValue({
+          status: 'disabled',
+          bucketConfigured: true,
+          credentialsConfigured: true,
+        });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+        global.fetch = jest.fn(() =>
+          Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ result: 'ok' }) })
+        );
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.ready).toBe(true);
+        expect(res.body.checks.storage.status).toBe('disabled');
+
+        const metric = await readinessGauge.get();
+        expect(metric.values[0].value).toBe(1);
+      });
+
+      it('returns 200 when S3 storage probe is in_memory (test mode)', async () => {
+        mockStorageProbe.mockResolvedValue({
+          status: 'in_memory',
+          bucketConfigured: false,
+          credentialsConfigured: false,
+        });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+        global.fetch = jest.fn(() =>
+          Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ result: 'ok' }) })
+        );
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.ready).toBe(true);
+        expect(res.body.checks.storage.status).toBe('in_memory');
+
+        const metric = await readinessGauge.get();
+        expect(metric.values[0].value).toBe(1);
+      });
+
+      it('returns 200 when S3 storage probe is healthy', async () => {
+        mockStorageProbe.mockResolvedValue({
+          status: 'healthy',
+          latency: 8,
+          bucketConfigured: true,
+          credentialsConfigured: true,
+        });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+        global.fetch = jest.fn(() =>
+          Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ result: 'ok' }) })
+        );
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.ready).toBe(true);
+        expect(res.body.checks.storage.status).toBe('healthy');
+      });
     });
 
     it('should not leak database connection strings or hostnames in error responses', async () => {

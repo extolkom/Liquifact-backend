@@ -203,50 +203,106 @@ async function checkIndexerStaleness() {
 }
 
 /**
+ * Checks if the configured S3 bucket is reachable using the connectivity
+ * probe defined by the storage service. The result is the raw probe output:
+ * status plus optional latency and a sanitized error descriptor. Credentials,
+ * endpoint URLs, and signed request headers are stripped before the result
+ * is returned.
+ *
+ * Operator-visible statuses:
+ *
+ * - `'healthy'` — bucket is reachable and credentials authorize access.
+ * - `'in_memory'` — in-memory fallback active; probe skipped.
+ * - `'disabled'` — operator opted out via `S3_HEALTHCHECK_ENABLED=false`.
+ * - `'not_configured'` — bucket name or credentials are missing.
+ * - `'unhealthy'` — `HeadBucket` failed; `error.code` is an AWS error name.
+ *
+ * @returns {Promise<{
+ *   status: string,
+ *   latency?: number,
+ *   error?: {code: string, hint: string},
+ *   bucketConfigured?: boolean,
+ *   credentialsConfigured?: boolean
+ * }>}
+ */
+async function checkStorageHealth() {
+  const storage = require('./storage');
+  return storage.probeS3Connectivity();
+}
+
+/**
  * Performs all dependency health checks.
  * @returns {Promise<{healthy: boolean, checks: Object}>}
  */
 async function performHealthChecks() {
-  const [soroban, database, kyc, indexerStaleness] = await Promise.all([
+  const [soroban, database, kyc, indexerStaleness, storage] = await Promise.all([
     checkSorobanHealth(),
     checkDatabaseHealth(),
     checkKycHealth(),
     checkIndexerStaleness(),
+    checkStorageHealth(),
   ]);
 
-  const checks = { soroban, database, kyc, indexerStaleness };
+  const checks = { soroban, database, kyc, indexerStaleness, storage };
   const healthy =
     (soroban.status === 'healthy' || soroban.status === 'unknown') &&
     (kyc.status === 'healthy' || kyc.status === 'disabled') &&
-    (indexerStaleness.status === 'healthy' || indexerStaleness.status === 'disabled');
+    (indexerStaleness.status === 'healthy' || indexerStaleness.status === 'disabled') &&
+    // Storage is in-memory or opted out → non-blocking. Missing config or
+    // unreachable buckets → blocking for `/ready` because uploads will fail.
+    storage.status !== 'not_configured' &&
+    storage.status !== 'unhealthy';
 
   return { healthy, checks };
 }
 
 /**
- * Performs critical-dependency readiness checks (DB, Soroban RPC).
- * The KYC and indexer checks are omitted because they are not required
- * for the process to serve traffic — only critical upstream dependencies
- * that would prevent any request from completing are included.
+ * Performs critical-dependency readiness checks (DB, Soroban RPC, storage).
+ * The KYC and indexer staleness checks are omitted because they are not
+ * required for the process to serve *most* traffic — only critical
+ * upstream dependencies that would prevent any business request from
+ * completing are included.
  *
- * Updates the `readiness_gauge` Prometheus metric (1 = ready, 0 = not ready).
+ * The S3 storage probe is included so a misconfigured bucket (wrong
+ * endpoint, bad credentials, deleted bucket) is surfaced on the readiness
+ * probe rather than at the first invoice upload.
  *
- * @returns {Promise<{healthy: boolean, checks: {database: Object, soroban: Object}}>}
+ * Updates the `readiness_gauge` Prometheus metric (1 = ready, 0 = not
+ * ready). Degraded Soroban RPC (slow) does NOT block readiness.
+ *
+ * @returns {Promise<{
+ *   healthy: boolean,
+ *   checks: {
+ *     database: Object,
+ *     soroban: Object,
+ *     storage: Object
+ *   }
+ * }>}
  */
 async function performReadinessChecks() {
-  const [database, soroban] = await Promise.all([
+  const [database, soroban, storage] = await Promise.all([
     checkDatabaseHealth(),
     checkSorobanHealth(),
+    checkStorageHealth(),
   ]);
 
-  const checks = { database, soroban };
+  const checks = { database, soroban, storage };
+  // In-memory and explicitly-disabled probes are treated as readiness-OK.
+  // Production deployments missing the bucket or with an unreachable
+  // bucket DO block readiness.
+  const storageOk =
+    storage.status === 'healthy' ||
+    storage.status === 'in_memory' ||
+    storage.status === 'disabled';
+
   // Determine overall readiness. Degraded Soroban RPC (slow) does NOT block readiness.
   const healthy =
     database.status === 'healthy' &&
-    (soroban.status === 'healthy' || soroban.status === 'degraded' || soroban.status === 'unknown');
+    (soroban.status === 'healthy' || soroban.status === 'degraded' || soroban.status === 'unknown') &&
+    storageOk;
 
   // Set gauge: 1 = ready, 0.5 = degraded, 0 = not ready
-  if (database.status !== 'healthy') {
+  if (database.status !== 'healthy' || !storageOk) {
     readinessGauge.set(0);
   } else if (soroban.status === 'degraded') {
     readinessGauge.set(0.5);
@@ -261,6 +317,7 @@ module.exports = {
   checkSorobanHealth,
   checkDatabaseHealth,
   checkKycHealth,
+  checkStorageHealth,
   checkIndexerStaleness,
   performHealthChecks,
   performReadinessChecks,
