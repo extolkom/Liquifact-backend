@@ -550,6 +550,97 @@ curl -X POST http://localhost:3001/api/invest/fund-invoice \
 
 ---
 
+## Legal-Hold Compliance Gate — Fail-Closed Policy (issue #424)
+
+**Status**: Production-ready.  
+**Date**: June 2026.  
+**Relates to**: Issue #424 — Treat an unknown legal-hold read result as fail-closed instead of defaulting to false.
+
+### Why fail-closed
+
+The legal-hold flag is a compliance gate. A held escrow MUST NOT receive
+funding. Prior to issue #424, `src/services/escrowRead.js#fetchLegalHold`
+collapsed any read failure (RPC outage, timeout, circuit-breaker open)
+into `false`, downstream `/api/escrow/:invoiceId/fund` then proceeded as
+if "not held". That is a silent compliance bypass: every transient Soroban
+outage is a window during which a held invoice could be funded.
+
+### Tri-state outcome
+
+`fetchLegalHoldStatus(invoiceId, adapter)` returns a tri-state envelope:
+
+| Status     | Meaning                                            | Funding gate response         |
+|------------|----------------------------------------------------|-------------------------------|
+| `held`     | On-chain flag is truthy.                           | `423 Locked` RFC 7807         |
+| `not_held` | On-chain flag is falsy.                            | `next()` — funding permitted   |
+| `unknown`  | RPC error / circuit open / timeout / adapter throw | `503 Service Unavailable`     |
+
+The `unknown` case additionally:
+
+1. Increments the dedicated counter `legal_hold_unknown_blocks_total{reason}`.
+2. Emits a structured `logger.warn({event: 'legal_hold_status_unavailable',
+   component, invoiceId, reason, errorCode}, ...)`.
+3. Returns a problem+json response of type
+   `https://liquifact.com/probs/legal-hold-status-unavailable`.
+
+### Read-side fail-closed
+
+For backwards compatibility, `state.legal_hold` (boolean) reflects
+**both** `held` and `unknown` as `true`. This means any legacy caller of
+`/api/escrow/:invoiceId` that branches on `if (state.legal_hold === false)`
+is also fail-closed: a read that produced `unknown` will not be flagged as
+"safe to fund". The full tri-state is available as `state.legalHoldStatus`,
+`state.legalHoldReason`, and `state.legalHoldErrorCode` for operators and
+dashboards that need to distinguish a verified hold from an outage.
+
+### Operational runbook
+
+- **Alert on `rate(legal_hold_unknown_blocks_total[5m]) > 0`** — every
+  occurrence is a Soroban read outage impacting funding paths.
+- **Group by `reason`** — `rpc_error` is from upstream, `adapter_error`
+  is from a misbehaving caller-supplied adapter, `service_unavailable`
+  is from the gate missing a usable service factory.
+- **Reconciliation** — the existing reconcile job will surface stuck
+  funding requests whose hold status moved from `unknown → held` once
+  the upstream service recovers.
+- **Per-invoiceId triage** — the `legalHoldUnknownBlocksTotal` counter
+  intentionally does NOT carry an `invoiceId` label to keep Prometheus
+  series cardinality bounded. Per-invoice triage is performed via the
+  structured warn log (event=`legal_hold_status_unavailable`) or by
+  inspecting `state.legalHoldErrorCode` on individual escrow-read
+  responses.
+- **Held blocks** — `legal_hold_blocks_total{outcome="held"}` is the
+  separate counter for verified holds. Operators querying "how many
+  funding requests did we block today" should sum both counters and
+  group by `outcome`.
+- **No manual override** — operators do NOT have a "skip gate" knob. The
+  only safe remediation is to wait for the upstream service and retry.
+
+### Tests
+
+`tests/escrow.legalhold.test.js` covers:
+
+- `fetchLegalHoldStatus`: all four outcomes (truthy, falsy, RPC error,
+  generic throw), plus the canonical `LEGAL_HOLD_STATUS` constant.
+- `fetchLegalHold` (legacy boolean projection): `true → true`, `false →
+  false`, `unknown → false` (explicit fail-closed documentation in the
+  test).
+- `readEscrowState` (fail-closed at the data layer): `legal_hold === true`
+  on both `held` and `unknown`; `legalHoldStatus`, `legalHoldReason`,
+  `legalHoldErrorCode` populated on the unknown case.
+- `legalHoldGate()`: 423 on `held`, 200 on `not_held`, 503 RFC 7807 on
+  `unknown`, metric increment, structured warn log, 400 on missing
+  invoiceId, 400 on empty invoiceId, falling closed when an adapter
+  throws, boolean-adapter coercion.
+
+Run:
+
+```bash
+npm test -- tests/escrow.legalhold.test.js
+```
+
+---
+
 ## Support & Troubleshooting
 
 ### Common Issues

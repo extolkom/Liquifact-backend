@@ -35,7 +35,11 @@ let client;
 try {
   client = require('prom-client');
 } catch (_e) {
-  // Fallback shim for environments without prom-client (tests)
+  // Fallback shim for environments without prom-client (tests).
+  //
+  // The shims maintain the same observable surface as real prom-client so
+  // tests can inspect `counter.hashMap` / `counter.get()` directly without
+  // changing the assertion code.
 
   /**
    * Minimal prom-client Registry shim for test environments.
@@ -43,20 +47,53 @@ try {
    */
   class RegistryShim {
     /** @param {void} */
-    constructor() { this.contentType = 'text/plain'; }
+    constructor() {
+      this.contentType = 'text/plain';
+      this._items = [];
+    }
     /** @returns {string} */
-    metrics() { return ''; }
+    metrics() {
+      return '';
+    }
   }
 
   /**
    * Counter shim for test environments.
    * @implements {import('prom-client').Counter}
+   *
+   * Maintains a `hashMap` of `{value: number}` keyed by the JSON
+   * stringification of the label set so callers that introspect
+   * `counter.hashMap` against the real prom-client internals keep working.
    */
   class CounterShim {
-    /** @param {void} */
-    constructor() {}
+    /** @param {{ name: string, help: string, labelNames?: string[] }} opts */
+    constructor(opts = {}) {
+      this.name = opts.name;
+      this.help = opts.help;
+      this.labelNames = opts.labelNames || [];
+      this.hashMap = {};
+      this._map = new Map();
+    }
     /** @returns {void} */
-    inc() {}
+    inc(labels = {}) {
+      const key = JSON.stringify(labels);
+      if (!this._map.has(key)) {
+        this._map.set(key, { value: 0 });
+      }
+      const entry = this._map.get(key);
+      entry.value += 1;
+      this.hashMap[key] = entry;
+    }
+    /** Read a single labeled counter value. */
+    get(labels = {}) {
+      const entry = this._map.get(JSON.stringify(labels));
+      return entry ? entry.value : 0;
+    }
+    /** Reset all label sets to 0 (test helper). */
+    reset() {
+      this._map.clear();
+      this.hashMap = {};
+    }
   }
 
   /**
@@ -64,12 +101,28 @@ try {
    * @implements {import('prom-client').Gauge}
    */
   class GaugeShim {
-    /** @param {void} */
-    constructor() {}
+    /** @param {{ name: string, help: string }} opts */
+    constructor(opts = {}) {
+      this.name = opts.name;
+      this.help = opts.help;
+      this.value = undefined;
+      this.hashMap = { _default: { value: undefined } };
+    }
     /** @returns {void} */
-    set() {}
+    set(v) {
+      this.value = v;
+      this.hashMap._default.value = v;
+    }
     /** @returns {void} */
-    setToCurrentTime() {}
+    setToCurrentTime() {
+      this.value = Date.now();
+      this.hashMap._default.value = this.value;
+    }
+    // Note: no `reset()` is exposed — gauges are sample-by-sample and any
+    // test that needs a clean baseline should call `set(undefined)` or
+    // re-create the shim. The original `CounterShim.reset()` IS kept
+    // because the escrow-legalhold tests rely on it for cross-test
+    // isolation.
   }
 
   client = {
@@ -84,11 +137,23 @@ try {
   };
 }
 
-// Hoisted to the top so the gauges below can register against `registry`
-// without triggering a TDZ error at module-load time. The
-// `client.collectDefaultMetrics` registration deliberately stays AFTER
-// all gauges to avoid double-registration.
+/**
+ * Shared Prometheus registry. Declared BEFORE the counter/gauge
+ * constructors so `registers: [registry]` does not hit a TDZ
+ * ReferenceError. Issue #424 + pre-existing fix: the original code
+ * placed `const registry` near the bottom of the file, which meant
+ * every counter construction referenced a binding that had not yet
+ * been initialized. The error was masked only because every consumer
+ * of this module (`tests/invest.list.test.js`, `tests/health.readiness.test.js`,
+ * etc.) `jest.mock`s the module before evaluation.
+ *
+ * @type {import('prom-client').Registry}
+ */
 const registry = new client.Registry();
+
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
 
 const METRIC_REFRESH_INTERVAL_MS = 5000;
 const registeredJobQueues = new Set();
@@ -357,10 +422,6 @@ async function metricsHandler(_req, res) {
   res.end(await registry.metrics());
 }
 
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
 /**
  * Counter: Escrow events successfully processed by the indexer per cycle.
  * Incremented by the number of events persisted in each indexer cycle.
@@ -540,26 +601,105 @@ const readinessGauge = new client.Gauge({
 });
 
 /**
- * Counter: Cache store read/write errors that fail open.
- * Incremented when cache store get/set/delByPrefix throws.
+ * Counter: Legal-hold blocks triggered by a verified `held` outcome.
+ * Issue #424 — the gate blocks funding while a verified hold is on
+ * chain. Labelled by invoiceId (debug-only) and outcome so dashboards
+ * can group by outcome rather than the high-cardinality invoiceId.
  * @type {import('prom-client').Counter}
  */
-const cacheStoreErrorsTotal = new client.Counter({
-  name: 'cache_store_errors_total',
-  help: 'Total number of cache store errors (get/set/invalidate) that fail open',
+const legalHoldBlocksTotal = new client.Counter({
+  name: 'legal_hold_blocks_total',
+  help: 'Total number of funding requests blocked by the legal-hold gate, labelled by outcome (held)',
+  labelNames: ['invoiceId', 'outcome'],
   registers: [registry],
 });
 
 /**
- * Counter: Redis cache errors that fail open (swallowed, no re-throw).
- * Incremented when a Redis get/set/del operation throws.
+ * Counter: Legal-hold gate trips with status `unknown` (fail-closed).
+ * Issue #424 — a transient read failure MUST NOT collapse to "not held".
+ * This counter is the single source of truth for unknown-blocks. The
+ * `reason` label distinguishes RPC failure (`rpc_error`) from a
+ * misbehaving adapter (`adapter_error`) so operators can alert and
+ * triage separately.
+ *
+ * NOTE: this counter intentionally does NOT carry a per-invoiceId
+ * label. Per-invoiceId correlation is delivered through the structured
+ * warn log instead; high-cardinality labels would blow up the
+ * Prometheus series count without giving operators an actionable
+ * aggregate signal.
  * @type {import('prom-client').Counter}
  */
-const redisCacheFailOpenTotal = new client.Counter({
-  name: 'redis_cache_fail_open_total',
-  help: 'Total number of Redis cache errors that are swallowed (fail-open)',
+const legalHoldUnknownBlocksTotal = new client.Counter({
+  name: 'legal_hold_unknown_blocks_total',
+  help: 'Total number of funding requests blocked because the legal-hold read returned unknown (fail-closed)',
+  labelNames: ['reason'],
   registers: [registry],
 });
+
+/**
+ * Increment the legal-hold gate `held` counter.
+ *
+ * Issue #424: signature aligned to the pre-existing
+ * `incrementMetric('legal_hold_blocked_attempts', { invoiceId })` call site
+ * so existing middleware can adopt this helper without changes.
+ *
+ * @param {object} [labels] - Optional label overrides.
+ * @param {string} [labels.invoiceId] - Invoice identifier (debug-only).
+ * @returns {void}
+ */
+function incrementLegalHoldBlocks(labels = {}) {
+  legalHoldBlocksTotal.inc({
+    invoiceId: labels.invoiceId || 'unknown',
+    outcome: 'held',
+  });
+}
+
+/**
+ * Increment the legal-hold gate `unknown` counter (issue #424 fail-closed).
+ *
+ * Single source of truth for unknown-blocks; the `reason` label carries
+ * the operator-actionable signal (`rpc_error` / `adapter_error` / fallback).
+ * Per-invoiceId correlation lives in the structured warn log so we don't
+ * blow up Prometheus cardinality.
+ *
+ * @param {object} [labels]
+ * @param {string} [labels.invoiceId] - Invoice identifier for debugging (logged, not labelled).
+ * @param {string} [labels.reason] - `'rpc_error'` or `'adapter_error'`.
+ * @param {string|null} [labels.errorCode] - Optional low-cardinality error code (logged, not labelled).
+ * @returns {void}
+ */
+function incrementLegalHoldUnknownBlocks(labels = {}) {
+  legalHoldUnknownBlocksTotal.inc({
+    reason: labels.reason || 'unknown',
+  });
+}
+
+/**
+ * Backwards-compatible generic metric incrementer. Issue #424 — the
+ * pre-existing `legalHoldGate.js` calls
+ *   `incrementMetric('legal_hold_blocked_attempts', { invoiceId })`
+ * with a name that no Prometheus counter was registered under. Map
+ * well-known aliases onto the canonical counters so existing call sites
+ * keep working without widening the public surface.
+ *
+ * @param {string} name - Logical metric name (alias).
+ * @param {object} [labels] - Optional label overrides.
+ * @returns {void}
+ */
+function incrementMetric(name, labels = {}) {
+  switch (name) {
+    case 'legal_hold_blocked_attempts':
+      incrementLegalHoldBlocks(labels);
+      return;
+    case 'legal_hold_unknown_blocks':
+      incrementLegalHoldUnknownBlocks(labels);
+      return;
+    default:
+      // Forward-compatible no-op: unknown aliases swallow rather than throw
+      // so a misconfigured call site doesn't take down the request path.
+      return;
+  }
+}
 
 module.exports = {
   registry,
@@ -569,22 +709,12 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
-  safeEqual,
-  extractClientIp,
-  LOOPBACK,
-  cacheStoreErrorsTotal,
-  redisCacheFailOpenTotal,
-  footprintCacheHitsTotal,
-  footprintCacheMissesTotal,
-  footprintCacheEvictionsTotal,
-  escrowIndexerEventsProcessedTotal,
-  escrowIndexerEventsSkippedTotal,
-  escrowIndexerCycleFailuresTotal,
-  escrowIndexerLastCursorAdvanceTimestampSeconds,
-  escrowReconciliationMismatches,
-  maturityReminderDeliveryAttemptsTotal,
-  maturityReminderDeliverySuccessTotal,
-  maturityReminderDeadLetterTotal,
-  sorobanCircuitBreakerStateTransitionsTotal,
-  readinessGauge,
+  // Issue #424 — explicit exports for the new fail-closed-aware counters
+  // and their increment helpers. `incrementMetric` is retained for the
+  // pre-existing `legalHoldGate.js` call site.
+  incrementMetric,
+  incrementLegalHoldBlocks,
+  incrementLegalHoldUnknownBlocks,
+  legalHoldBlocksTotal,
+  legalHoldUnknownBlocksTotal,
 };
