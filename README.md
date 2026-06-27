@@ -1285,8 +1285,9 @@ Both ends of the pipeline attach `error` listeners. If the database stream or th
 
 Every CSV field is processed by `escapeCsvField()` in `src/services/auditLogStore.js`:
 
-1. **Leading-character neutralisation** — cells beginning with `=`, `+`, `-`, `@`, TAB, or CR are prefixed with a single quote (`'`). This prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or a DDE command.
-2. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
+1. **Leading-whitespace normalisation** — the field is checked after stripping leading whitespace (`trimStart()`), so values like ` =HYPERLINK(...)` or `\t=cmd` are caught even when the dangerous character is not in position 0.
+2. **Leading-character neutralisation** — cells whose first non-whitespace character is `=`, `+`, `-`, `@`, `|`, TAB, or CR are prefixed with a single quote (`'`). This covers the full OWASP CSV Injection list and prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or DDE command.
+3. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
 
 #### Tenant isolation
 
