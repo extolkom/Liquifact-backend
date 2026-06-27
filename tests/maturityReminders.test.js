@@ -61,10 +61,21 @@ describe('Maturity Reminders Job', () => {
       process.env.SMTP_PORT = '587';
       process.env.SMTP_USER = 'user';
       process.env.SMTP_PASS = 'pass';
-      
+
       const transport = getTransport();
       expect(transport).toBeDefined();
       expect(transport.sendMail).toBeDefined();
+      expect(transport.options).toBeDefined();
+      expect(transport.options.host).toBe('smtp.example.com');
+      expect(transport.options.port).toBe(587);
+    });
+
+    it('returns a nodemailer transport when SMTP_HOST is set but port defaults', () => {
+      process.env.SMTP_HOST = 'smtp.example.com';
+      delete process.env.SMTP_PORT;
+
+      const transport = getTransport();
+      expect(transport.options.port).toBe(587);
     });
   });
 
@@ -88,14 +99,14 @@ describe('Maturity Reminders Job', () => {
     });
 
     it('cancels a reminder and removes it from the map', () => {
-      const invoice = { id: 'inv_456', customer: 'Bob', amount: 2000 };
+      const invoice = { id: 'inv_456-bob', customer: 'Bob', amount: 2000 };
       const targetDate = new Date(Date.now() + 5000);
       scheduleReminder(invoice, targetDate, 'bob@example.com');
-      
-      const canceled = cancelReminder('inv_456');
-      
+
+      const canceled = cancelReminder('inv_456-bob');
+
       expect(canceled).toBe(true);
-      expect(invoiceJobs.has('inv_456')).toBe(false);
+      expect(invoiceJobs.has('inv_456-bob')).toBe(false);
     });
 
     it('returns false when canceling non-existent reminder', () => {
@@ -107,13 +118,33 @@ describe('Maturity Reminders Job', () => {
       const invoice = { id: 'inv_789', customer: 'Charlie', amount: 3000 };
       const targetDate1 = new Date(Date.now() + 5000);
       const targetDate2 = new Date(Date.now() + 10000);
-      
+
       const jobId1 = scheduleReminder(invoice, targetDate1, 'charlie@example.com');
       const jobId2 = scheduleReminder(invoice, targetDate2, 'charlie@example.com');
-      
+
       expect(jobId1).not.toBe(jobId2);
       expect(invoiceJobs.get('inv_789')).toBe(jobId2);
+      expect(emailQueue.getJob(jobId1)).toBeNull();
       expect(emailQueue.queue.length).toBe(1); // Only one pending job
+    });
+
+    it('cancels a scheduled reminder via emailQueue.getJob', () => {
+      const invoice = { id: 'inv_456', customer: 'Acme', amount: 300 };
+      const targetDate = new Date(Date.now() + 10000);
+
+      const jobId = scheduleReminder(invoice, targetDate, 'acme@example.com');
+      expect(invoiceJobs.has('inv_456')).toBe(true);
+
+      const canceled = cancelReminder('inv_456');
+
+      expect(canceled).toBe(true);
+      expect(invoiceJobs.has('inv_456')).toBe(false);
+      expect(emailQueue.getJob(jobId)).toBeNull();
+    });
+
+    it('returns false when cancelling unknown invoice id', () => {
+      const canceled = cancelReminder('unknown_id');
+      expect(canceled).toBe(false);
     });
   });
 
@@ -344,9 +375,16 @@ describe('Maturity Reminders Job', () => {
     it('starts and stops the queue processing', async () => {
       startQueueProcessing();
       expect(require('../src/workers/worker')).toBeDefined();
-      
+
       await stopQueueProcessing(100);
       // Should complete without error
+    });
+
+    it('starts queue processing without crashing if already running', () => {
+      startQueueProcessing();
+      // Calling start a second time must be a safe no-op (idempotent restart).
+      startQueueProcessing();
+      stopQueueProcessing(100);
     });
 
     it('processes jobs after start', async () => {
