@@ -105,13 +105,6 @@ const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
 let refreshTimer = null;
 
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
 const queueDepthGauge = new client.Gauge({
   name: 'liquifact_job_queue_depth',
   help: 'Number of pending jobs currently waiting in background queues',
@@ -171,6 +164,15 @@ const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
   'not_found',
   'already_resolved',
 ]);
+
+/**
+ * Refreshes all gauge metrics for queue depths, worker in-flight count,
+ * and builds a cached Prometheus exposition string for the shim path.
+ * @returns {void}
+ */
+function refreshMetrics() {
+  let queueLength = 0;
+  let retryQueueLength = 0;
 
   for (const queue of registeredJobQueues) {
     try {
@@ -529,42 +531,6 @@ const escrowReconciliationDriftAlertsTotal = new client.Counter({
 });
 
 /**
- * Counter: Maturity reminder email delivery attempts.
- * Incremented for each attempt to send a maturity reminder email (including retries).
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeliveryAttemptsTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_attempts_total',
-  help: 'Total number of maturity reminder email delivery attempts (each retry counts)',
-  labelNames: ['job_type'],
-  registers: [registry],
-});
-
-/**
- * Counter: Successful maturity reminder email deliveries.
- * Incremented when a maturity reminder email is sent successfully.
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeliverySuccessTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_success_total',
-  help: 'Total number of maturity reminder emails delivered successfully',
-  labelNames: ['job_type'],
-  registers: [registry],
-});
-
-/**
- * Counter: Dead-lettered maturity reminder emails.
- * Incremented when a maturity reminder fails permanently (permanent SMTP error or max retries exceeded).
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeadLetterTotal = new client.Counter({
-  name: 'maturity_reminder_dead_letter_total',
-  help: 'Total number of maturity reminder emails dead-lettered due to permanent failures or retry exhaustion',
-  labelNames: ['job_type', 'reason'],
-  registers: [registry],
-});
-
-/**
  * Counter: Footprint cache hits.
  * @type {import('prom-client').Counter}
  */
@@ -603,6 +569,20 @@ const sorobanCircuitBreakerStateTransitionsTotal = new client.Counter({
   name: 'soroban_circuit_breaker_state_transitions_total',
   help: 'Total number of Soroban circuit breaker state transitions, labelled by state',
   labelNames: ['state'],
+  registers: [registry],
+});
+
+/**
+ * Counter: Soroban retry budget exhaustion events.
+ * Incremented each time the cumulative elapsed-time budget (`maxElapsedMs`)
+ * is exhausted in the Soroban retry wrapper, causing early abort of retries.
+ * Non-zero values indicate sustained transient failures that burn through
+ * the time budget before the attempt cap is reached.
+ * @type {import('prom-client').Counter}
+ */
+const sorobanRetryBudgetExhaustedTotal = new client.Counter({
+  name: 'soroban_retry_budget_exhausted_total',
+  help: 'Total number of times the Soroban retry cumulative elapsed-time budget was exhausted',
   registers: [registry],
 });
 
@@ -646,4 +626,5 @@ module.exports = {
   refreshMetrics,
   resetMetricsForTests,
   contractWasmVersionMismatchAlertsTotal,
+  sorobanRetryBudgetExhaustedTotal,
 };

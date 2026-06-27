@@ -12,18 +12,38 @@
 
 const { CircuitBreaker } = require('../utils/circuitBreaker');
 
+/** @type {Object|null} Lazily-loaded metrics module reference. */
+let metricsModule = null;
+
+/**
+ * Returns the metrics module, loading it at most once.
+ * @returns {Object|null}
+ */
+function getMetrics() {
+  if (metricsModule === null) {
+    try {
+      metricsModule = require('../metrics');
+    } catch (_e) {
+      metricsModule = false;
+    }
+  }
+  return metricsModule || null;
+}
+
 /**
  * Retry configuration used for all Soroban contract calls.
  *
  * @constant {Object} SOROBAN_RETRY_CONFIG
- * @property {number} maxRetries  - Maximum number of retry attempts (hard-capped at 10).
- * @property {number} baseDelay   - Initial back-off delay in milliseconds.
- * @property {number} maxDelay    - Maximum delay between retries in milliseconds.
+ * @property {number} maxRetries   - Maximum number of retry attempts (hard-capped at 10).
+ * @property {number} baseDelay    - Initial back-off delay in milliseconds.
+ * @property {number} maxDelay     - Maximum delay between retries in milliseconds.
+ * @property {number} maxElapsedMs - Cumulative elapsed-time budget in milliseconds (hard-capped at 120 000).
  */
 const SOROBAN_RETRY_CONFIG = {
   maxRetries: parseInt(process.env.SOROBAN_MAX_RETRIES || '3', 10),
   baseDelay: parseInt(process.env.SOROBAN_BASE_DELAY || '200', 10),
   maxDelay: parseInt(process.env.SOROBAN_MAX_DELAY || '5000', 10),
+  maxElapsedMs: parseInt(process.env.SOROBAN_MAX_ELAPSED_MS || '10000', 10),
 };
 
 /**
@@ -133,19 +153,22 @@ function isTransientError(err) {
  * transient Soroban / Horizon errors.
  *
  * Security caps (enforced regardless of `config`):
- *   - `maxRetries` ≤ 10
- *   - `maxDelay`   ≤ 60 000 ms
- *   - `baseDelay`  ≤ 10 000 ms
+ *   - `maxRetries`  ≤ 10
+ *   - `maxDelay`    ≤ 60 000 ms
+ *   - `baseDelay`   ≤ 10 000 ms
+ *   - `maxElapsedMs` ≤ 120 000 ms
  *
  * @template T
  * @param {() => Promise<T>} operation - Async function to execute and retry.
- * @param {Object} [config]            - Optional retry configuration override.
- * @param {number} [config.maxRetries] - Max retry attempts (default 3).
- * @param {number} [config.baseDelay]  - Base delay in ms (default 200).
- * @param {number} [config.maxDelay]   - Max delay in ms (default 5 000).
+ * @param {Object} [config]             - Optional retry configuration override.
+ * @param {number} [config.maxRetries]  - Max retry attempts (default 3).
+ * @param {number} [config.baseDelay]   - Base delay in ms (default 200).
+ * @param {number} [config.maxDelay]    - Max delay in ms (default 5 000).
+ * @param {number} [config.maxElapsedMs] - Cumulative elapsed-time budget in ms
+ *   (default 10 000). Retries stop once this budget is consumed.
  * @returns {Promise<T>} Resolved value of `operation`.
- * @throws {Error} The last error when all retries are exhausted or the error
- *   is not retryable.
+ * @throws {Error} The last error when all retries are exhausted, when the
+ *   elapsed-time budget is exhausted, or when the error is not retryable.
  *
  * @example
  * const data = await withRetry(() => horizonClient.getAccount(publicKey));
@@ -153,7 +176,9 @@ function isTransientError(err) {
 async function withRetry(operation, config) {
   const cfg = Object.assign({}, SOROBAN_RETRY_CONFIG, config);
   const maxRetries = Math.min(cfg.maxRetries, 10);
+  const maxElapsedMs = Math.min(cfg.maxElapsedMs, 120_000);
 
+  const startTime = Date.now();
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -162,6 +187,15 @@ async function withRetry(operation, config) {
       lastErr = err;
       const isLast = attempt === maxRetries;
       if (isLast || !isRetryable(err)) {
+        throw err;
+      }
+
+      const elapsed = Date.now() - startTime;
+      if (elapsed >= maxElapsedMs) {
+        const metrics = getMetrics();
+        if (metrics && metrics.sorobanRetryBudgetExhaustedTotal) {
+          metrics.sorobanRetryBudgetExhaustedTotal.inc();
+        }
         throw err;
       }
 
