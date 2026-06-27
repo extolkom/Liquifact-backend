@@ -38,6 +38,7 @@ const { metricsAuth, metricsHandler } = require('./metrics');
 const smeRoutes = require('./routes/sme');
 const invoiceFileRoutes = require('./routes/invoiceFile');
 const auditTrailRoutes = require('./routes/auditTrail');
+const adminWebhooksRoutes = require('./routes/adminWebhooks');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -250,6 +251,7 @@ function createApp() {
   app.use('/api/sme', smeRoutes);
   app.use('/api/invoices', invoiceFileRoutes);
   app.use('/api/audit-trail', auditTrailRoutes);
+  app.use('/api/admin/webhooks', adminWebhooksRoutes);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
   app.get('/metrics', metricsAuth, metricsHandler);

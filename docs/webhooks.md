@@ -134,3 +134,143 @@ While signatures prevent tampering and replay, consider implementing idempotency
 ## Testing
 
 Use invoice IDs `funded_invoice` and `settled_invoice` to trigger webhooks when reading escrow state.
+
+---
+
+## Dead-letter replay
+
+### Overview
+
+When a webhook delivery exhausts all retries the delivery job writes the
+failed event to the `webhook_dead_letters` table. Operators can re-attempt
+("replay") those deliveries after a merchant endpoint recovers using the admin
+API.
+
+### Schema — `webhook_dead_letters`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | UUID PK | Row identifier used in all replay/resolve calls |
+| `tenant_id` | TEXT | Owning tenant |
+| `invoice_id` | TEXT | Related invoice |
+| `event` | TEXT | Webhook event type |
+| `payload` | JSONB | Original event payload |
+| `webhook_url` | TEXT | Destination URL at time of failure |
+| `attempts` | INTEGER | Number of delivery attempts before dead-lettering |
+| `last_error` | TEXT | Last error message |
+| `resolved` | BOOLEAN | `true` once successfully replayed or manually resolved |
+| `resolved_at` | TIMESTAMPTZ | When the row was resolved |
+
+Migration: `migrations/20260627000001_create_webhook_dead_letters.sql`
+
+### Replay flow
+
+```
+Operator                Admin API              webhooks.js          Merchant
+   │                       │                       │                    │
+   │ POST /replay/:id       │                       │                    │
+   │──────────────────────>│                       │                    │
+   │                       │ replayWebhook(id)     │                    │
+   │                       │──────────────────────>│                    │
+   │                       │                       │ fetch tenant secret│
+   │                       │                       │ createSignatureHeader()
+   │                       │                       │ POST (fresh sig)──>│
+   │                       │                       │<── 2xx ────────────│
+   │                       │                       │ resolveDeadLetter()│
+   │                       │<── { replayed: [id] } │                    │
+   │<── 202 ───────────────│                       │                    │
+```
+
+Key properties:
+- **Re-signs every replay** — a fresh `t=<timestamp>,v1=<hmac>` signature is
+  computed at replay time using the tenant's current webhook secret.
+- **Idempotency guard** — replaying an already-resolved row returns `409`.
+- **Atomic resolution** — the row is only marked resolved after a `2xx`
+  response; a delivery failure leaves it available for a subsequent replay.
+
+### Admin endpoints
+
+All endpoints require either `Authorization: Bearer <admin-jwt>` or
+`X-API-Key: <key>`.
+
+#### Replay a single row
+
+```
+POST /api/admin/webhooks/replay/:id
+```
+
+Responses:
+
+| Status | Meaning |
+|--------|---------|
+| 202 | Replayed successfully — `{ "replayed": ["<id>"] }` |
+| 401/403 | Missing or invalid credentials |
+| 404 | Dead-letter row not found |
+| 409 | Row already resolved |
+| 502 | Delivery failed — `{ "error": "Replay failed: <msg>" }` |
+
+#### Replay a batch
+
+```
+POST /api/admin/webhooks/replay
+Content-Type: application/json
+```
+
+Body (one of):
+
+```json
+{ "ids": ["uuid1", "uuid2"] }
+```
+
+```json
+{ "tenantId": "t_123", "limit": 50 }
+```
+
+`limit` is capped at 200. Response is always `202`:
+
+```json
+{
+  "replayed": ["uuid1"],
+  "failed":   [{ "id": "uuid2", "error": "..." }]
+}
+```
+
+#### Resolve without re-sending
+
+```
+POST /api/admin/webhooks/resolve/:id
+```
+
+Marks the row resolved without making a delivery attempt. Useful when the
+event is stale and re-delivery is not desired.
+
+| Status | Meaning |
+|--------|---------|
+| 200 | Resolved — `{ "resolved": "<id>" }` |
+| 404 | Row not found |
+| 409 | Row already resolved |
+
+### `webhook_replay` job
+
+The `webhookReplayHandler` in `src/jobs/webhookReplay.js` processes
+`webhook_replay` jobs enqueued with `{ deadLetterId }` as the payload. It is
+registered with the background worker and increments the `webhook_replay_total`
+Prometheus counter with the outcome label:
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `success` | Delivery succeeded and row resolved |
+| `failure` | Delivery returned non-2xx or network error |
+| `not_found` | Dead-letter row missing |
+| `already_resolved` | Row was already resolved before the job ran |
+
+### Metrics
+
+`webhook_replay_total{outcome="..."}` — exported by `GET /metrics`.
+
+### Security
+
+- Only admin-authenticated callers (JWT or API key) can trigger replays.
+- The HMAC signature is always recomputed at replay time — stored payloads
+  are never re-sent with a stale signature.
+- Batch size is hard-capped at 200 to prevent request-amplification abuse.

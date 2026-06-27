@@ -144,11 +144,107 @@ function verifySignature(secret, rawBody, signatureHeader, toleranceMs = TOLERAN
   return { valid, error: valid ? null : 'Signature mismatch' };
 }
 
+/**
+ * Writes a failed webhook delivery to the dead-letter table.
+ *
+ * @param {Object} params
+ * @param {string} params.tenantId
+ * @param {string} params.invoiceId
+ * @param {string} params.event
+ * @param {Object} params.payload
+ * @param {string} params.webhookUrl
+ * @param {number} params.attempts
+ * @param {string} params.lastError
+ * @returns {Promise<string>} The new dead-letter row id.
+ */
+async function writeDeadLetter({ tenantId, invoiceId, event, payload, webhookUrl, attempts, lastError }) {
+  const [row] = await db('webhook_dead_letters')
+    .insert({
+      tenant_id: tenantId,
+      invoice_id: invoiceId,
+      event,
+      payload: JSON.stringify(payload),
+      webhook_url: webhookUrl,
+      attempts,
+      last_error: lastError,
+    })
+    .returning('id');
+  return row?.id ?? row;
+}
+
+/**
+ * Replays a dead-letter row by re-signing and re-sending the stored payload.
+ * On success the row is marked resolved. Throws on delivery failure.
+ *
+ * @param {string} deadLetterId - The `webhook_dead_letters.id` to replay.
+ * @returns {Promise<void>}
+ */
+async function replayWebhook(deadLetterId) {
+  const row = await db('webhook_dead_letters').where('id', deadLetterId).first();
+  if (!row) {
+    throw Object.assign(new Error(`Dead-letter row not found: ${deadLetterId}`), { code: 'NOT_FOUND' });
+  }
+  if (row.resolved) {
+    throw Object.assign(new Error(`Dead-letter row already resolved: ${deadLetterId}`), { code: 'ALREADY_RESOLVED' });
+  }
+
+  const tenant = await db('tenants').select('settings').where('id', row.tenant_id).first();
+  const secret = tenant?.settings?.webhook_secret;
+  if (!secret) {
+    throw new Error(`No webhook secret configured for tenant ${row.tenant_id}`);
+  }
+
+  const body = typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload);
+  const signatureHeader = createSignatureHeader(secret, body);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+  let response;
+  try {
+    response = await fetch(row.webhook_url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': signatureHeader,
+      },
+      body,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    throw new Error(`Webhook replay responded with ${response.status}`);
+  }
+
+  await resolveDeadLetter(deadLetterId);
+  logger.info({ deadLetterId, webhook_url: row.webhook_url }, 'Webhook replayed successfully');
+}
+
+/**
+ * Marks a dead-letter row as resolved without re-sending.
+ *
+ * @param {string} deadLetterId
+ * @returns {Promise<void>}
+ */
+async function resolveDeadLetter(deadLetterId) {
+  await db('webhook_dead_letters').where('id', deadLetterId).update({
+    resolved: true,
+    resolved_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+}
+
 module.exports = {
   emitWebhook,
   verifySignature,
   createSignature,
   createSignatureHeader,
+  writeDeadLetter,
+  replayWebhook,
+  resolveDeadLetter,
   SIGNATURE_VERSION,
   TOLERANCE_MS,
 };

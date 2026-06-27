@@ -39,7 +39,18 @@ const REMINDER_REASON_ENUM = Object.freeze([
  * Bounded enum of allowed `job_type` label values.
  * Add new job types here when introducing new background job kinds.
  */
-const JOB_TYPE_ENUM = Object.freeze(['maturity_reminder', 'unknown']);
+const JOB_TYPE_ENUM = Object.freeze(['maturity_reminder', 'webhook_replay', 'unknown']);
+
+/**
+ * Bounded enum of allowed `outcome` label values for webhook replay metrics.
+ * @readonly
+ */
+const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
+  'success',
+  'failure',
+  'not_found',
+  'already_resolved',
+]);
 
 /**
  * Maps a raw error/reason string to a bounded Prometheus label value.
@@ -110,6 +121,18 @@ const maturityReminderDeadLetterTotal = new client.Counter({
   registers: [],
 });
 
+/**
+ * Total webhook replay attempts, labelled by bounded `outcome`.
+ * Outcomes: success | failure | not_found | already_resolved
+ * @type {import('prom-client').Counter}
+ */
+const webhookReplayTotal = new client.Counter({
+  name: 'webhook_replay_total',
+  help: 'Total number of webhook dead-letter replay attempts',
+  labelNames: ['outcome'],
+  registers: [],
+});
+
 /** Shared registry — exported so tests can reset it between runs. */
 const registry = new client.Registry();
 
@@ -118,6 +141,7 @@ client.collectDefaultMetrics({ register: registry });
 // Register bounded counters with the shared registry
 registry.registerMetric(maturityReminderDeliveryAttemptsTotal);
 registry.registerMetric(maturityReminderDeadLetterTotal);
+registry.registerMetric(webhookReplayTotal);
 
 /**
  * Express middleware that enforces metrics auth.
@@ -163,6 +187,8 @@ module.exports = {
   normalizeJobType,
   maturityReminderDeliveryAttemptsTotal,
   maturityReminderDeadLetterTotal,
+  webhookReplayTotal,
   REMINDER_REASON_ENUM,
   JOB_TYPE_ENUM,
+  WEBHOOK_REPLAY_OUTCOME_ENUM,
 };
