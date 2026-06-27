@@ -114,16 +114,11 @@ const workerInFlightGauge = new client.Gauge({
   registers: [registry],
 });
 
-// Cached metrics text for compatibility with tests that call
-// `registry.metrics()` synchronously. Prom-client >=14 returns a Promise
-// from `registry.metrics()`, but some test code calls it without `await`.
-// We provide a synchronous accessor by overriding `registry.metrics`
-// to return the latest cached string; `metricsHandler` still works because
-// awaiting a string yields the string value.
+// Cached metrics text for compatibility with test environments where
+// prom-client is not available (shim). In production with the real
+// prom-client, `metricsHandler` calls the real `registry.metrics()`
+// which returns the full Prometheus exposition of ALL registered metrics.
 let cachedMetrics = '# HELP liquifact_custom_metrics Placeholder\n';
-registry.metrics = function metricsSync() {
-  return cachedMetrics;
-};
 
 /**
  * Refresh all registered queue and worker metrics.
@@ -166,6 +161,18 @@ function refreshMetrics() {
 
   // Build a minimal Prometheus text exposition that includes our gauges.
   // Keep labels bounded and avoid including payloads or per-job ids.
+  // The body-size-limit counter is read from the prom-client hashMap so it
+  // reflects all .inc() calls made since process start (or shim default 0).
+  let bodySizeRejectionsByType = '';
+  const hashMap = bodySizeLimitRejectionsTotal.hashMap || {};
+  for (const entry of Object.values(hashMap)) {
+    if (entry && typeof entry.value === 'number' && entry.value > 0) {
+      const labels = entry.labels || {};
+      const typeLabel = labels.type || 'unknown';
+      bodySizeRejectionsByType += `body_size_limit_rejections_total{type="${typeLabel}"} ${entry.value}\n`;
+    }
+  }
+
   cachedMetrics = '' +
     '# HELP liquifact_job_queue_depth Number of pending jobs waiting in queues\n' +
     '# TYPE liquifact_job_queue_depth gauge\n' +
@@ -175,7 +182,10 @@ function refreshMetrics() {
     `liquifact_job_retry_queue_size ${retryQueueLength}\n` +
     '# HELP liquifact_worker_inflight_count Number of jobs currently being processed\n' +
     '# TYPE liquifact_worker_inflight_count gauge\n' +
-    `liquifact_worker_inflight_count ${workerInFlight}\n`;
+    `liquifact_worker_inflight_count ${workerInFlight}\n` +
+    '# HELP body_size_limit_rejections_total Total number of request body-size limit rejections (413 Payload Too Large), labelled by limit type for DoS detection\n' +
+    '# TYPE body_size_limit_rejections_total counter\n' +
+    bodySizeRejectionsByType;
 }
 
 function startMetricsRefresh() {
@@ -349,7 +359,13 @@ function metricsAuth(req, res, next) {
  */
 async function metricsHandler(_req, res) {
   res.set('Content-Type', registry.contentType);
-  res.end(await registry.metrics());
+  // Use the real prom-client registry.metrics() when available (production),
+  // which returns the full Prometheus exposition including ALL registered
+  // counters and gauges. Fall back to cachedMetrics for the shim (tests).
+  const metricsText = typeof client.Gauge !== 'function' || client.Gauge.name === 'GaugeShim'
+    ? cachedMetrics
+    : await registry.metrics();
+  res.end(metricsText);
 }
 
 /** Shared registry — exported so tests can reset it between runs. */
