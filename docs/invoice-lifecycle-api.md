@@ -48,11 +48,42 @@ curl -X POST http://localhost:3001/api/invoices/inv-001/transition \
 
 ### States
 
-- **pending**: Initial state when invoice is created
-- **approved**: Invoice has been verified and approved
-- **linked_escrow**: Invoice is linked to an escrow contract (terminal state)
-- **rejected**: Invoice was rejected during verification (terminal state)
-- **cancelled**: Invoice was cancelled by user (terminal state)
+The platform recognises two overlapping state vocabularies that both live in
+`src/services/invoiceStateMachine.js` as the single authoritative source.
+
+#### Approval / escrow lifecycle (managed by the state machine)
+
+| Status | Description |
+|--------|-------------|
+| `pending` | Initial state when invoice is created |
+| `approved` | Invoice has been verified and approved |
+| `linked_escrow` | Invoice is linked to an escrow contract (**terminal**) |
+| `rejected` | Invoice was rejected during verification (**terminal**) |
+| `cancelled` | Invoice was cancelled by user (**terminal**) |
+
+#### Funding-progress overlay (set by the investment/funding subsystem)
+
+| Status | Description | Investable? |
+|--------|-------------|-------------|
+| `pending_verification` | Awaiting KYC / compliance check | No |
+| `verified` | Passed compliance; open for investment | **Yes** |
+| `partially_funded` | Funding target partially met; still accepting commitments | **Yes** |
+| `funded` | Funding target fully met; no new commitments accepted | No |
+| `completed` | Invoice settled / matured | No |
+| `defaulted` | Issuer defaulted (**terminal**) | No |
+
+### Investable Statuses
+
+The marketplace and invest endpoints only surface invoices whose `status` is in
+the **investable set**: `verified` and `partially_funded`.  This set is defined
+once in `INVESTABLE_STATUSES` (exported from `invoiceStateMachine.js`) and
+consumed by `marketplaceService` and `investService` via a named import — there
+is no separate hardcoded array.
+
+**Security invariant**: no terminal lifecycle state (`linked_escrow`, `rejected`,
+`cancelled`, `defaulted`) can ever appear in `INVESTABLE_STATUSES`.  The test
+suite in `tests/marketplace.test.js` (section *"Status vocabulary alignment"*)
+enforces this property on every CI run.
 
 ### Valid Transitions
 

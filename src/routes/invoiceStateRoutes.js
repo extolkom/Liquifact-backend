@@ -6,8 +6,8 @@
  * to the authenticated tenant from extractTenant middleware.
  *
  * Capital-movement routes are protected by the KYC gate:
- *   - POST /:id/link-escrow   — initiates escrow funding lifecycle
- *   - POST /:id/transition     — when targetState is 'funded' or 'settled'
+ * - POST /:id/link-escrow   — initiates escrow funding lifecycle
+ * - POST /:id/transition     — when targetState is 'funded' or 'settled'
  *
  * @module routes/invoiceStateRoutes
  */
@@ -42,9 +42,10 @@ router.use(extractTenant);
 
 /**
  * Helper to extract actor from request
+ * STRENGTHENED: Removed spoofable IP fallback logic.
  *
  * @param {import('express').Request} req Express request object
- * @returns {string} Actor identifier
+ * @returns {string|null} Actor identifier or null if unauthenticated
  */
 function getActorFromRequest(req) {
   if (req.user && req.user.id) {
@@ -53,7 +54,7 @@ function getActorFromRequest(req) {
   if (req.user && req.user.sub) {
     return req.user.sub;
   }
-  return req.ip || req.socket.remoteAddress || 'unknown';
+  return null;
 }
 
 /**
@@ -134,12 +135,6 @@ function conditionalKycGate(req, res, next) {
 /**
  * POST /api/invoices/:id/transition
  * Execute a state transition
- *
- * Request body:
- * {
- *   "targetState": "approved",
- *   "reason": "Invoice verified and approved by finance team"
- * }
  */
 router.post('/:id/transition', conditionalKycGate, idempotencyMiddleware, async (req, res, next) => {
   const { id } = req.params;
@@ -153,6 +148,12 @@ router.post('/:id/transition', conditionalKycGate, idempotencyMiddleware, async 
     }
 
     const actor = getActorFromRequest(req);
+    if (!actor) {
+      return res.status(401).json(
+        responseHelper.error('An authenticated principal identity is required to modify invoice state.', 'UNAUTHORIZED_ACTOR'),
+      );
+    }
+
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
@@ -197,6 +198,12 @@ router.post('/:id/approve', idempotencyMiddleware, async (req, res, next) => {
 
   try {
     const actor = getActorFromRequest(req);
+    if (!actor) {
+      return res.status(401).json(
+        responseHelper.error('An authenticated principal identity is required to modify invoice state.', 'UNAUTHORIZED_ACTOR'),
+      );
+    }
+
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
@@ -234,9 +241,6 @@ router.post('/:id/approve', idempotencyMiddleware, async (req, res, next) => {
 /**
  * POST /api/invoices/:id/link-escrow
  * Link an approved invoice to escrow.
- *
- * This is a capital-movement endpoint: it initiates the escrow funding
- * lifecycle. KYC must be verified before the link can be made.
  */
 router.post('/:id/link-escrow', requireKycForFunding, idempotencyMiddleware, async (req, res, next) => {
   const { id } = req.params;
@@ -257,6 +261,12 @@ router.post('/:id/link-escrow', requireKycForFunding, idempotencyMiddleware, asy
     }
 
     const actor = getActorFromRequest(req);
+    if (!actor) {
+      return res.status(401).json(
+        responseHelper.error('An authenticated principal identity is required to modify invoice state.', 'UNAUTHORIZED_ACTOR'),
+      );
+    }
+
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 
@@ -340,6 +350,12 @@ router.post('/:id/reject', idempotencyMiddleware, async (req, res, next) => {
     }
 
     const actor = getActorFromRequest(req);
+    if (!actor) {
+      return res.status(401).json(
+        responseHelper.error('An authenticated principal identity is required to modify invoice state.', 'UNAUTHORIZED_ACTOR'),
+      );
+    }
+
     const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
 

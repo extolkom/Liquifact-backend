@@ -37,11 +37,11 @@ describe('Soroban Integration Wrapper', () => {
 
     it('should trip the circuit breaker on sustained transient errors', async () => {
       const { sharedBreaker } = require('./soroban');
-      
+
       // Reset breaker state for clean test
       sharedBreaker.state = 'CLOSED';
       sharedBreaker.failureCount = 0;
-      
+
       const operation = jest.fn().mockImplementation(() => {
         const err = new Error('503 Service Unavailable');
         err.status = 503;
@@ -50,7 +50,7 @@ describe('Soroban Integration Wrapper', () => {
 
       // Provide a fast retry config so test doesn't hang
       const fastConfig = { maxRetries: 0, baseDelay: 0, maxDelay: 0 };
-      
+
       // Fail enough times to trip the breaker (default threshold is 5)
       for (let i = 0; i < 5; i++) {
         await expect(callSorobanContract(operation, fastConfig)).rejects.toThrow('503 Service Unavailable');
@@ -64,7 +64,7 @@ describe('Soroban Integration Wrapper', () => {
       } catch (e) {
         caughtError = e;
       }
-      
+
       expect(caughtError).toBeDefined();
       expect(caughtError.code).toBe('CIRCUIT_OPEN');
       expect(fastFailOp).not.toHaveBeenCalled();

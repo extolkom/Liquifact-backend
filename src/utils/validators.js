@@ -9,6 +9,7 @@
  * there so all callers continue to work without modification.
  */
 
+const { ALL_INVOICE_STATUSES } = require('../services/invoiceStateMachine');
 // ── Zod-backed invoice payload validator (re-export) ─────────────────────────
 
 const {
@@ -137,7 +138,7 @@ function validateMarketplaceQueryParams(query) {
   } = query;
 
   if (status !== undefined) {
-    const validStatuses = ['pending_verification', 'verified', 'funded', 'partially_funded', 'completed', 'defaulted'];
+    const validStatuses = ALL_INVOICE_STATUSES;
     if (validStatuses.includes(status)) {
       validatedParams.filters.status = status;
     } else {

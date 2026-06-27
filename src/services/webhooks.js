@@ -41,6 +41,11 @@ const { registry } = require('../metrics');
 const SIGNATURE_VERSION = 'v1';
 const TOLERANCE_MS = 5 * 60 * 1000;
 
+// Signature header guards — a well-formed header is "t=<10 digits>,v1=<64 hex chars>"
+// (~80 chars). These limits are generous but still block header-flooding abuse.
+const MAX_SIGNATURE_HEADER_LENGTH = 256;
+const MAX_SIGNATURE_HEADER_PARTS = 10;
+
 /**
  * Recursively sorts keys of an object to ensure deterministic JSON serialization.
  *
@@ -269,7 +274,21 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
  * @returns {Object} Result object with valid boolean and optional error message.
  */
 function verifySignature(secret, rawBody, signatureHeader, toleranceMs = TOLERANCE_MS) {
+  // ── Max-length guard ────────────────────────────────────────────────────────
+  // Reject oversized headers before any splitting or allocation work.
+  if (typeof signatureHeader !== 'string' || signatureHeader.length > MAX_SIGNATURE_HEADER_LENGTH) {
+    return { valid: false, error: 'Invalid signature header format' };
+  }
+
   const parts = signatureHeader.split(',');
+
+  // ── Part-count guard ────────────────────────────────────────────────────────
+  // A well-formed header has exactly 2 parts: "t=<ts>" and "v1=<sig>".
+  // Cap well above that to allow future versioning while blocking floods.
+  if (parts.length > MAX_SIGNATURE_HEADER_PARTS) {
+    return { valid: false, error: 'Invalid signature header format' };
+  }
+
   let timestamp = null;
   let signature = null;
 
