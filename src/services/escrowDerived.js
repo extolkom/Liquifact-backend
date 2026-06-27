@@ -91,7 +91,7 @@ function validateLedgerCloseTimeUnit(value) {
   // Non-numeric, negative, or NaN → invalid
   if (!isFinite(num) || num < 0) {
     console.warn(
-      `[escrowDerived] ledgerCloseTime is non-numeric or negative: ${value}`
+      '[escrowDerived] ledgerCloseTime is non-numeric or negative: ' + value
     );
     return null;
   }
@@ -99,8 +99,7 @@ function validateLedgerCloseTimeUnit(value) {
   // Magnitude check: if > threshold, likely milliseconds, not seconds
   if (num > EPOCH_SECONDS_THRESHOLD) {
     console.warn(
-      `[escrowDerived] ledgerCloseTime ${num} exceeds threshold ${EPOCH_SECONDS_THRESHOLD}; ` +
-      `unit mismatch suspected (milliseconds passed as seconds?). Rejecting.`
+      '[escrowDerived] ledgerCloseTime ' + num + ' exceeds threshold ' + EPOCH_SECONDS_THRESHOLD + '; unit mismatch suspected (milliseconds passed as seconds?). Rejecting.'
     );
     return null;
   }
@@ -129,16 +128,14 @@ function validateMaturityDateBounds(maturityDate, referenceTime) {
 
   if (daysDiff > MAX_FUTURE_DAYS) {
     console.warn(
-      `[escrowDerived] maturityDate is ${daysDiff} days in future (> ${MAX_FUTURE_DAYS} day max); ` +
-      `absurd value flagged. Treating as invalid.`
+      '[escrowDerived] maturityDate is ' + daysDiff + ' days in future (> ' + MAX_FUTURE_DAYS + ' day max); absurd value flagged. Treating as invalid.'
     );
     return false;
   }
 
   if (daysDiff < -MAX_OVERDUE_DAYS) {
     console.warn(
-      `[escrowDerived] maturityDate is ${daysDiff} days in past (> ${MAX_OVERDUE_DAYS} day grace); ` +
-      `stale or malformed. Treating as invalid.`
+      '[escrowDerived] maturityDate is ' + daysDiff + ' days in past (> ' + MAX_OVERDUE_DAYS + ' day grace); stale or malformed. Treating as invalid.'
     );
     return false;
   }
