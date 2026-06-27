@@ -90,6 +90,16 @@ function buildMemo(invoiceId) {
   return { type: 'text', value: memoValue };
 }
 
+/**
+ * Build and submit (or prepare) the fund_escrow call.
+ *
+ * @param {Object} params
+ * @param {string} params.escrowAddress   — Stellar contract address of the escrow
+ * @param {string} params.investorAddress — investor's Stellar public key
+ * @param {string|number} params.amountStroops — amount in stroops (integer string)
+ * @param {string} params.invoiceId       — used for idempotency / memo
+ * @returns {Promise<EscrowSubmitResult>}
+ */
 async function submitFundEscrow({ escrowAddress, investorAddress, amountStroops, invoiceId }) {
   const mode = (process.env.ESCROW_SIGNING_MODE || SIGNING_MODE.STUBBED).toLowerCase();
 
