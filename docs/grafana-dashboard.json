@@ -47,8 +47,66 @@
   "tags": ["liquifact", "dos-detection", "security"],
   "timezone": "browser",
   "schemaVersion": 36,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": true,
+        "expr": "ALERTS{alertname=\"BodySizeLimitRejectionRateWarning\"}",
+        "iconColor": "rgba(237, 129, 40, 0.89)",
+        "name": "BodySizeLimitRejectionRateWarning",
+        "showIn": 0,
+        "titleFormat": "Warning alert firing",
+        "tagKeys": "alertname,severity",
+        "textFormat": "Rate: {{ $labels.severity }} — {{ humanize $value }}/s"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": true,
+        "expr": "ALERTS{alertname=\"BodySizeLimitRejectionRateCritical\"}",
+        "iconColor": "rgba(245, 54, 54, 0.9)",
+        "name": "BodySizeLimitRejectionRateCritical",
+        "showIn": 0,
+        "titleFormat": "Critical alert firing",
+        "tagKeys": "alertname,severity",
+        "textFormat": "Rate: {{ $labels.severity }} — {{ humanize $value }}/s"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": true,
+        "expr": "ALERTS{alertname=~\"BodySize.*\"}",
+        "iconColor": "pink",
+        "name": "Any DoS Alert Firing",
+        "showIn": 0,
+        "titleFormat": "DoS alert: {{ $labels.alertname }}",
+        "tagKeys": "alertname,severity",
+        "textFormat": "Severity: {{ $labels.severity }} — {{ $labels.alertname }}"
+      }
+    ]
+  },
   "time": {
     "from": "now-6h",
     "to": "now"
