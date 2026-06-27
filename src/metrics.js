@@ -105,13 +105,6 @@ const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
 let refreshTimer = null;
 
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
 const queueDepthGauge = new client.Gauge({
   name: 'liquifact_job_queue_depth',
   help: 'Number of pending jobs currently waiting in background queues',
@@ -172,6 +165,15 @@ const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
   'already_resolved',
 ]);
 
+/**
+ * Refreshes the cached metrics text by aggregating queue and worker statistics.
+ * Called periodically via startMetricsRefresh().
+ * @returns {void}
+ */
+function refreshMetrics() {
+  let queueLength = 0;
+  let retryQueueLength = 0;
+
   for (const queue of registeredJobQueues) {
     try {
       const stats = queue.getStats();
@@ -205,7 +207,7 @@ const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
   // The body-size-limit counter is read from the prom-client hashMap so it
   // reflects all .inc() calls made since process start (or shim default 0).
   let bodySizeRejectionsByType = '';
-  const hashMap = bodySizeLimitRejectionsTotal.hashMap || {};
+  const hashMap = bodySizeLimitRejectionsTotal ? bodySizeLimitRejectionsTotal.hashMap || {} : {};
   for (const entry of Object.values(hashMap)) {
     if (entry && typeof entry.value === 'number' && entry.value > 0) {
       const labels = entry.labels || {};
@@ -227,6 +229,24 @@ const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
     '# HELP body_size_limit_rejections_total Total number of request body-size limit rejections (413 Payload Too Large), labelled by limit type for DoS detection\n' +
     '# TYPE body_size_limit_rejections_total counter\n' +
     bodySizeRejectionsByType;
+}
+
+/**
+ * Registers a job queue for metrics tracking.
+ * @param {object} queue - Queue object with getStats method.
+ * @returns {void}
+ */
+function registerJobQueue(queue) {
+  registeredJobQueues.add(queue);
+}
+
+/**
+ * Registers a worker for metrics tracking.
+ * @param {object} worker - Worker object with getStats method.
+ * @returns {void}
+ */
+function registerWorker(worker) {
+  registeredWorkers.add(worker);
 }
 
 /**
@@ -529,111 +549,14 @@ const escrowReconciliationDriftAlertsTotal = new client.Counter({
 });
 
 /**
- * Counter: Maturity reminder email delivery attempts.
- * Incremented for each attempt to send a maturity reminder email (including retries).
+ * Counter: Failed idempotency response storage attempts after all retries exhausted.
+ * Labelled by key prefix (first 8 chars) for operational visibility without exposing full keys.
  * @type {import('prom-client').Counter}
  */
-const maturityReminderDeliveryAttemptsTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_attempts_total',
-  help: 'Total number of maturity reminder email delivery attempts (each retry counts)',
-  labelNames: ['job_type'],
-  registers: [registry],
-});
-
-/**
- * Counter: Successful maturity reminder email deliveries.
- * Incremented when a maturity reminder email is sent successfully.
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeliverySuccessTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_success_total',
-  help: 'Total number of maturity reminder emails delivered successfully',
-  labelNames: ['job_type'],
-  registers: [registry],
-});
-
-/**
- * Counter: Dead-lettered maturity reminder emails.
- * Incremented when a maturity reminder fails permanently (permanent SMTP error or max retries exceeded).
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeadLetterTotal = new client.Counter({
-  name: 'maturity_reminder_dead_letter_total',
-  help: 'Total number of maturity reminder emails dead-lettered due to permanent failures or retry exhaustion',
-  labelNames: ['job_type', 'reason'],
-  registers: [registry],
-});
-
-/**
- * Counter: Footprint cache hits.
- * @type {import('prom-client').Counter}
- */
-const footprintCacheHitsTotal = new client.Counter({
-  name: 'soroban_footprint_cache_hits_total',
-  help: 'Total number of Soroban footprint cache hits',
-  registers: [registry],
-});
-
-/**
- * Counter: Footprint cache misses.
- * @type {import('prom-client').Counter}
- */
-const footprintCacheMissesTotal = new client.Counter({
-  name: 'soroban_footprint_cache_misses_total',
-  help: 'Total number of Soroban footprint cache misses',
-  registers: [registry],
-});
-
-/**
- * Counter: Footprint cache evictions (LRU or TTL).
- * @type {import('prom-client').Counter}
- */
-const footprintCacheEvictionsTotal = new client.Counter({
-  name: 'soroban_footprint_cache_evictions_total',
-  help: 'Total number of Soroban footprint cache evictions (LRU or TTL expiry)',
-  registers: [registry],
-});
-
-/**
- * Counter: Soroban circuit breaker state transitions.
- * Labelled by the new state name to allow counting transitions into each state.
- * @type {import('prom-client').Counter}
- */
-const sorobanCircuitBreakerStateTransitionsTotal = new client.Counter({
-  name: 'soroban_circuit_breaker_state_transitions_total',
-  help: 'Total number of Soroban circuit breaker state transitions, labelled by state',
-  labelNames: ['state'],
-  registers: [registry],
-});
-
-/**
- * Gauge: Readiness state (1 = ready, 0 = not ready).
- * Updated by performReadinessChecks() in the health service.
- * @type {import('prom-client').Gauge}
- */
-const readinessGauge = new client.Gauge({
-  name: 'readiness_gauge',
-  help: 'Readiness state of the service: 1 = ready to serve traffic, 0 = not ready',
-  registers: [registry],
-});
-
-/**
- * Counter: operator alerts raised when `contractListRefresh` detects an on-chain
- * LiquifactEscrow wasm `SCHEMA_VERSION` that diverges from the expected/known
- * registry version.
- *
- * Labelled by the comparison `status` (`ahead` — contract is newer than anything
- * the backend tracks; `unknown` — version not present in the registry) so ops can
- * distinguish an upgrade from an unexpected/rolled-back deployment. A non-zero
- * value is an actionable signal that the backend may not yet support the on-chain
- * contract — see `docs/wasm-ops.md`.
- *
- * @type {import('prom-client').Counter}
- */
-const contractWasmVersionMismatchAlertsTotal = new client.Counter({
-  name: 'contract_wasm_version_mismatch_alerts_total',
-  help: 'Total operator alerts raised when contractListRefresh detects an on-chain wasm SCHEMA_VERSION mismatch',
-  labelNames: ['status'],
+const idempotencyStorageFailureTotal = new client.Counter({
+  name: 'idempotency_storage_failure_total',
+  help: 'Total number of idempotency response storage failures after max retries',
+  labelNames: ['keyPrefix'],
   registers: [registry],
 });
 
@@ -646,4 +569,5 @@ module.exports = {
   refreshMetrics,
   resetMetricsForTests,
   contractWasmVersionMismatchAlertsTotal,
+  idempotencyStorageFailureTotal,
 };
