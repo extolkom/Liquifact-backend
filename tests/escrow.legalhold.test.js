@@ -22,7 +22,6 @@ const jwt = require('jsonwebtoken');
 const { describe, it } = require('mocha');
 const expect = require('chai').expect;
 const express = require('express');
-const request = require('supertest');
 const sinon = require('sinon');
 const escrowRead = require('../services/escrowRead');
 const { legalHoldGate } = require('../middleware/legalHoldGate');
