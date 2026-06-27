@@ -292,6 +292,81 @@ On success, `req.apiClient` is set to `{ clientId, scopes }`.
 
 ---
 
+## Docker / Deployment
+
+The production image is built with two hardening measures that address
+container-security best practices (CIS Docker Benchmark):
+
+### Image overview
+
+| Property | Value |
+|---|---|
+| Base image | `node:20-slim` |
+| Build strategy | Multi-stage (deps → runtime) |
+| Runtime user | `appuser` (UID 1001, non-root) |
+| Dependency install | `npm ci --omit=dev` against committed `package-lock.json` |
+| Health probe | `GET /readyz` (HTTP 200 = healthy) |
+| Exposed port | `3001` |
+
+### Non-root runtime user
+
+The final image creates a dedicated `appuser`/`appgroup` (UID/GID 1001) and
+switches to that identity before `CMD`. The process therefore runs without
+`root` privileges, limiting the blast radius of any application-layer exploit.
+
+```dockerfile
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid appgroup --no-create-home --shell /bin/false appuser
+...
+USER appuser
+```
+
+### Lockfile-verified install
+
+`npm ci` requires `package-lock.json` to be present and in sync with
+`package.json`. If the lockfile is absent or diverged the build fails
+immediately — no silent version drift into production.
+
+> **Note:** `package-lock.json` must be committed to the repository.
+> The `.gitignore` was updated to allow this file; run
+> `npm install` locally and commit the generated lockfile before building the
+> Docker image.
+
+### Multi-stage build
+
+The `deps` stage installs dependencies; the `runtime` stage copies only the
+resolved `node_modules` and application source. Build tooling, npm itself,
+and any intermediate files never reach the final layer.
+
+### Building and running
+
+```bash
+# Build the hardened image
+docker build -t liquifact-backend:latest .
+
+# Run with required environment variables
+docker run --rm \
+  -p 3001:3001 \
+  -e NODE_ENV=production \
+  -e DATABASE_URL=postgresql://user:pass@host:5432/db \
+  liquifact-backend:latest
+
+# Verify the container runs as a non-root user
+docker run --rm --entrypoint id liquifact-backend:latest
+# Expected output: uid=1001(appuser) gid=1001(appgroup) groups=1001(appgroup)
+```
+
+### Edge cases
+
+| Scenario | Behaviour |
+|---|---|
+| `package-lock.json` missing | `npm ci` fails; `docker build` exits non-zero |
+| `package-lock.json` out of sync | `npm ci` fails; `docker build` exits non-zero |
+| Health check during startup | `--start-period=5s` absorbs boot time; probe retried up to 3× |
+| Non-root file permissions | `chown -R appuser:appgroup /app` grants app full access to its own tree |
+
+---
+
 ## Development
 
 | Command | Description |
