@@ -614,125 +614,54 @@ Before production deployment:
 
 ---
 
-## Invoice Audit Trail & State-Transition History API
+## Audit-Trail Per-Invoice Authorization (Issue #426)
 
-**Status**: Implemented  
-**Date**: May 2026  
-**Relates to**: Issue #208 — Add admin endpoint for invoice audit trail and state-transition history export
+### Problem
 
-### Overview
+The audit-trail endpoint previously scoped queries only by `req.tenantId`. A tenant member could iterate `invoiceId` values and read audit logs for invoices they had no relationship to within the same tenant.
 
-Compliance operators can retrieve and export the full audit history for any invoice, including all mutations and state transitions. All endpoints are admin-gated and tenant-isolated.
+### Authorization rule
 
-### Endpoints
+Before streaming audit events, the endpoint enforces three conditions via `assertInvoiceEntitlement`:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/admin/audit/invoices/:invoiceId` | Paginated audit trail |
-| GET | `/api/admin/audit/invoices/:invoiceId/transitions` | State-transition history |
-| GET | `/api/admin/audit/invoices/:invoiceId/export` | Export as JSON or CSV |
+1. **Invoice exists** — the invoice must be present and not soft-deleted.
+2. **Tenant ownership** — the invoice's `tenant_id` must match the caller's `req.tenantId`.
+3. **Role check** — the caller's JWT `role` claim must be `admin` or `owner`. Any other role (e.g. `investor`, `viewer`, absent) is denied.
 
-### Authentication
+**All failure cases return `404 Not Found`** — not `403 Forbidden`. This prevents existence leakage: a caller cannot distinguish "invoice doesn't exist" from "invoice belongs to another tenant" from "insufficient role".
 
-All endpoints accept either:
-- `Authorization: Bearer <JWT>` — admin JWT with `tenantId` claim
-- `X-API-KEY: <key>` — service-to-service API key
-
-Tenant context is resolved from the `x-tenant-id` header (highest priority) or the `tenantId` JWT claim. Requests without a resolvable tenant are rejected with `400`.
-
-### Tenant Isolation
-
-Every query is scoped to the authenticated operator's tenant. An operator cannot retrieve audit records belonging to another tenant.
-
-### Pagination
-
-Query params: `limit` (1–500, default 50) and `offset` (default 0).
-
-```bash
-GET /api/admin/audit/invoices/inv-001?limit=20&offset=40
-```
-
-Response includes a `meta` object:
-```json
-{
-  "data": [...],
-  "meta": { "invoiceId": "inv-001", "limit": 20, "offset": 40, "total": 87 }
-}
-```
-
-### Export Formats
-
-#### JSON (default)
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     -H "x-tenant-id: tenant-alpha" \
-     "http://localhost:3001/api/admin/audit/invoices/inv-001/export"
-```
-
-Returns `application/json` — a JSON array of audit log entries.
-
-#### CSV
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     -H "x-tenant-id: tenant-alpha" \
-     "http://localhost:3001/api/admin/audit/invoices/inv-001/export?format=csv" \
-     -o audit-inv-001.csv
-```
-
-Returns `text/csv` with `Content-Disposition: attachment`. CSV columns:
+### Middleware stack
 
 ```
-id,timestamp,actor,action,resourceType,resourceId,statusCode,ipAddress,userAgent
+GET /api/audit-trail/:invoiceId
+  → authenticateToken   (401 if missing/invalid JWT)
+  → extractTenant       (400 if no tenant context)
+  → assertInvoiceEntitlement  (404 for any entitlement failure)
+  → stream audit events
 ```
 
-Fields containing commas, double-quotes, or newlines are RFC 4180-escaped (wrapped in double-quotes, internal quotes doubled).
+### Security properties
 
-### Secret Redaction
+- **Enumeration resistance**: foreign invoices and nonexistent invoices return the same `404` response with no distinguishing body fields.
+- **No tenant leakage**: the response body never includes the `tenant_id` of the requested invoice.
+- **Role minimum**: only `admin` and `owner` may read audit trails. The role check is performed before the DB query so an unpermitted role never triggers a lookup.
 
-Sensitive fields (`password`, `token`, `secret`, `apiKey`, `privateKey`, etc.) are redacted to `***REDACTED***` before any log entry is stored or exported. This is enforced at write time by `sanitizeSensitiveData` in `src/services/auditLog.js` and `redactValue` in `src/services/auditLogStore.js`.
+### Test coverage
 
-### State-Transition History
+File: `tests/auditTrail.api.test.js`
 
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     -H "x-tenant-id: tenant-alpha" \
-     "http://localhost:3001/api/admin/audit/invoices/inv-001/transitions"
-```
+| Scenario | Expected |
+|---|---|
+| admin role, own tenant invoice | 200 with events |
+| owner role, own tenant invoice | 200 with events |
+| investor role | 404 |
+| no role claim in JWT | 404 |
+| invoice from different tenant | 404 |
+| nonexistent invoice | 404 |
+| foreign vs nonexistent indistinguishable | both 404, same body shape |
+| no Authorization header | 401 |
+| tampered token | 401 |
+| no tenant context | 400 |
 
-Response:
-```json
-{
-  "data": [
-    {
-      "id": "AUDIT-...",
-      "timestamp": "2026-05-30T10:00:00.000Z",
-      "actor": "admin-1",
-      "fromState": "pending",
-      "toState": "approved",
-      "reason": null,
-      "ipAddress": "127.0.0.1"
-    }
-  ],
-  "meta": { "invoiceId": "inv-001" }
-}
-```
-
-### Security Notes
-
-- Endpoints are read-only; no mutations are possible through this API.
-- Input validation rejects `invoiceId` values longer than 128 characters.
-- Pagination bounds are clamped server-side (max 500 per page).
-- All responses omit internal stack traces and infrastructure details.
-- The audit log store is append-only at the database layer (see `migrations/202604260002_enforce_audit_log_append_only.sql`).
-
-### Deployment Checklist
-
-- [ ] Ensure `JWT_SECRET` is set in deployment secrets
-- [ ] Confirm `x-tenant-id` header is forwarded by API gateway / load balancer
-- [ ] Verify audit log DB migrations have run (`npm run db:migrate`)
-- [ ] Run tests: `npx jest tests/auditTrail.api.test.js`
-
-**Last Updated**: May 30, 2026  
-**Relates to**: Issue #208
+**Last Updated**: June 2026
+**Relates to**: Issue #426 — Enforce per-invoice authorization on the audit-trail endpoint

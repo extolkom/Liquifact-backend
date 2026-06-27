@@ -44,14 +44,6 @@ const { metricsAuth, metricsHandler } = require('./metrics');
 const smeRoutes = require('./routes/sme');
 const invoiceFileRoutes = require('./routes/invoiceFile');
 const auditTrailRoutes = require('./routes/auditTrail');
-const investRoutes = require('./routes/invest');
-const investorRoutes = require('./routes/investor');
-const marketplaceRoutes = require('./routes/marketplace');
-const retentionRoutes = require('./routes/retention');
-const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
-const adminEscrowRoutes = require('./routes/adminEscrow');
-const kycRoutes = require('./routes/kyc');
-const v1Routes = require('./routes/v1');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -329,16 +321,7 @@ function createApp() {
   // ── 5. SME & Invoice File routes ─────────────────────────────────────────
   app.use('/api/sme', smeRoutes);
   app.use('/api/invoices', invoiceFileRoutes);
-  app.use('/api/invoices', invoiceStateRoutes);
-  app.use('/api/invest', investRoutes);
-  app.use('/api/investor', investorRoutes);
-  app.use('/api/kyc', kycRoutes);
-  app.use('/api/marketplace', marketplaceRoutes);
-  app.use('/api/retention', retentionRoutes);
-  app.use('/api/admin/audit', auditTrailRoutes);
-  app.use('/api/admin/escrow', adminEscrowRoutes);
-  app.use('/api/admin/reconciliation', reconciliationRoutes);
-  app.use('/v1', v1Routes);
+  app.use('/api/audit-trail', auditTrailRoutes);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
   app.get('/metrics', metricsAuth, metricsHandler);

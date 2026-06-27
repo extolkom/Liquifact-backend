@@ -3,12 +3,11 @@
 const nodemailer = require('nodemailer');
 const JobQueue = require('../workers/jobQueue');
 const BackgroundWorker = require('../workers/worker');
-const { sendMailWithRetry, isPermanentSmtpError } = require('../utils/retry');
-const logger = require('../logger');
 const {
   maturityReminderDeliveryAttemptsTotal,
-  maturityReminderDeliverySuccessTotal,
   maturityReminderDeadLetterTotal,
+  normalizeReminderReason,
+  normalizeJobType,
 } = require('../metrics');
 
 /**
@@ -74,97 +73,27 @@ LiquiFact Settlement Team
  */
 emailWorker.registerHandler('maturity_reminder', async (job) => {
   const { invoiceId, customer, amount, email, targetDate } = job.payload;
-  
-  const transport = getTransport();
-  const text = templates.maturityReminder(customer, amount, targetDate);
+  const jobType = normalizeJobType(job.type);
 
-  const mailOptions = {
-    from: process.env.SMTP_FROM || 'noreply@liquifact.com',
-    to: email,
-    subject: `Settlement Reminder: Invoice ${invoiceId}`,
-    text,
-  };
-
-  const maxAttempts = Number(process.env.SMTP_MAX_RETRIES) || 3;
+  maturityReminderDeliveryAttemptsTotal.inc({ reason: 'unknown', job_type: jobType });
 
   try {
-    // Track attempt
-    maturityReminderDeliveryAttemptsTotal.inc({ job_type: 'maturity_reminder' });
+    const transport = getTransport();
+    const text = templates.maturityReminder(customer, amount, targetDate);
 
-    // Send with retry and backoff
-    await sendMailWithRetry(transport, mailOptions, {
-      maxAttempts,
-      baseDelayMs: 1000,
-      onRetry: ({ attempt, error }) => {
-        logger.warn({
-          msg: 'Maturity reminder delivery retry',
-          invoiceId,
-          email,
-          attempt,
-          errorCode: error.code,
-          errorMessage: error.message,
-        });
-        
-        // Count each retry attempt
-        maturityReminderDeliveryAttemptsTotal.inc({ job_type: 'maturity_reminder' });
-      },
+    await transport.sendMail({
+      from: process.env.SMTP_FROM || 'noreply@liquifact.com',
+      to: email,
+      subject: `Settlement Reminder: Invoice ${invoiceId}`,
+      text,
     });
 
-    // Success
-    maturityReminderDeliverySuccessTotal.inc({ job_type: 'maturity_reminder' });
-    logger.info({
-      msg: 'Maturity reminder delivered successfully',
-      invoiceId,
-      email,
-    });
-
-    // Clean up job mapping
+    // Since it succeeded, we can clear the job from the map if it hadn't been replaced
     invoiceJobs.delete(invoiceId);
-
-  } catch (error) {
-    const isPermanent = isPermanentSmtpError(error);
-    const reason = isPermanent ? 'permanent_error' : 'max_retries_exceeded';
-
-    logger.error({
-      msg: 'Maturity reminder delivery failed',
-      invoiceId,
-      email,
-      errorCode: error.code,
-      errorMessage: error.message,
-      isPermanent,
-      reason,
-    });
-
-    // Record dead-letter
-    maturityReminderDeadLetterTotal.inc({ 
-      job_type: 'maturity_reminder',
-      reason,
-    });
-
-    // Store in dead-letter queue for manual recovery
-    deadLetterQueue.push({
-      invoiceId,
-      email,
-      error: {
-        code: error.code,
-        message: error.message,
-        response: error.response,
-        isPermanent,
-      },
-      timestamp: new Date().toISOString(),
-      maxAttempts,
-    });
-
-    // Limit dead-letter queue size to prevent memory leak
-    if (deadLetterQueue.length > 1000) {
-      deadLetterQueue.shift();
-    }
-
-    // Clean up job mapping
-    invoiceJobs.delete(invoiceId);
-
-    // Re-throw so job queue marks job as failed
-    throw error;
+  } catch (err) {
+    const reason = normalizeReminderReason(err);
+    maturityReminderDeadLetterTotal.inc({ reason, job_type: jobType });
+    throw err;
   }
 });
 

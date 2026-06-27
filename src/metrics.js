@@ -48,195 +48,102 @@ try {
     metrics() { return ''; }
   }
 
-  /**
-   * Counter shim for test environments.
-   * @implements {import('prom-client').Counter}
-   */
-  class CounterShim {
-    /** @param {void} */
-    constructor() {}
-    /** @returns {void} */
-    inc() {}
-  }
-
-  /**
-   * Gauge shim for test environments.
-   * @implements {import('prom-client').Gauge}
-   */
-  class GaugeShim {
-    /** @param {void} */
-    constructor() {}
-    /** @returns {void} */
-    set() {}
-    /** @returns {void} */
-    setToCurrentTime() {}
-  }
-
-  client = {
-    Registry: RegistryShim,
-    /**
-     * No-op default metrics collector stub.
-     * @returns {void}
-     */
-    collectDefaultMetrics: () => { },
-    Counter: CounterShim,
-    Gauge: GaugeShim,
-  };
-}
-
-const METRIC_REFRESH_INTERVAL_MS = 5000;
-const registeredJobQueues = new Set();
-const registeredWorkers = new Set();
-let refreshTimer = null;
-
-const queueDepthGauge = new client.Gauge({
-  name: 'liquifact_job_queue_depth',
-  help: 'Number of pending jobs currently waiting in background queues',
-  registers: [registry],
-});
-
-const retryQueueSizeGauge = new client.Gauge({
-  name: 'liquifact_job_retry_queue_size',
-  help: 'Number of jobs waiting in retry queues for background processing',
-  registers: [registry],
-});
-
-const workerInFlightGauge = new client.Gauge({
-  name: 'liquifact_worker_inflight_count',
-  help: 'Number of jobs currently being processed by background workers',
-  registers: [registry],
-});
-
-// Cached metrics text for compatibility with tests that call
-// `registry.metrics()` synchronously. Prom-client >=14 returns a Promise
-// from `registry.metrics()`, but some test code calls it without `await`.
-// We provide a synchronous accessor by overriding `registry.metrics`
-// to return the latest cached string; `metricsHandler` still works because
-// awaiting a string yields the string value.
-let cachedMetrics = '# HELP liquifact_custom_metrics Placeholder\n';
-registry.metrics = function metricsSync() {
-  return cachedMetrics;
-};
+/**
+ * Bounded enum of allowed `reason` label values for maturity-reminder metrics.
+ * Any raw error/reason string must be mapped through {@link normalizeReminderReason}
+ * before being used as a Prometheus label to prevent time-series cardinality explosion.
+ *
+ * | Value            | Meaning                                              |
+ * |------------------|------------------------------------------------------|
+ * | smtp_timeout     | SMTP connection or send timed out                    |
+ * | smtp_reject      | SMTP server rejected the message (4xx/5xx response)  |
+ * | template_error   | Email template rendering failed                      |
+ * | unknown          | Any other / unmapped failure                         |
+ */
+const REMINDER_REASON_ENUM = Object.freeze([
+  'smtp_timeout',
+  'smtp_reject',
+  'template_error',
+  'unknown',
+]);
 
 /**
- * Refresh all registered queue and worker metrics.
- *
- * This performs periodic sampling from existing getStats() outputs on
- * registered job queue and worker instances. It avoids adding extra hot-path
- * overhead to each enqueue/dequeue operation.
+ * Bounded enum of allowed `job_type` label values.
+ * Add new job types here when introducing new background job kinds.
  */
-function refreshMetrics() {
-  let queueLength = 0;
-  let retryQueueLength = 0;
+const JOB_TYPE_ENUM = Object.freeze(['maturity_reminder', 'unknown']);
 
-  for (const queue of registeredJobQueues) {
-    try {
-      const stats = queue.getStats();
-      if (stats) {
-        queueLength += Number(stats.queueLength || 0);
-        retryQueueLength += Number(stats.retryQueueLength || 0);
-      }
-    } catch (err) {
-      // Preserve existing metrics if a registered queue becomes invalid.
-    }
+/**
+ * Maps a raw error/reason string to a bounded Prometheus label value.
+ *
+ * Mapping table:
+ * - Contains "timeout" (case-insensitive) → `smtp_timeout`
+ * - Contains "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", or "connect" (case-insensitive) → `smtp_timeout`
+ * - Contains "reject", "550", "551", "552", "553", "554" → `smtp_reject`
+ * - Contains "4xx" SMTP temporary failures ("421", "450", "451", "452") → `smtp_reject`
+ * - Contains "template" (case-insensitive) → `template_error`
+ * - Anything else, empty, null, or non-string → `unknown`
+ *
+ * PII guarantee: this function only pattern-matches; it never includes the
+ * raw string in the returned label, so no recipient address or invoice
+ * content can leak into Prometheus label values.
+ *
+ * @param {unknown} raw - Raw error message, reason string, or Error object.
+ * @returns {'smtp_timeout'|'smtp_reject'|'template_error'|'unknown'} Bounded label value.
+ */
+function normalizeReminderReason(raw) {
+  const str = raw instanceof Error ? raw.message : typeof raw === 'string' ? raw : '';
+  if (!str) { return 'unknown'; }
+
+  if (/timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|connect/i.test(str)) {
+    return 'smtp_timeout';
   }
-
-  let workerInFlight = 0;
-  for (const worker of registeredWorkers) {
-    try {
-      const stats = worker.getStats();
-      if (stats && typeof stats.processingCount === 'number') {
-        workerInFlight += stats.processingCount;
-      }
-    } catch (err) {
-      // Preserve existing metrics if a registered worker becomes invalid.
-    }
+  if (/reject|55[0-4]|42[0-9]|EAUTH/i.test(str)) {
+    return 'smtp_reject';
   }
-
-  queueDepthGauge.set(queueLength);
-  retryQueueSizeGauge.set(retryQueueLength);
-  workerInFlightGauge.set(workerInFlight);
-
-  // Build a minimal Prometheus text exposition that includes our gauges.
-  // Keep labels bounded and avoid including payloads or per-job ids.
-  cachedMetrics = '' +
-    '# HELP liquifact_job_queue_depth Number of pending jobs waiting in queues\n' +
-    '# TYPE liquifact_job_queue_depth gauge\n' +
-    `liquifact_job_queue_depth ${queueLength}\n` +
-    '# HELP liquifact_job_retry_queue_size Number of jobs waiting in retry queues\n' +
-    '# TYPE liquifact_job_retry_queue_size gauge\n' +
-    `liquifact_job_retry_queue_size ${retryQueueLength}\n` +
-    '# HELP liquifact_worker_inflight_count Number of jobs currently being processed\n' +
-    '# TYPE liquifact_worker_inflight_count gauge\n' +
-    `liquifact_worker_inflight_count ${workerInFlight}\n`;
-}
-
-function startMetricsRefresh() {
-  if (refreshTimer) {
-    return;
+  if (/template/i.test(str)) {
+    return 'template_error';
   }
-
-  refreshTimer = setInterval(refreshMetrics, METRIC_REFRESH_INTERVAL_MS);
-  if (typeof refreshTimer.unref === 'function') {
-    refreshTimer.unref();
-  }
-}
-
-function stopMetricsRefresh() {
-  if (!refreshTimer) {
-    return;
-  }
-
-  clearInterval(refreshTimer);
-  refreshTimer = null;
+  return 'unknown';
 }
 
 /**
- * Register a job queue instance for Prometheus instrumentation.
+ * Maps a raw job type string to a bounded Prometheus label value.
  *
- * @param {Object} queue
+ * @param {unknown} raw - Raw job type string.
+ * @returns {string} Bounded label value from {@link JOB_TYPE_ENUM}.
  */
-function registerJobQueue(queue) {
-  if (!queue || typeof queue.getStats !== 'function') {
-    return;
-  }
-
-  if (registeredJobQueues.has(queue)) {
-    return;
-  }
-
-  registeredJobQueues.add(queue);
-  refreshMetrics();
-  startMetricsRefresh();
+function normalizeJobType(raw) {
+  const str = typeof raw === 'string' ? raw : '';
+  return JOB_TYPE_ENUM.includes(str) ? str : 'unknown';
 }
+
+// ── Maturity-reminder counters ────────────────────────────────────────────────
 
 /**
- * Register a worker instance for Prometheus instrumentation.
- *
- * @param {Object} worker
+ * Total maturity-reminder delivery attempts, labelled by bounded `reason` and `job_type`.
+ * @type {import('prom-client').Counter}
  */
-function registerWorker(worker) {
-  if (!worker || typeof worker.getStats !== 'function') {
-    return;
-  }
+const maturityReminderDeliveryAttemptsTotal = new client.Counter({
+  name: 'maturity_reminder_delivery_attempts_total',
+  help: 'Total number of maturity-reminder delivery attempts',
+  labelNames: ['reason', 'job_type'],
+  registers: [],
+});
 
-  if (registeredWorkers.has(worker)) {
-    return;
-  }
+/**
+ * Total maturity-reminder dead-letter events, labelled by bounded `reason` and `job_type`.
+ * @type {import('prom-client').Counter}
+ */
+const maturityReminderDeadLetterTotal = new client.Counter({
+  name: 'maturity_reminder_dead_letter_total',
+  help: 'Total number of maturity-reminder messages moved to the dead-letter queue',
+  labelNames: ['reason', 'job_type'],
+  registers: [],
+});
 
-  registeredWorkers.add(worker);
-  refreshMetrics();
-  startMetricsRefresh();
-}
-
-function resetMetricsForTests() {
-  registeredJobQueues.clear();
-  registeredWorkers.clear();
-  queueDepthGauge.set(0);
-  retryQueueSizeGauge.set(0);
-  workerInFlightGauge.set(0);
-  stopMetricsRefresh();
-}
+/** Shared registry — exported so tests can reset it between runs. */
+const registry = new client.Registry();
 
 /**
  * Constant-time string comparison to prevent timing attacks.
@@ -261,6 +168,10 @@ function safeEqual(a, b) {
   }
   return result === 0;
 }
+
+// Register bounded counters with the shared registry
+registry.registerMetric(maturityReminderDeliveryAttemptsTotal);
+registry.registerMetric(maturityReminderDeadLetterTotal);
 
 /**
  * Set of loopback IP addresses that are allowed when no bearer token is
@@ -345,165 +256,14 @@ async function metricsHandler(_req, res) {
   res.end(await registry.metrics());
 }
 
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
-/**
- * Counter: Escrow events successfully processed by the indexer per cycle.
- * Incremented by the number of events persisted in each indexer cycle.
- * @type {import('prom-client').Counter}
- */
-const escrowIndexerEventsProcessedTotal = new client.Counter({
-  name: 'escrow_indexer_events_processed_total',
-  help: 'Total number of escrow events successfully processed and persisted by the indexer',
-  registers: [registry],
-});
-
-/**
- * Counter: Escrow events skipped (invalid) by the indexer per cycle.
- * Incremented when an event fails validation or persistence.
- * @type {import('prom-client').Counter}
- */
-const escrowIndexerEventsSkippedTotal = new client.Counter({
-  name: 'escrow_indexer_events_skipped_total',
-  help: 'Total number of escrow events skipped due to validation or persistence errors',
-  registers: [registry],
-});
-
-/**
- * Counter: Escrow indexer cycle failures.
- * Incremented when a cycle throws an unhandled exception or receives invalid metric data.
- * @type {import('prom-client').Counter}
- */
-const escrowIndexerCycleFailuresTotal = new client.Counter({
-  name: 'escrow_indexer_cycle_failures_total',
-  help: 'Total number of escrow indexer cycles that failed with an exception',
-  registers: [registry],
-});
-
-/**
- * Gauge: Unix timestamp (seconds) of the last successful cursor advance.
- * Updated when a cycle completes and cursorAfter !== cursorBefore.
- * Used by health check to detect indexer staleness.
- * @type {import('prom-client').Gauge}
- */
-const escrowIndexerLastCursorAdvanceTimestampSeconds = new client.Gauge({
-  name: 'escrow_indexer_last_cursor_advance_timestamp_seconds',
-  help: 'Unix timestamp (seconds) of the last cycle where the cursor advanced (cursorAfter !== cursorBefore)',
-  registers: [registry],
-});
-
-/**
- * Counter: Escrow reconciliation mismatches.
- * Incremented each time a reconcileInvoice call detects a discrepancy
- * between the DB funded total and the on-chain funded amount.
- * @type {import('prom-client').Counter}
- */
-const escrowReconciliationMismatches = new client.Counter({
-  name: 'escrow_reconciliation_mismatches_total',
-  help: 'Total number of escrow reconciliation mismatches detected',
-  registers: [registry],
-});
-
-/**
- * Counter: Maturity reminder email delivery attempts.
- * Incremented for each attempt to send a maturity reminder email (including retries).
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeliveryAttemptsTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_attempts_total',
-  help: 'Total number of maturity reminder email delivery attempts (each retry counts)',
-  labelNames: ['job_type'],
-  registers: [registry],
-});
-
-/**
- * Counter: Successful maturity reminder email deliveries.
- * Incremented when a maturity reminder email is sent successfully.
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeliverySuccessTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_success_total',
-  help: 'Total number of maturity reminder emails delivered successfully',
-  labelNames: ['job_type'],
-  registers: [registry],
-});
-
-/**
- * Counter: Dead-lettered maturity reminder emails.
- * Incremented when a maturity reminder fails permanently (permanent SMTP error or max retries exceeded).
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeadLetterTotal = new client.Counter({
-  name: 'maturity_reminder_dead_letter_total',
-  help: 'Total number of maturity reminder emails dead-lettered due to permanent failures or retry exhaustion',
-  labelNames: ['job_type', 'reason'],
-  registers: [registry],
-});
-
-/**
- * Counter: Footprint cache hits.
- * @type {import('prom-client').Counter}
- */
-const footprintCacheHitsTotal = new client.Counter({
-  name: 'soroban_footprint_cache_hits_total',
-  help: 'Total number of Soroban footprint cache hits',
-  registers: [registry],
-});
-
-/**
- * Counter: Footprint cache misses.
- * @type {import('prom-client').Counter}
- */
-const footprintCacheMissesTotal = new client.Counter({
-  name: 'soroban_footprint_cache_misses_total',
-  help: 'Total number of Soroban footprint cache misses',
-  registers: [registry],
-});
-
-/**
- * Counter: Footprint cache evictions (LRU or TTL).
- * @type {import('prom-client').Counter}
- */
-const footprintCacheEvictionsTotal = new client.Counter({
-  name: 'soroban_footprint_cache_evictions_total',
-  help: 'Total number of Soroban footprint cache evictions (LRU or TTL expiry)',
-  registers: [registry],
-});
-
-/**
- * Counter: Soroban circuit breaker state transitions.
- * Labelled by the new state name to allow counting transitions into each state.
- * @type {import('prom-client').Counter}
- */
-const sorobanCircuitBreakerStateTransitionsTotal = new client.Counter({
-  name: 'soroban_circuit_breaker_state_transitions_total',
-  help: 'Total number of Soroban circuit breaker state transitions, labelled by state',
-  labelNames: ['state'],
-  registers: [registry],
-});
-
-/**
- * Gauge: Readiness state (1 = ready, 0 = not ready).
- * Updated by performReadinessChecks() in the health service.
- * @type {import('prom-client').Gauge}
- */
-const readinessGauge = new client.Gauge({
-  name: 'readiness_gauge',
-  help: 'Readiness state of the service: 1 = ready to serve traffic, 0 = not ready',
-  registers: [registry],
-});
-
 module.exports = {
   registry,
   metricsAuth,
   metricsHandler,
-  registerJobQueue,
-  registerWorker,
-  refreshMetrics,
-  resetMetricsForTests,
+  normalizeReminderReason,
+  normalizeJobType,
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeadLetterTotal,
+  REMINDER_REASON_ENUM,
+  JOB_TYPE_ENUM,
 };
