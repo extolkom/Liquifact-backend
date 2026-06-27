@@ -40,7 +40,21 @@
     },
     "setupFilesAfterEnv": [
       "<rootDir>/tests/mocks/setup.js"
-    ]
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 60,
+        "functions": 70,
+        "lines": 70,
+        "statements": 70
+      },
+      "./src/middleware/rateLimit.js": {
+        "branches": 85,
+        "functions": 95,
+        "lines": 95,
+        "statements": 95
+      }
+    }
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.665.0",
@@ -69,7 +83,7 @@
     "@babel/types": "^8.0.0",
     "@types/node": "^20.0.0",
     "autocannon": "^8.0.0",
-    "c8": "^11.0.0",
+    "c8": "^11.1.0",
     "eslint": "^9.21.0",
     "eslint-plugin-jsdoc": "50.6.3",
     "eslint-plugin-security": "^3.0.1",
