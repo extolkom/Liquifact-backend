@@ -638,6 +638,10 @@ invoice.pdf            -> accepted
 
 ### Tenant and Invoice Validation
 
+Tenant IDs are **required** for all SME upload operations, provided either via:
+- `X-Tenant-Id` header (service-to-service), or
+- `tenantId` JWT claim (authenticated users).
+
 Tenant IDs and invoice IDs are validated before key generation.
 
 Allowed characters:
@@ -657,6 +661,14 @@ Rejected examples:
 tenant/admin
 inv/123
 ```
+
+### Idempotency for Presigned URL Generation
+
+The `POST /api/sme/invoice/presigned-url` endpoint **requires an `Idempotency-Key` header** to prevent duplicate invoiceId creation and ensure retries don't generate new presigned URLs.
+
+- Valid key format: 8–128 URL-safe characters (a-z, A-Z, 0-9, ., _, :, -)
+- Same key + same body → returns cached response (same invoiceId and presigned URL)
+- Same key + different body → returns 409 Conflict
 
 ### MIME Type Validation
 
