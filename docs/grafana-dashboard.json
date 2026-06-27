@@ -47,7 +47,7 @@
   "tags": ["liquifact", "dos-detection", "security"],
   "timezone": "browser",
   "schemaVersion": 36,
-  "version": 2,
+  "version": 3,
   "refresh": "30s",
   "annotations": {
     "list": [
@@ -623,6 +623,271 @@
           "expr": "sum(rate(body_size_limit_rejections_total[5m]))",
           "legendFormat": "All types",
           "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "DoS Incidents (24h)",
+      "description": "Total number of distinct DoS alert events in the last 24 hours. Each event is a complete alert firing cycle (trigger → resolve). A non-zero value means an alert threshold was breached.",
+      "type": "stat",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"]
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "floor(clamp_min(changes(ALERTS{alertname=~\"BodySize.*\"}[24h]) / 2, 0))",
+          "legendFormat": "Total incidents",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "DoS Incidents by Pattern (24h)",
+      "description": "Attack pattern classification over the last 24h: 'Sustained' = only the High/Warning alert fired (rate > 10/min for >= 2 min, indicating prolonged moderate elevation). 'Burst' = the Critical alert fired (rate > 30/min for >= 1 min, indicating a short high-rate spike). A high burst-to-sustained ratio suggests an active volumetric attack.",
+      "type": "bargauge",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 4,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Burst"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sustained"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "floor(clamp_min(changes(ALERTS{alertname=\"BodySizeLimitRejectionRateCritical\"}[24h]) / 2, 0))",
+          "legendFormat": "Burst",
+          "refId": "A"
+        },
+        {
+          "expr": "floor(clamp_min((changes(ALERTS{alertname=\"BodySizeLimitRejectionRateHigh\"}[24h]) - changes(ALERTS{alertname=\"BodySizeLimitRejectionRateCritical\"}[24h])) / 2, 0))",
+          "legendFormat": "Sustained",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "DoS Incident Timeline (24h)",
+      "description": "Alert firing activity over the last 24 hours. Each spike indicates a DoS alert trigger. Compare the timeline with the Rejection Rate panel above to correlate alert firings with rate patterns.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["mean", "max", "lastNotNull"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineInterpolation": "stepAfter",
+            "showPoints": "always",
+            "fillOpacity": 50,
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Critical alert"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Warning alert"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 50
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "ALERTS{alertname=\"BodySizeLimitRejectionRateHigh\"}",
+          "legendFormat": "Warning alert",
+          "refId": "A"
+        },
+        {
+          "expr": "ALERTS{alertname=\"BodySizeLimitRejectionRateCritical\"}",
+          "legendFormat": "Critical alert",
+          "refId": "B"
         }
       ]
     }
