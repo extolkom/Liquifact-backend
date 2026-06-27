@@ -14,15 +14,64 @@ const { invalidatePrefix } = require('../middleware/cache');
 
 
 /**
- * Valid invoice states in the lifecycle
+ * Valid invoice states in the approval/escrow lifecycle.
+ * These states govern the internal workflow (pending → approved → linked_escrow)
+ * and are managed exclusively by executeTransition().
  */
 const INVOICE_STATES = {
   PENDING: 'pending',
   APPROVED: 'approved',
   LINKED_ESCROW: 'linked_escrow',
-  REJECTED: 'rejected', // Terminal state
+  REJECTED: 'rejected',   // Terminal state
   CANCELLED: 'cancelled', // Terminal state
 };
+
+/**
+ * Full recognized state vocabulary across both the approval lifecycle and the
+ * funding-progress layer.  Any status value stored in the `invoices.status`
+ * column MUST appear here.  This is the single authoritative source — add new
+ * statuses here before using them anywhere else.
+ *
+ * Approval/escrow lifecycle (managed by the state machine):
+ *   pending, approved, linked_escrow, rejected, cancelled
+ *
+ * Funding-progress overlay (set by the investment/funding subsystem):
+ *   pending_verification – awaiting KYC / compliance check
+ *   verified             – passed compliance; open for investment
+ *   partially_funded     – funding target partially met; still accepting commitments
+ *   funded               – funding target fully met
+ *   completed            – invoice settled / matured
+ *   defaulted            – issuer defaulted; terminal
+ */
+const ALL_INVOICE_STATUSES = Object.freeze([
+  // Approval/escrow lifecycle
+  INVOICE_STATES.PENDING,
+  INVOICE_STATES.APPROVED,
+  INVOICE_STATES.LINKED_ESCROW,
+  INVOICE_STATES.REJECTED,
+  INVOICE_STATES.CANCELLED,
+  // Funding-progress overlay
+  'pending_verification',
+  'verified',
+  'partially_funded',
+  'funded',
+  'completed',
+  'defaulted',
+]);
+
+/**
+ * Statuses that make an invoice publicly visible in the marketplace and
+ * eligible for investor commitments.
+ *
+ * Business rule: an invoice is investable when it has passed compliance
+ * checks (`verified`) or is still accepting additional funding
+ * (`partially_funded`).  All other statuses are tenant-private and MUST NOT
+ * be exposed through marketplace/invest read endpoints.
+ *
+ * This constant is the single source of truth.  `marketplaceService` and
+ * `investService` import it directly; no separate literal array should exist.
+ */
+const INVESTABLE_STATUSES = Object.freeze(['verified', 'partially_funded']);
 
 /**
  * Valid state transitions
@@ -69,12 +118,27 @@ function normalizeTransitionReason(reason) {
 }
 
 /**
- * Validates if a state is a valid invoice state
- * 
- * @param {string} state State to validate
- * @returns {boolean} True if valid
+ * Validates whether a string is a recognized invoice status (approval or
+ * funding-progress vocabulary).
+ *
+ * @param {string} state - Status value to check.
+ * @returns {boolean} `true` when the value is in {@link ALL_INVOICE_STATUSES}.
  */
 function isValidState(state) {
+  return ALL_INVOICE_STATUSES.includes(state);
+}
+
+/**
+ * Validates whether a status belongs to the approval/escrow lifecycle managed
+ * by this state machine (i.e. is a key in {@link INVOICE_STATES}).
+ *
+ * Use this when you need to distinguish lifecycle states from funding-progress
+ * overlay values.
+ *
+ * @param {string} state - Status value to check.
+ * @returns {boolean} `true` when the value is a lifecycle state.
+ */
+function isLifecycleState(state) {
   return Object.values(INVOICE_STATES).includes(state);
 }
 
@@ -397,9 +461,12 @@ function canLinkToEscrow(invoice) {
 
 module.exports = {
   INVOICE_STATES,
+  ALL_INVOICE_STATUSES,
+  INVESTABLE_STATUSES,
   VALID_TRANSITIONS,
   TERMINAL_STATES,
   isValidState,
+  isLifecycleState,
   isTransitionAllowed,
   isTerminalState,
   getAllowedTransitions,
