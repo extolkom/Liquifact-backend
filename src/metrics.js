@@ -427,6 +427,39 @@ const escrowReconciliationMismatches = new client.Counter({
 });
 
 /**
+ * Gauge: Count of mismatched invoices from the most recent reconciliation run.
+ * Updated after each performReconciliation run completes.
+ * @type {import('prom-client').Gauge}
+ */
+const escrowReconciliationMismatchedInvoicesGauge = new client.Gauge({
+  name: 'escrow_reconciliation_mismatched_invoices',
+  help: 'Number of mismatched invoices from the most recent reconciliation run',
+  registers: [registry],
+});
+
+/**
+ * Gauge: Total absolute drift magnitude (sum of |DB - onChain|) from the most
+ * recent reconciliation run. Higher values indicate larger financial discrepancies.
+ * @type {import('prom-client').Gauge}
+ */
+const escrowReconciliationDriftMagnitudeGauge = new client.Gauge({
+  name: 'escrow_reconciliation_drift_magnitude',
+  help: 'Total absolute drift magnitude from the most recent reconciliation run',
+  registers: [registry],
+});
+
+/**
+ * Counter: Reconciliation runs that breached the configured drift threshold.
+ * Incremented when mismatches >= RECONCILIATION_DRIFT_THRESHOLD.
+ * @type {import('prom-client').Counter}
+ */
+const escrowReconciliationDriftAlertsTotal = new client.Counter({
+  name: 'escrow_reconciliation_drift_alerts_total',
+  help: 'Total number of reconciliation runs that breached the drift threshold',
+  registers: [registry],
+});
+
+/**
  * Counter: Maturity reminder email delivery attempts.
  * Incremented for each attempt to send a maturity reminder email (including retries).
  * @type {import('prom-client').Counter}
@@ -538,4 +571,8 @@ module.exports = {
   refreshMetrics,
   resetMetricsForTests,
   bodySizeLimitRejectionsTotal,
+  escrowReconciliationMismatches,
+  escrowReconciliationMismatchedInvoicesGauge,
+  escrowReconciliationDriftMagnitudeGauge,
+  escrowReconciliationDriftAlertsTotal,
 };
