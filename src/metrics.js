@@ -139,7 +139,7 @@ function refreshMetrics() {
         queueLength += Number(stats.queueLength || 0);
         retryQueueLength += Number(stats.retryQueueLength || 0);
       }
-    } catch (err) {
+    } catch (_err) {
       // Preserve existing metrics if a registered queue becomes invalid.
     }
   }
@@ -151,7 +151,7 @@ function refreshMetrics() {
       if (stats && typeof stats.processingCount === 'number') {
         workerInFlight += stats.processingCount;
       }
-    } catch (err) {
+    } catch (_err) {
       // Preserve existing metrics if a registered worker becomes invalid.
     }
   }
@@ -174,6 +174,10 @@ function refreshMetrics() {
     `liquifact_worker_inflight_count ${workerInFlight}\n`;
 }
 
+/**
+ * Starts the metrics refresh interval timer if not already running.
+ * @returns {void}
+ */
 function startMetricsRefresh() {
   if (refreshTimer) {
     return;
@@ -185,6 +189,10 @@ function startMetricsRefresh() {
   }
 }
 
+/**
+ * Stops the metrics refresh interval timer.
+ * @returns {void}
+ */
 function stopMetricsRefresh() {
   if (!refreshTimer) {
     return;
@@ -232,6 +240,10 @@ function registerWorker(worker) {
   startMetricsRefresh();
 }
 
+/**
+ * Resets all registered job queues and workers for test isolation.
+ * @returns {void}
+ */
 function resetMetricsForTests() {
   registeredJobQueues.clear();
   registeredWorkers.clear();
@@ -528,7 +540,7 @@ function incrementMetric(name, labels = {}) {
       });
     }
     metric.inc(labels);
-  } catch (err) {
+  } catch (_err) {
     // Silently ignore or log error
   }
 }

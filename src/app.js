@@ -52,6 +52,7 @@ const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
 const adminEscrowRoutes = require('./routes/adminEscrow');
 const kycRoutes = require('./routes/kyc');
 const v1Routes = require('./routes/v1');
+const reconciliationRoutes = require('./routes/reconciliation');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.

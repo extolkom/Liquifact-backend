@@ -32,7 +32,7 @@ function isValidStellarContractId(contractId) {
   }
   try {
     return StrKey.isValidContractId(contractId);
-  } catch (err) {
+  } catch (_err) {
     return false;
   }
 }
