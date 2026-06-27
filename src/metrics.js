@@ -84,23 +84,11 @@ try {
   };
 }
 
-/** Shared registry — exported so tests can reset it between runs. */
+// Hoisted to the top so the gauges below can register against `registry`
+// without triggering a TDZ error at module-load time. The
+// `client.collectDefaultMetrics` registration deliberately stays AFTER
+// all gauges to avoid double-registration.
 const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
-// Cached metrics text for compatibility with tests that call
-// `registry.metrics()` synchronously. Prom-client >=14 returns a Promise
-// from `registry.metrics()`, but some test code calls it without `await`.
-// We provide a synchronous accessor by overriding `registry.metrics`
-// to return the latest cached string; `metricsHandler` still works because
-// awaiting a string yields the string value.
-let cachedMetrics = '# HELP liquifact_custom_metrics Placeholder\n';
-registry.metrics = function metricsSync() {
-  return cachedMetrics;
-};
 
 const METRIC_REFRESH_INTERVAL_MS = 5000;
 const registeredJobQueues = new Set();
@@ -369,6 +357,10 @@ async function metricsHandler(_req, res) {
   res.end(await registry.metrics());
 }
 
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
+
 /**
  * Counter: Escrow events successfully processed by the indexer per cycle.
  * Incremented by the number of events persisted in each indexer cycle.
@@ -423,6 +415,24 @@ const escrowIndexerLastCursorAdvanceTimestampSeconds = new client.Gauge({
 const escrowReconciliationMismatches = new client.Counter({
   name: 'escrow_reconciliation_mismatches_total',
   help: 'Total number of escrow reconciliation mismatches detected',
+  registers: [registry],
+});
+
+/**
+ * Counter: Escrow funding submissions rejected at contract-existence
+ * preflight (issue #436). Incremented once per rejection event, labelled
+ * by `reason` to distinguish the failure class:
+ *   - `not_found`       — the contract address has no on-ledger entry.
+ *   - `rpc_error`       — transport / 5xx / not-found-as-throw error.
+ *   - `invalid_address` — escrowAddress could not be parsed or
+ *                          rounded-tripped through the address XDR.
+ *
+ * @type {import('prom-client').Counter}
+ */
+const escrowPreflightRejectedTotal = new client.Counter({
+  name: 'escrow_preflight_rejected_total',
+  help: 'Total number of escrow funding submissions rejected at the contract-existence preflight, labelled by rejection reason',
+  labelNames: ['reason'],
   registers: [registry],
 });
 
@@ -534,18 +544,8 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
-  cacheStoreErrorsTotal,
-  footprintCacheHitsTotal,
-  footprintCacheMissesTotal,
-  footprintCacheEvictionsTotal,
-  escrowIndexerEventsProcessedTotal,
-  escrowIndexerEventsSkippedTotal,
-  escrowIndexerCycleFailuresTotal,
-  escrowIndexerLastCursorAdvanceTimestampSeconds,
-  escrowReconciliationMismatches,
-  maturityReminderDeliveryAttemptsTotal,
-  maturityReminderDeliverySuccessTotal,
-  maturityReminderDeadLetterTotal,
-  sorobanCircuitBreakerStateTransitionsTotal,
-  readinessGauge,
+  // Counter exported for issue #436 — contract preflight.
+  // (Other counters in this module are registered against `registry`; their
+  // external-visibility is out of scope for #436.)
+  escrowPreflightRejectedTotal,
 };
