@@ -69,13 +69,13 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "enable": true,
-        "expr": "ALERTS{alertname=\"BodySizeLimitRejectionRateWarning\"}",
+        "expr": "ALERTS{alertname=\"BodySizeLimitRejectionRateHigh\"}",
         "iconColor": "rgba(237, 129, 40, 0.89)",
-        "name": "BodySizeLimitRejectionRateWarning",
+        "name": "BodySizeLimitRejectionRateHigh",
         "showIn": 0,
         "titleFormat": "Warning alert firing",
         "tagKeys": "alertname,severity",
-        "textFormat": "Rate: {{ $labels.severity }} — {{ humanize $value }}/s"
+        "textFormat": "Severity: {{ $labels.severity }} — alertname: {{ $labels.alertname }}"
       },
       {
         "datasource": {
@@ -89,7 +89,7 @@
         "showIn": 0,
         "titleFormat": "Critical alert firing",
         "tagKeys": "alertname,severity",
-        "textFormat": "Rate: {{ $labels.severity }} — {{ humanize $value }}/s"
+        "textFormat": "Severity: {{ $labels.severity }} — alertname: {{ $labels.alertname }}"
       },
       {
         "datasource": {
