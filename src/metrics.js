@@ -84,10 +84,23 @@ try {
   };
 }
 
-// Hoisted so the gauges below can register against it without a TDZ error.
-// The `client.collectDefaultMetrics` registration deliberately stays AFTER
-// all gauges to ensure they're not double-registered.
+/** Shared registry — exported so tests can reset it between runs. */
 const registry = new client.Registry();
+
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
+
+// Cached metrics text for compatibility with tests that call
+// `registry.metrics()` synchronously. Prom-client >=14 returns a Promise
+// from `registry.metrics()`, but some test code calls it without `await`.
+// We provide a synchronous accessor by overriding `registry.metrics`
+// to return the latest cached string; `metricsHandler` still works because
+// awaiting a string yields the string value.
+let cachedMetrics = '# HELP liquifact_custom_metrics Placeholder\n';
+registry.metrics = function metricsSync() {
+  return cachedMetrics;
+};
 
 const METRIC_REFRESH_INTERVAL_MS = 5000;
 const registeredJobQueues = new Set();
@@ -112,55 +125,82 @@ const workerInFlightGauge = new client.Gauge({
   registers: [registry],
 });
 
-// Cached metrics text for compatibility with tests that call
-// `registry.metrics()` synchronously. Prom-client >=14 returns a Promise
-// from `registry.metrics()`, but some test code calls it without `await`.
-// We provide a synchronous accessor by overriding `registry.metrics`
-// to return the latest cached string; `metricsHandler` still works because
-// awaiting a string yields the string value.
-let cachedMetrics = '# HELP liquifact_custom_metrics Placeholder\n';
-registry.metrics = function metricsSync() {
-  return cachedMetrics;
-};
-
 /**
  * Bounded enum of allowed `job_type` label values.
  * Add new job types here when introducing new background job kinds.
  */
 const JOB_TYPE_ENUM = Object.freeze(['maturity_reminder', 'unknown']);
 
-/**
- * Maps a raw error/reason string to a bounded Prometheus label value.
- *
- * Mapping table:
- * - Contains "timeout" (case-insensitive) → `smtp_timeout`
- * - Contains "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", or "connect" (case-insensitive) → `smtp_timeout`
- * - Contains "reject", "550", "551", "552", "553", "554" → `smtp_reject`
- * - Contains "4xx" SMTP temporary failures ("421", "450", "451", "452") → `smtp_reject`
- * - Contains "template" (case-insensitive) → `template_error`
- * - Anything else, empty, null, or non-string → `unknown`
- *
- * PII guarantee: this function only pattern-matches; it never includes the
- * raw string in the returned label, so no recipient address or invoice
- * content can leak into Prometheus label values.
- *
- * @param {unknown} raw - Raw error message, reason string, or Error object.
- * @returns {'smtp_timeout'|'smtp_reject'|'template_error'|'unknown'} Bounded label value.
- */
-function normalizeReminderReason(raw) {
-  const str = raw instanceof Error ? raw.message : typeof raw === 'string' ? raw : '';
-  if (!str) { return 'unknown'; }
+  for (const queue of registeredJobQueues) {
+    try {
+      const stats = queue.getStats();
+      if (stats) {
+        queueLength += Number(stats.queueLength || 0);
+        retryQueueLength += Number(stats.retryQueueLength || 0);
+      }
+    } catch (_err) {
+      // Preserve existing metrics if a registered queue becomes invalid.
+    }
+  }
 
-  if (/timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|connect/i.test(str)) {
-    return 'smtp_timeout';
+  let workerInFlight = 0;
+  for (const worker of registeredWorkers) {
+    try {
+      const stats = worker.getStats();
+      if (stats && typeof stats.processingCount === 'number') {
+        workerInFlight += stats.processingCount;
+      }
+    } catch (_err) {
+      // Preserve existing metrics if a registered worker becomes invalid.
+    }
   }
-  if (/reject|55[0-4]|42[0-9]|EAUTH/i.test(str)) {
-    return 'smtp_reject';
+
+  queueDepthGauge.set(queueLength);
+  retryQueueSizeGauge.set(retryQueueLength);
+  workerInFlightGauge.set(workerInFlight);
+
+  // Build a minimal Prometheus text exposition that includes our gauges.
+  // Keep labels bounded and avoid including payloads or per-job ids.
+  cachedMetrics = '' +
+    '# HELP liquifact_job_queue_depth Number of pending jobs waiting in queues\n' +
+    '# TYPE liquifact_job_queue_depth gauge\n' +
+    `liquifact_job_queue_depth ${queueLength}\n` +
+    '# HELP liquifact_job_retry_queue_size Number of jobs waiting in retry queues\n' +
+    '# TYPE liquifact_job_retry_queue_size gauge\n' +
+    `liquifact_job_retry_queue_size ${retryQueueLength}\n` +
+    '# HELP liquifact_worker_inflight_count Number of jobs currently being processed\n' +
+    '# TYPE liquifact_worker_inflight_count gauge\n' +
+    `liquifact_worker_inflight_count ${workerInFlight}\n`;
+}
+
+/**
+ * Start the periodic metrics refresh interval.
+ * Each tick calls {@link refreshMetrics} and updates the cached text
+ * exposition for synchronous consumers.
+ * @returns {void}
+ */
+function startMetricsRefresh() {
+  if (refreshTimer) {
+    return;
   }
-  if (/template/i.test(str)) {
-    return 'template_error';
+
+  refreshTimer = setInterval(refreshMetrics, METRIC_REFRESH_INTERVAL_MS);
+  if (typeof refreshTimer.unref === 'function') {
+    refreshTimer.unref();
   }
-  return 'unknown';
+}
+
+/**
+ * Stop the periodic metrics refresh interval.
+ * @returns {void}
+ */
+function stopMetricsRefresh() {
+  if (!refreshTimer) {
+    return;
+  }
+
+  clearInterval(refreshTimer);
+  refreshTimer = null;
 }
 
 /**
@@ -198,8 +238,25 @@ const maturityReminderDeadLetterTotal = new client.Counter({
   registers: [],
 });
 
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
+  registeredWorkers.add(worker);
+  refreshMetrics();
+  startMetricsRefresh();
+}
+
+/**
+ * Reset all metric state for test isolation.
+ * Clears registered queues/workers, zeros gauges, and stops the refresh
+ * timer so a subsequent test starts from a clean slate.
+ * @returns {void}
+ */
+function resetMetricsForTests() {
+  registeredJobQueues.clear();
+  registeredWorkers.clear();
+  queueDepthGauge.set(0);
+  retryQueueSizeGauge.set(0);
+  workerInFlightGauge.set(0);
+  stopMetricsRefresh();
+}
 
 /**
  * Constant-time string comparison to prevent timing attacks.
@@ -310,10 +367,6 @@ function metricsAuth(req, res, next) {
 async function metricsHandler(_req, res) {
   res.set('Content-Type', registry.contentType);
   res.end(await registry.metrics());
-}
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
 }
 
 /**
@@ -462,14 +515,37 @@ const readinessGauge = new client.Gauge({
   registers: [registry],
 });
 
+/**
+ * Counter: Cache store read/write errors that fail open.
+ * Incremented when cache store get/set/delByPrefix throws.
+ * @type {import('prom-client').Counter}
+ */
+const cacheStoreErrorsTotal = new client.Counter({
+  name: 'cache_store_errors_total',
+  help: 'Total number of cache store errors (get/set/invalidate) that fail open',
+  registers: [registry],
+});
+
 module.exports = {
   registry,
   metricsAuth,
   metricsHandler,
-  normalizeReminderReason,
-  normalizeJobType,
+  registerJobQueue,
+  registerWorker,
+  refreshMetrics,
+  resetMetricsForTests,
+  cacheStoreErrorsTotal,
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+  escrowIndexerEventsProcessedTotal,
+  escrowIndexerEventsSkippedTotal,
+  escrowIndexerCycleFailuresTotal,
+  escrowIndexerLastCursorAdvanceTimestampSeconds,
+  escrowReconciliationMismatches,
   maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
   maturityReminderDeadLetterTotal,
-  REMINDER_REASON_ENUM,
-  JOB_TYPE_ENUM,
+  sorobanCircuitBreakerStateTransitionsTotal,
+  readinessGauge,
 };
