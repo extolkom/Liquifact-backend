@@ -16,8 +16,12 @@ Applied in this order before any route handler runs:
 | 3 | URL-encoded body limit | Form payloads (50 KB) |
 | 4 | Security headers (`createSecurityMiddleware`) | Helmet-style hardening |
 | 5 | Audit middleware | Structured request audit trail |
-| 6 | Request ID | Propagates `req.id` for logging |
+| 6 | Request ID | Validates and propagates `req.id` for logging; only `X-Request-Id`/`X-Request-ID` values matching `[A-Za-z0-9._-]{1,128}` are trusted, otherwise a fresh UUID is generated and echoed back in the response header |
 | 7 | Correlation ID | Cross-service trace correlation |
+
+## Request ID header contract
+
+The request ID middleware accepts a client-supplied header only when it is a non-empty string of at most 128 characters and contains only the safe characters `[A-Za-z0-9._-]`. Values with control characters, newlines, whitespace, or other disallowed bytes are rejected and replaced with a server-generated UUID. The sanitized value is then attached to `req.id`, propagated into child loggers, and echoed in the `X-Request-Id` response header.
 
 ## Inline routes (defined on `app` directly)
 

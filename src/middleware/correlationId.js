@@ -1,3 +1,5 @@
+'use strict';
+
 const { randomUUID } = require('crypto');
 const { createRequestLogger } = require('../logger');
 
@@ -14,10 +16,13 @@ const CORRELATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
  */
 function correlationIdMiddleware(req, res, next) {
   const candidate = req.header(CORRELATION_HEADER);
+  // Fallback uses the full UUID (no truncation) so the generated id keeps its
+  // full entropy, matching the strength of the requestId middleware fallback.
+  // `req_` + 32 hex chars = 36 chars, within the accepted {8,64} bound.
   const correlationId =
     typeof candidate === 'string' && CORRELATION_ID_PATTERN.test(candidate)
       ? candidate
-      : `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+      : `req_${randomUUID().replace(/-/g, '')}`;
 
   req.correlationId = correlationId;
   req.log = createRequestLogger(req);
