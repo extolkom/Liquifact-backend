@@ -27,6 +27,7 @@ const { legalHoldGate } = require('../middleware/legalHoldGate');
 const { resolveEscrowAddress, EscrowNotFoundError } = require('../config/escrowMap');
 const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmit');
 const { persistCommitment } = require('../services/investorCommitment');
+const { listOpportunities } = require('../services/investService');
 const idempotencyMiddleware = require('../middleware/idempotency');
 const { isValidStellarAddress } = require('../utils/stellarAddress');
 
@@ -97,7 +98,7 @@ router.post(
   '/fund-invoice',
   requireKycForFunding,
   idempotencyMiddleware,
-  asyncHandler(async (req, res, next) => {
+  asyncHandler(async (req, res) => {
     // 1. Input validation
     const validationErrors = validateFundInvoiceBody(req.body);
     if (validationErrors.length > 0) {
@@ -118,13 +119,17 @@ router.post(
     const gateHandler = legalHoldGate();
     await new Promise((resolve, reject) => {
       gateHandler(req, res, (err) => {
-        if (err) return reject(err);
+        if (err) {
+          return reject(err);
+        }
         resolve();
       });
     });
 
     // If the gate intercepted the response (e.g., returned a 423), stop execution processing immediately
-    if (res.headersSent) return;
+    if (res.headersSent) {
+      return;
+    }
 
     // 3. Resolve the escrow contract address
     let escrowAddress;
