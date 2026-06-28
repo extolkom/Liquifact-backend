@@ -181,8 +181,31 @@ The application exposes Prometheus metrics on `GET /metrics` (subject to the sam
 - `liquifact_job_queue_depth`: Number of pending jobs currently waiting in background queues (includes main queue across registered job queues).
 - `liquifact_job_retry_queue_size`: Number of jobs currently waiting in retry queues across registered job queues.
 - `liquifact_worker_inflight_count`: Number of jobs currently being processed by registered background workers.
+- `soroban_rpc_call_duration_seconds`: Histogram of end-to-end Soroban RPC wrapper latency, labelled by bounded `method` and `outcome` values. The timing includes retry delays because it measures the full `callSorobanContract()` wrapper path.
+- `soroban_rpc_retry_causes_total`: Counter of Soroban retry attempts, labelled by bounded `cause` values (`timeout`, `429`, `5xx`, `unknown`).
 
 These gauges are updated by sampling registered `JobQueue` and `BackgroundWorker` instances and are intentionally bounded to avoid high-cardinality labels.
+
+Soroban metric labels are intentionally coarse and bounded:
+
+- `method` is normalized to a small allowlist of method families such as `contract_call`, `simulate_transaction`, and `get_ledger_entries`. Unknown or untrusted values are collapsed to `unknown`.
+- `outcome` is limited to `success`, `error`, or `circuit_open`.
+- `cause` is limited to `timeout`, `429`, `5xx`, or `unknown`.
+
+No request payloads, contract arguments, presigned URLs, bearer tokens, or other secrets are included in metric labels.
+
+Example PromQL:
+
+```promql
+# 95th percentile end-to-end Soroban latency by method
+histogram_quantile(
+  0.95,
+  sum(rate(soroban_rpc_call_duration_seconds_bucket[5m])) by (le, method)
+)
+
+# Retry rate by retry cause
+sum(rate(soroban_rpc_retry_causes_total[5m])) by (cause)
+```
 
 ### Body-size limit rejection metrics
 

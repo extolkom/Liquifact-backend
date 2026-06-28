@@ -31,6 +31,78 @@ function getMetrics() {
 }
 
 /**
+ * Resolves a bounded Soroban RPC method label from config or operation hints.
+ *
+ * Raw values are normalized through `src/metrics.js` so labels stay bounded
+ * and never include payloads, contract IDs, or other request-specific data.
+ *
+ * @param {Function} operation - Wrapped Soroban operation.
+ * @param {object} [config] - Optional retry / metric config.
+ * @returns {string} Bounded metric label value.
+ */
+function getSorobanMetricMethod(operation, config) {
+  const metrics = getMetrics();
+  const rawMethod = (config && (config.metricMethod || config.method || config.rpcMethod))
+    || operation.metricMethod
+    || operation.sorobanMethod
+    || operation.name;
+
+  if (metrics && typeof metrics.normalizeSorobanRpcMethod === 'function') {
+    return metrics.normalizeSorobanRpcMethod(rawMethod);
+  }
+
+  return 'unknown';
+}
+
+/**
+ * Maps a Soroban error classification to a bounded retry-cause metric label.
+ *
+ * @param {SorobanErrorClassification} classification - Retry classification.
+ * @returns {string} Bounded retry-cause label.
+ */
+function getRetryCauseLabel(classification) {
+  if (!classification || !classification.retryable) {
+    return 'unknown';
+  }
+
+  if (classification.category === 'rate-limit') {
+    return '429';
+  }
+
+  if (classification.category === 'rpc-5xx') {
+    return '5xx';
+  }
+
+  if (
+    classification.reason === 'network-code:ETIMEDOUT' ||
+    classification.reason === 'message:timeout'
+  ) {
+    return 'timeout';
+  }
+
+  return 'unknown';
+}
+
+/**
+ * Maps a thrown error to a bounded Soroban outcome label.
+ *
+ * @param {unknown} err - Error thrown by the wrapped call.
+ * @returns {string} Bounded outcome label.
+ */
+function getSorobanOutcomeLabel(err) {
+  const metrics = getMetrics();
+  const rawOutcome = err && typeof err === 'object' && err.code === 'CIRCUIT_OPEN'
+    ? 'circuit_open'
+    : 'error';
+
+  if (metrics && typeof metrics.normalizeSorobanRpcOutcome === 'function') {
+    return metrics.normalizeSorobanRpcOutcome(rawOutcome);
+  }
+
+  return rawOutcome;
+}
+
+/**
  * Retry configuration used for all Soroban contract calls.
  *
  * @constant {Object} SOROBAN_RETRY_CONFIG
@@ -284,8 +356,9 @@ async function withRetry(operation, config) {
       return await operation();
     } catch (err) {
       lastErr = err;
+      const classification = classifySorobanError(err);
       const isLast = attempt === maxRetries;
-      if (isLast || !isRetryable(err)) {
+      if (isLast || !classification.retryable) {
         throw err;
       }
 
@@ -296,6 +369,14 @@ async function withRetry(operation, config) {
           metrics.sorobanRetryBudgetExhaustedTotal.inc();
         }
         throw err;
+      }
+
+      const metrics = getMetrics();
+      if (metrics && metrics.sorobanRpcRetryCausesTotal) {
+        const cause = typeof metrics.normalizeSorobanRetryCause === 'function'
+          ? metrics.normalizeSorobanRetryCause(getRetryCauseLabel(classification))
+          : getRetryCauseLabel(classification);
+        metrics.sorobanRpcRetryCausesTotal.labels({ cause }).inc();
       }
 
       const delay = computeBackoff(attempt, cfg.baseDelay, cfg.maxDelay);
@@ -325,7 +406,24 @@ async function withRetry(operation, config) {
  */
 async function callSorobanContract(operation, config) {
   const cfg = config ? { ...SOROBAN_RETRY_CONFIG, ...config } : SOROBAN_RETRY_CONFIG;
-  return sharedBreaker.execute(() => withRetry(operation, cfg));
+  const metrics = getMetrics();
+  const method = getSorobanMetricMethod(operation, cfg);
+  const endTimer = metrics && metrics.sorobanRpcCallDurationSeconds
+    ? metrics.sorobanRpcCallDurationSeconds.startTimer({ method })
+    : null;
+
+  try {
+    const result = await sharedBreaker.execute(() => withRetry(operation, cfg));
+    if (typeof endTimer === 'function') {
+      endTimer({ outcome: 'success' });
+    }
+    return result;
+  } catch (err) {
+    if (typeof endTimer === 'function') {
+      endTimer({ outcome: getSorobanOutcomeLabel(err) });
+    }
+    throw err;
+  }
 }
 
 module.exports = {
@@ -340,4 +438,7 @@ module.exports = {
   RETRYABLE_STATUS_CODES,
   SOROBAN_RETRY_CONFIG,
   sharedBreaker,
+  getRetryCauseLabel,
+  getSorobanMetricMethod,
+  getSorobanOutcomeLabel,
 };

@@ -46,10 +46,33 @@ try {
    * @implements {import('prom-client').Registry}
    */
   class RegistryShim {
-    /** @param {void} */
     constructor() {
       this.contentType = 'text/plain';
-      this._items = [];
+      this._items = new Map();
+    }
+    /**
+     * @param {object} metric - Metric instance to register.
+     * @returns {void}
+     */
+    registerMetric(metric) {
+      if (metric && metric.name) {
+        this._items.set(metric.name, metric);
+      }
+    }
+    /**
+     * @param {string} name - Metric name.
+     * @returns {object|undefined}
+     */
+    getSingleMetric(name) {
+      return this._items.get(name);
+    }
+    /** @returns {void} */
+    resetMetrics() {
+      for (const metric of this._items.values()) {
+        if (metric && typeof metric.reset === 'function') {
+          metric.reset();
+        }
+      }
     }
     /** @returns {string} */
     metrics() {
@@ -58,27 +81,175 @@ try {
   }
 
   /**
+   * Minimal labelled metric shim with Prometheus-like helpers.
+   */
+  class LabelledMetricShim {
+    /**
+     * @param {object} [config]
+     * @param {string} [config.name]
+     * @param {string[]} [config.labelNames]
+     * @param {RegistryShim[]} [config.registers]
+     */
+    constructor(config = {}) {
+      this.name = config.name || 'metric';
+      this.labelNames = Array.isArray(config.labelNames) ? config.labelNames : [];
+      this.hashMap = {};
+
+      const registers = Array.isArray(config.registers) ? config.registers : [];
+      for (const register of registers) {
+        if (register && typeof register.registerMetric === 'function') {
+          register.registerMetric(this);
+        }
+      }
+    }
+    /**
+     * @param {unknown[]|object} args - Raw label arguments.
+     * @returns {Record<string, string>}
+     */
+    _normalizeLabels(args) {
+      if (args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+        const labels = {};
+        for (const key of this.labelNames) {
+          labels[key] = String(args[0][key] || '');
+        }
+        return labels;
+      }
+
+      const labels = {};
+      for (let i = 0; i < this.labelNames.length; i++) {
+        labels[this.labelNames[i]] = String(args[i] || '');
+      }
+      return labels;
+    }
+    /**
+     * @param {Record<string, string>} labels - Normalized label map.
+     * @returns {string}
+     */
+    _hashKey(labels) {
+      return JSON.stringify(labels);
+    }
+    /**
+     * @param {Record<string, string>} labels - Normalized label map.
+     * @returns {{ labels: Record<string, string>, value: number }}
+     */
+    _getOrCreateEntry(labels) {
+      const key = this._hashKey(labels);
+      if (!this.hashMap[key]) {
+        this.hashMap[key] = {
+          labels,
+          value: 0,
+        };
+      }
+      return this.hashMap[key];
+    }
+    /**
+     * @param {...unknown} values - Positional or object labels.
+     * @returns {object}
+     */
+    labels(...values) {
+      const labels = this._normalizeLabels(values);
+      return {
+        inc: (value) => this.inc(labels, value),
+        set: (value) => this.set(labels, value),
+        observe: (value) => this.observe(labels, value),
+        startTimer: () => this.startTimer(labels),
+      };
+    }
+    /**
+     * @param {Record<string, string>} [labels={}] - Label set to inspect.
+     * @returns {number}
+     */
+    get(labels = {}) {
+      const entry = this.hashMap[this._hashKey(labels)];
+      return entry ? entry.value : 0;
+    }
+    /** @returns {void} */
+    reset() {
+      this.hashMap = {};
+    }
+  }
+
+  /**
    * Counter shim for test environments.
    * @implements {import('prom-client').Counter}
    */
-  class CounterShim {
-    /** @param {void} */
-    constructor() {}
-    /** @returns {void} */
-    inc() {}
+  class CounterShim extends LabelledMetricShim {
+    /**
+     * @param {Record<string, string>|number} [labelsOrValue]
+     * @param {number} [maybeValue]
+     * @returns {void}
+     */
+    inc(labelsOrValue, maybeValue) {
+      const hasLabels = labelsOrValue && typeof labelsOrValue === 'object' && !Array.isArray(labelsOrValue);
+      const labels = hasLabels ? labelsOrValue : this._normalizeLabels([]);
+      const value = typeof labelsOrValue === 'number'
+        ? labelsOrValue
+        : typeof maybeValue === 'number'
+          ? maybeValue
+          : 1;
+      const entry = this._getOrCreateEntry(labels);
+      entry.value += value;
+    }
   }
 
   /**
    * Gauge shim for test environments.
    * @implements {import('prom-client').Gauge}
    */
-  class GaugeShim {
-    /** @param {void} */
-    constructor() {}
+  class GaugeShim extends LabelledMetricShim {
+    /**
+     * @param {Record<string, string>|number} [labelsOrValue]
+     * @param {number} [maybeValue]
+     * @returns {void}
+     */
+    set(labelsOrValue, maybeValue) {
+      const hasLabels = labelsOrValue && typeof labelsOrValue === 'object' && !Array.isArray(labelsOrValue);
+      const labels = hasLabels ? labelsOrValue : this._normalizeLabels([]);
+      const value = hasLabels ? Number(maybeValue || 0) : Number(labelsOrValue || 0);
+      const entry = this._getOrCreateEntry(labels);
+      entry.value = value;
+    }
+    /**
+     * @param {Record<string, string>} [labels]
+     * @returns {void}
+     */
+    setToCurrentTime(labels) {
+      this.set(labels || this._normalizeLabels([]), Date.now() / 1000);
+    }
+  }
+
+  /**
+   * Histogram shim for test environments.
+   * @implements {import('prom-client').Histogram}
+   */
+  class HistogramShim extends LabelledMetricShim {
+    /**
+     * @param {object} [config]
+     */
+    constructor(config = {}) {
+      super(config);
+      this.buckets = Array.isArray(config.buckets) ? config.buckets : [];
+    }
     /** @returns {void} */
-    set() {}
-    /** @returns {void} */
-    setToCurrentTime() {}
+    observe(labelsOrValue, maybeValue) {
+      const hasLabels = labelsOrValue && typeof labelsOrValue === 'object' && !Array.isArray(labelsOrValue);
+      const labels = hasLabels ? labelsOrValue : this._normalizeLabels([]);
+      const value = hasLabels ? Number(maybeValue || 0) : Number(labelsOrValue || 0);
+      const entry = this._getOrCreateEntry(labels);
+      entry.value += value;
+    }
+    /**
+     * @param {Record<string, string>} [labels={}]
+     * @returns {(extraLabels?: Record<string, string>) => number}
+     */
+    startTimer(labels = {}) {
+      const start = Date.now();
+      return (extraLabels = {}) => {
+        const seconds = (Date.now() - start) / 1000;
+        this.observe(Object.assign({}, labels, extraLabels), seconds);
+        return seconds;
+      };
+    }
   }
 
   client = {
@@ -90,6 +261,7 @@ try {
     collectDefaultMetrics: () => { },
     Counter: CounterShim,
     Gauge: GaugeShim,
+    Histogram: HistogramShim,
   };
 }
 
@@ -163,6 +335,43 @@ const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
   'failure',
   'not_found',
   'already_resolved',
+]);
+
+/**
+ * Bounded enum of allowed Soroban RPC method label values.
+ * Only stable, coarse method families are permitted to avoid leaking payloads
+ * or introducing unbounded label cardinality.
+ * @readonly
+ */
+const SOROBAN_RPC_METHOD_ENUM = Object.freeze([
+  'contract_call',
+  'simulate_transaction',
+  'get_ledger_entries',
+  'token_metadata',
+  'legal_hold_status',
+  'schema_version',
+  'unknown',
+]);
+
+/**
+ * Bounded enum of allowed Soroban RPC outcome label values.
+ * @readonly
+ */
+const SOROBAN_RPC_OUTCOME_ENUM = Object.freeze([
+  'success',
+  'error',
+  'circuit_open',
+]);
+
+/**
+ * Bounded enum of allowed Soroban retry cause label values.
+ * @readonly
+ */
+const SOROBAN_RETRY_CAUSE_ENUM = Object.freeze([
+  'timeout',
+  '429',
+  '5xx',
+  'unknown',
 ]);
 
 /**
@@ -287,6 +496,69 @@ function stopMetricsRefresh() {
 function normalizeJobType(raw) {
   const str = typeof raw === 'string' ? raw : '';
   return JOB_TYPE_ENUM.includes(str) ? str : 'unknown';
+}
+
+/**
+ * Maps a raw Soroban RPC method identifier to a bounded metric label value.
+ *
+ * Raw method names may come from config, wrapper names, or internal call-site
+ * hints. Unknown values are collapsed to `unknown` to keep label cardinality
+ * bounded and to prevent request-specific data from surfacing in metrics.
+ *
+ * @param {unknown} raw - Raw method identifier.
+ * @returns {string} Bounded label value from {@link SOROBAN_RPC_METHOD_ENUM}.
+ */
+function normalizeSorobanRpcMethod(raw) {
+  const str = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  const methodAliases = {
+    contract_call: 'contract_call',
+    callsorobancontract: 'contract_call',
+    invoke_contract: 'contract_call',
+    invokecontract: 'contract_call',
+    simulate_transaction: 'simulate_transaction',
+    simulatetransaction: 'simulate_transaction',
+    simulation: 'simulate_transaction',
+    get_ledger_entries: 'get_ledger_entries',
+    getledgerentries: 'get_ledger_entries',
+    token_metadata: 'token_metadata',
+    tokenmeta: 'token_metadata',
+    legal_hold_status: 'legal_hold_status',
+    get_legal_hold: 'legal_hold_status',
+    schema_version: 'schema_version',
+    get_schema_version: 'schema_version',
+  };
+  const normalized = methodAliases[str] || 'unknown';
+  return SOROBAN_RPC_METHOD_ENUM.includes(normalized) ? normalized : 'unknown';
+}
+
+/**
+ * Maps a raw Soroban call outcome to a bounded metric label value.
+ *
+ * @param {unknown} raw - Raw outcome identifier or error code.
+ * @returns {string} Bounded label value from {@link SOROBAN_RPC_OUTCOME_ENUM}.
+ */
+function normalizeSorobanRpcOutcome(raw) {
+  const str = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  const outcome = str === 'circuit_open'
+    ? 'circuit_open'
+    : str === 'success'
+      ? 'success'
+      : 'error';
+  return SOROBAN_RPC_OUTCOME_ENUM.includes(outcome) ? outcome : 'error';
+}
+
+/**
+ * Maps a raw Soroban retry classification to a bounded metric label value.
+ *
+ * Accepted inputs are the stable retry buckets emitted by `src/services/soroban.js`:
+ * `timeout`, `429`, `5xx`. Any other value is collapsed to `unknown`.
+ *
+ * @param {unknown} raw - Raw retry cause identifier.
+ * @returns {string} Bounded label value from {@link SOROBAN_RETRY_CAUSE_ENUM}.
+ */
+function normalizeSorobanRetryCause(raw) {
+  const str = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return SOROBAN_RETRY_CAUSE_ENUM.includes(str) ? str : 'unknown';
 }
 
 /**
@@ -541,6 +813,32 @@ const webhookReplayTotal = new client.Counter({
 });
 
 /**
+ * Histogram: End-to-end latency of Soroban RPC wrapper calls, including retry
+ * delays and circuit-breaker handling. Labels remain bounded to coarse method
+ * families and a small set of outcomes.
+ * @type {import('prom-client').Histogram}
+ */
+const sorobanRpcCallDurationSeconds = new client.Histogram({
+  name: 'soroban_rpc_call_duration_seconds',
+  help: 'Latency of Soroban RPC wrapper calls in seconds',
+  labelNames: ['method', 'outcome'],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10],
+  registers: [registry],
+});
+
+/**
+ * Counter: Retry attempts made by Soroban RPC wrappers, labelled by a bounded
+ * retry cause classification. Raw exception messages are never used as labels.
+ * @type {import('prom-client').Counter}
+ */
+const sorobanRpcRetryCausesTotal = new client.Counter({
+  name: 'soroban_rpc_retry_causes_total',
+  help: 'Total number of Soroban RPC retry attempts by retry cause',
+  labelNames: ['cause'],
+  registers: [registry],
+});
+
+/**
  * Registers a job queue for metric collection.
  * @param {object} queue - Queue instance with a getStats() method.
  * @returns {void}
@@ -583,9 +881,14 @@ module.exports = {
   footprintCacheMissesTotal,
   footprintCacheEvictionsTotal,
   sorobanCircuitBreakerStateTransitionsTotal,
+  sorobanRpcCallDurationSeconds,
+  sorobanRpcRetryCausesTotal,
   webhookReplayTotal,
   bodySizeLimitRejectionsTotal,
   normalizeJobType,
+  normalizeSorobanRpcMethod,
+  normalizeSorobanRpcOutcome,
+  normalizeSorobanRetryCause,
   startMetricsRefresh,
   stopMetricsRefresh,
 };
