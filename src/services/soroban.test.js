@@ -1,6 +1,23 @@
-const { callSorobanContract, withRetry, computeBackoff } = require('./soroban');
+const metrics = require('../metrics');
+const {
+  callSorobanContract,
+  withRetry,
+  computeBackoff,
+  sharedBreaker,
+  getRetryCauseLabel,
+} = require('./soroban');
+
+async function getMetricsText() {
+  return metrics.registry.metrics();
+}
 
 describe('Soroban Integration Wrapper', () => {
+  beforeEach(() => {
+    metrics.registry.resetMetrics();
+    sharedBreaker.state = 'CLOSED';
+    sharedBreaker.failureCount = 0;
+    sharedBreaker.nextAttemptTime = 0;
+  });
 
   describe('callSorobanContract', () => {
     it('should execute successfully without retries', async () => {
@@ -27,6 +44,61 @@ describe('Soroban Integration Wrapper', () => {
       expect(operation).toHaveBeenCalledTimes(2);
     });
 
+    it('records a success latency sample with a bounded method label', async () => {
+      const operation = jest.fn().mockResolvedValue('success');
+
+      await callSorobanContract(operation, {
+        maxRetries: 0,
+        baseDelay: 0,
+        maxDelay: 0,
+        metricMethod: 'simulateTransaction',
+      });
+
+      const metricsText = await getMetricsText();
+      expect(metricsText).toMatch(
+        /soroban_rpc_call_duration_seconds_count\{method="simulate_transaction",outcome="success"\} 1/
+      );
+    });
+
+    it('records a circuit_open latency outcome when the breaker fails fast', async () => {
+      sharedBreaker.state = 'OPEN';
+      sharedBreaker.nextAttemptTime = Date.now() + 10000;
+      const operation = jest.fn().mockResolvedValue('never-called');
+
+      await expect(
+        callSorobanContract(operation, {
+          maxRetries: 0,
+          baseDelay: 0,
+          maxDelay: 0,
+          metricMethod: 'contract_call',
+        })
+      ).rejects.toThrow();
+
+      const metricsText = await getMetricsText();
+      expect(operation).not.toHaveBeenCalled();
+      expect(metricsText).toMatch(
+        /soroban_rpc_call_duration_seconds_count\{method="contract_call",outcome="circuit_open"\} 1/
+      );
+    });
+
+    it('collapses untrusted method hints to unknown so secrets do not appear in labels', async () => {
+      const operation = jest.fn().mockResolvedValue('ok');
+      const secretLikeMethod = 'wallet:secret-token-123';
+
+      await callSorobanContract(operation, {
+        maxRetries: 0,
+        baseDelay: 0,
+        maxDelay: 0,
+        metricMethod: secretLikeMethod,
+      });
+
+      const metricsText = await getMetricsText();
+      expect(metricsText).toMatch(
+        /soroban_rpc_call_duration_seconds_count\{method="unknown",outcome="success"\} 1/
+      );
+      expect(metricsText).not.toContain(secretLikeMethod);
+    });
+
     it('should fail immediately on non-transient error', async () => {
       const error = new Error('Invalid arguments');
       const operation = jest.fn().mockRejectedValue(error);
@@ -36,12 +108,6 @@ describe('Soroban Integration Wrapper', () => {
     });
 
     it('should trip the circuit breaker on sustained transient errors', async () => {
-      const { sharedBreaker } = require('./soroban');
-
-      // Reset breaker state for clean test
-      sharedBreaker.state = 'CLOSED';
-      sharedBreaker.failureCount = 0;
-
       const operation = jest.fn().mockImplementation(() => {
         const err = new Error('503 Service Unavailable');
         err.status = 503;
@@ -148,6 +214,43 @@ describe('Soroban Integration Wrapper', () => {
       expect(operation).toHaveBeenCalledTimes(3);
     });
 
+    it.each([
+      ['429', () => {
+        const err = new Error('Too Many Requests');
+        err.status = 429;
+        return err;
+      }],
+      ['5xx', () => {
+        const err = new Error('503 Service Unavailable');
+        err.status = 503;
+        return err;
+      }],
+      ['timeout', () => {
+        const err = new Error('timed out');
+        err.code = 'ETIMEDOUT';
+        return err;
+      }],
+    ])('increments the retry cause counter for %s retries', async (cause, buildError) => {
+      let attempts = 0;
+      const operation = jest.fn().mockImplementation(() => {
+        attempts++;
+        if (attempts === 1) {
+          return Promise.reject(buildError());
+        }
+        return Promise.resolve('ok');
+      });
+
+      await withRetry(operation, {
+        maxRetries: 2,
+        baseDelay: 0,
+        maxDelay: 0,
+        maxElapsedMs: 10000,
+      });
+
+      const metricsText = await getMetricsText();
+      expect(metricsText).toMatch(new RegExp(`soroban_rpc_retry_causes_total\\{cause="${cause}"\\} 1`));
+    });
+
     it('should succeed immediately when operation does not fail', async () => {
       const operation = jest.fn().mockResolvedValue('ok');
 
@@ -184,7 +287,6 @@ describe('Soroban Integration Wrapper', () => {
     });
 
     it('should increment the budget exhausted metric when budget is exceeded', async () => {
-      const metrics = require('../metrics');
       const incSpy = jest.spyOn(metrics.sorobanRetryBudgetExhaustedTotal, 'inc');
 
       const err = new Error('503 Service Unavailable');
@@ -198,6 +300,24 @@ describe('Soroban Integration Wrapper', () => {
       expect(incSpy).toHaveBeenCalledTimes(1);
 
       incSpy.mockRestore();
+    });
+
+    it('does not increment retry cause counters when the budget is exhausted before a retry occurs', async () => {
+      dateNowSpy.mockRestore();
+      const values = [0, 100];
+      let idx = 0;
+      dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => values[idx++]);
+
+      const err = new Error('503 Service Unavailable');
+      err.status = 503;
+      const operation = jest.fn().mockRejectedValue(err);
+
+      await expect(
+        withRetry(operation, { maxRetries: 5, baseDelay: 0, maxDelay: 0, maxElapsedMs: 50 })
+      ).rejects.toThrow('503 Service Unavailable');
+
+      const metricsText = await getMetricsText();
+      expect(metricsText).not.toMatch(/soroban_rpc_retry_causes_total\{cause="5xx"\} 1/);
     });
 
     it('should use default maxElapsedMs from SOROBAN_RETRY_CONFIG when not provided', async () => {
@@ -225,6 +345,13 @@ describe('Soroban Integration Wrapper', () => {
       expect(thrown.message).toBe('Service Temporarily Unavailable');
       expect(thrown.status).toBe(503);
       expect(thrown.code).toBe('SOROBAN_RPC_ERR');
+    });
+
+    it('maps retry classifications to bounded retry-cause labels', () => {
+      expect(getRetryCauseLabel({ retryable: true, category: 'rate-limit', reason: 'status:429' })).toBe('429');
+      expect(getRetryCauseLabel({ retryable: true, category: 'rpc-5xx', reason: 'status:503' })).toBe('5xx');
+      expect(getRetryCauseLabel({ retryable: true, category: 'network', reason: 'network-code:ETIMEDOUT' })).toBe('timeout');
+      expect(getRetryCauseLabel({ retryable: true, category: 'network', reason: 'network-code:ECONNRESET' })).toBe('unknown');
     });
   });
 });

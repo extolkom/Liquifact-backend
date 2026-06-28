@@ -255,6 +255,8 @@ describe('export guard — every module export is defined and valid', () => {
     'cacheStoreErrorsTotal',
     'redisCacheFailOpenTotal',
     'readinessGauge',
+    'sorobanRpcRetryCausesTotal',
+    'sorobanRpcCallDurationSeconds',
   ];
 
   const counterExports = [
@@ -271,11 +273,16 @@ describe('export guard — every module export is defined and valid', () => {
     'sorobanCircuitBreakerStateTransitionsTotal',
     'cacheStoreErrorsTotal',
     'redisCacheFailOpenTotal',
+    'sorobanRpcRetryCausesTotal',
   ];
 
   const gaugeExports = [
     'readinessGauge',
     'escrowIndexerLastCursorAdvanceTimestampSeconds',
+  ];
+
+  const histogramExports = [
+    'sorobanRpcCallDurationSeconds',
   ];
 
   it('every exported metric is defined (not undefined)', () => {
@@ -302,6 +309,13 @@ describe('export guard — every module export is defined and valid', () => {
     }
   });
 
+  it('every histogram export has observe and startTimer methods', () => {
+    for (const key of histogramExports) {
+      expect(typeof metrics[key].observe).toBe('function');
+      expect(typeof metrics[key].startTimer).toBe('function');
+    }
+  });
+
   it('sorobanCircuitBreakerStateTransitionsTotal has expected labelNames', () => {
     const counter = metrics.sorobanCircuitBreakerStateTransitionsTotal;
     expect(counter.labelNames).toBeDefined();
@@ -310,6 +324,41 @@ describe('export guard — every module export is defined and valid', () => {
     expect(names).toContain('from_state');
     expect(names).toContain('to_state');
     expect(names.length).toBe(3);
+  });
+});
+
+describe('Soroban metrics helpers', () => {
+  beforeEach(() => {
+    metrics.registry.resetMetrics();
+  });
+
+  it('exposes bounded label names for Soroban latency histogram', () => {
+    const histogram = metrics.sorobanRpcCallDurationSeconds;
+    expect(histogram.labelNames).toEqual(['method', 'outcome']);
+  });
+
+  it('exposes bounded label names for Soroban retry cause counter', () => {
+    const counter = metrics.sorobanRpcRetryCausesTotal;
+    expect(counter.labelNames).toEqual(['cause']);
+  });
+
+  it('normalizes Soroban RPC methods to bounded values', () => {
+    expect(metrics.normalizeSorobanRpcMethod('simulateTransaction')).toBe('simulate_transaction');
+    expect(metrics.normalizeSorobanRpcMethod('get_legal_hold')).toBe('legal_hold_status');
+    expect(metrics.normalizeSorobanRpcMethod('secret-wallet-123')).toBe('unknown');
+  });
+
+  it('normalizes Soroban retry causes to bounded values', () => {
+    expect(metrics.normalizeSorobanRetryCause('timeout')).toBe('timeout');
+    expect(metrics.normalizeSorobanRetryCause('429')).toBe('429');
+    expect(metrics.normalizeSorobanRetryCause('5xx')).toBe('5xx');
+    expect(metrics.normalizeSorobanRetryCause('ECONNRESET')).toBe('unknown');
+  });
+
+  it('normalizes Soroban outcomes to bounded values', () => {
+    expect(metrics.normalizeSorobanRpcOutcome('success')).toBe('success');
+    expect(metrics.normalizeSorobanRpcOutcome('circuit_open')).toBe('circuit_open');
+    expect(metrics.normalizeSorobanRpcOutcome('payload-secret')).toBe('error');
   });
 });
 
@@ -633,6 +682,34 @@ describe('metricsAuth unit', () => {
       metricsAuth(req, res, next);
       expect(next).toHaveBeenCalled();
       delete process.env.METRICS_BEARER_TOKEN;
+    });
+  });
+});
+
+describe('metrics shim path for Soroban observability', () => {
+  afterEach(() => {
+    jest.resetModules();
+    jest.unmock('prom-client');
+  });
+
+  it('keeps Soroban histogram and retry counter as safe no-ops when prom-client is unavailable', () => {
+    jest.resetModules();
+
+    jest.isolateModules(() => {
+      jest.doMock('prom-client', () => {
+        throw new Error('prom-client unavailable');
+      });
+
+      const shimMetrics = require('../src/metrics');
+
+      expect(() => {
+        shimMetrics.sorobanRpcRetryCausesTotal.labels({ cause: '429' }).inc();
+        const endTimer = shimMetrics.sorobanRpcCallDurationSeconds.startTimer({ method: 'contract_call' });
+        endTimer({ outcome: 'success' });
+      }).not.toThrow();
+
+      expect(shimMetrics.normalizeSorobanRpcMethod('secret-payload')).toBe('unknown');
+      expect(shimMetrics.normalizeSorobanRetryCause('rate-limited')).toBe('unknown');
     });
   });
 });
