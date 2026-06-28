@@ -1576,7 +1576,7 @@ The backend sends maturity reminders to relevant parties before invoices reach t
 
 - **Exponential backoff**: Transient SMTP failures (4xx, network errors) are automatically retried with configurable backoff (default: 3 attempts, ~1s base delay, doubling each attempt)
 - **Error classification**: Permanent SMTP failures (5xx, invalid recipient) fail immediately without retry to avoid wasting resources
-- **Dead-lettering**: Emails that fail after all retries are dead-lettered to an in-memory queue for manual inspection and recovery
+- **Dead-lettering**: Emails that fail after all retries are recorded as sanitized rows in `maturity_reminder_dead_letters` for durable inspection
 - **Observability**: Prometheus counters track delivery attempts, successes, and dead-lettered messages with fine-grained failure reasons
 
 #### Configuration

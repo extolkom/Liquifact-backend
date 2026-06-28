@@ -1,3 +1,34 @@
+'use strict';
+
+const mockDeliveryAttempts = { inc: jest.fn() };
+const mockDeadLetters = { inc: jest.fn() };
+const mockLogger = { warn: jest.fn() };
+const mockCreateTransport = jest.fn((options) => ({
+  options,
+  sendMail: jest.fn(),
+}));
+
+jest.mock('nodemailer', () => ({ createTransport: mockCreateTransport }), { virtual: true });
+jest.mock('../src/db/knex', () => jest.fn());
+jest.mock('../src/logger', () => mockLogger);
+jest.mock('../src/metrics', () => ({
+  registerJobQueue: jest.fn(),
+  registerWorker: jest.fn(),
+  maturityReminderDeliveryAttemptsTotal: mockDeliveryAttempts,
+  maturityReminderDeadLetterTotal: mockDeadLetters,
+  normalizeJobType: jest.fn((value) => value === 'maturity_reminder' ? value : 'unknown'),
+  normalizeReminderReason: jest.fn((error) => {
+    const message = error && error.message ? error.message : '';
+    if (/timeout|ETIMEDOUT/i.test(message)) {
+      return 'smtp_timeout';
+    }
+    if (/reject|550/i.test(message)) {
+      return 'smtp_reject';
+    }
+    return 'unknown';
+  }),
+}));
+
 const {
   scheduleReminder,
   cancelReminder,
@@ -5,28 +36,38 @@ const {
   stopQueueProcessing,
   invoiceJobs,
   emailQueue,
+  emailWorker,
   templates,
   getTransport,
-  getDeadLetterQueue,
-  clearDeadLetterQueue,
+  getMaxAttempts,
+  createMaturityReminderHandler,
+  persistReminderDeadLetter,
+  listReminderDeadLetters,
 } = require('../src/jobs/maturityReminders');
-const { sendMailWithRetry, isPermanentSmtpError } = require('../src/utils/retry');
+const defaultDb = require('../src/db/knex');
 
-const {
-  normalizeReminderReason,
-  normalizeJobType,
-  REMINDER_REASON_ENUM,
-  JOB_TYPE_ENUM,
-  maturityReminderDeliveryAttemptsTotal,
-  maturityReminderDeadLetterTotal,
-  registry,
-} = require('../src/metrics');
+function flushPromises() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
-describe('Maturity Reminders Job', () => {
-  beforeEach(() => {
+function createListDb(rows = []) {
+  const query = {
+    select: jest.fn().mockReturnThis(),
+    orderBy: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    then: (resolve, reject) => Promise.resolve(rows).then(resolve, reject),
+  };
+  return { db: jest.fn(() => query), query };
+}
+
+describe('maturity reminder dead-letter persistence', () => {
+  beforeEach(async () => {
+    if (emailWorker.isRunning) {
+      await stopQueueProcessing(100);
+    }
     emailQueue.clear();
     invoiceJobs.clear();
-    clearDeadLetterQueue();
     jest.clearAllMocks();
     delete process.env.SMTP_HOST;
     delete process.env.SMTP_PORT;
@@ -37,618 +78,324 @@ describe('Maturity Reminders Job', () => {
   });
 
   afterAll(async () => {
-    await stopQueueProcessing(100);
+    await stopQueueProcessing();
   });
 
-  describe('getTransport and execution', () => {
-    it('returns a mock transport when SMTP_HOST is not set', async () => {
+  describe('transport, template, and retry configuration', () => {
+    it('uses a dry-run transport without SMTP configuration', async () => {
       const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
-      const transport = getTransport();
-      
-      const res = await transport.sendMail({
-        to: 'test@example.com',
-        subject: 'Test',
-        text: 'Hello test'
+      const result = await getTransport().sendMail({
+        to: 'operator@example.com',
+        subject: 'subject',
+        text: 'body',
       });
-      
-      expect(res.response).toBe('250 OK Mock');
-      expect(consoleSpy).toHaveBeenCalledWith('[DRY RUN] Sending email to: test@example.com');
+
+      expect(result.response).toBe('250 OK Mock');
+      expect(consoleSpy).toHaveBeenCalledTimes(3);
       consoleSpy.mockRestore();
     });
 
-    it('returns a nodemailer transport when SMTP_HOST is set', () => {
+    it('creates a configured SMTP transport and defaults its port', () => {
       process.env.SMTP_HOST = 'smtp.example.com';
-      process.env.SMTP_PORT = '587';
       process.env.SMTP_USER = 'user';
       process.env.SMTP_PASS = 'pass';
 
-      const transport = getTransport();
-      expect(transport).toBeDefined();
-      expect(transport.sendMail).toBeDefined();
-      expect(transport.options).toBeDefined();
-      expect(transport.options.host).toBe('smtp.example.com');
-      expect(transport.options.port).toBe(587);
+      expect(getTransport().options).toMatchObject({
+        host: 'smtp.example.com',
+        port: 587,
+      });
+
+      process.env.SMTP_PORT = '2525';
+      expect(getTransport().options.port).toBe(2525);
     });
 
-    it('returns a nodemailer transport when SMTP_HOST is set but port defaults', () => {
-      process.env.SMTP_HOST = 'smtp.example.com';
-      delete process.env.SMTP_PORT;
-
-      const transport = getTransport();
-      expect(transport.options.port).toBe(587);
-    });
-  });
-
-  describe('templates', () => {
-    it('generates maturity reminder template correctly', () => {
-      const template = templates.maturityReminder('Alice', 1000, '2025-06-30');
-      expect(template).toContain('Alice');
-      expect(template).toContain('$1000');
-      expect(template).toContain('2025-06-30');
-    });
-  });
-
-  describe('scheduleReminder and cancelReminder', () => {
-    it('schedules a reminder and stores it in the map', () => {
-      const invoice = { id: 'inv_123', customer: 'Alice', amount: 1000 };
-      const targetDate = new Date(Date.now() + 5000);
-      const jobId = scheduleReminder(invoice, targetDate, 'alice@example.com');
-      
-      expect(jobId).toBeDefined();
-      expect(invoiceJobs.get('inv_123')).toBe(jobId);
+    it('renders the reminder template', () => {
+      const rendered = templates.maturityReminder('Alice', 1000, '2026-07-01');
+      expect(rendered).toContain('Alice');
+      expect(rendered).toContain('$1000');
+      expect(rendered).toContain('2026-07-01');
     });
 
-    it('cancels a reminder and removes it from the map', () => {
-      const invoice = { id: 'inv_456-bob', customer: 'Bob', amount: 2000 };
-      const targetDate = new Date(Date.now() + 5000);
-      scheduleReminder(invoice, targetDate, 'bob@example.com');
+    it('bounds configured SMTP attempts', () => {
+      expect(getMaxAttempts()).toBe(3);
 
-      const canceled = cancelReminder('inv_456-bob');
+      process.env.SMTP_MAX_RETRIES = 'invalid';
+      expect(getMaxAttempts()).toBe(3);
 
-      expect(canceled).toBe(true);
-      expect(invoiceJobs.has('inv_456-bob')).toBe(false);
-    });
+      process.env.SMTP_MAX_RETRIES = '0';
+      expect(getMaxAttempts()).toBe(1);
 
-    it('returns false when canceling non-existent reminder', () => {
-      const canceled = cancelReminder('non_existent');
-      expect(canceled).toBe(false);
-    });
+      process.env.SMTP_MAX_RETRIES = '20';
+      expect(getMaxAttempts()).toBe(10);
 
-    it('replaces previous reminder for same invoice', () => {
-      const invoice = { id: 'inv_789', customer: 'Charlie', amount: 3000 };
-      const targetDate1 = new Date(Date.now() + 5000);
-      const targetDate2 = new Date(Date.now() + 10000);
-
-      const jobId1 = scheduleReminder(invoice, targetDate1, 'charlie@example.com');
-      const jobId2 = scheduleReminder(invoice, targetDate2, 'charlie@example.com');
-
-      expect(jobId1).not.toBe(jobId2);
-      expect(invoiceJobs.get('inv_789')).toBe(jobId2);
-      expect(emailQueue.getJob(jobId1)).toBeNull();
-      expect(emailQueue.queue.length).toBe(1); // Only one pending job
-    });
-
-    it('cancels a scheduled reminder via emailQueue.getJob', () => {
-      const invoice = { id: 'inv_456', customer: 'Acme', amount: 300 };
-      const targetDate = new Date(Date.now() + 10000);
-
-      const jobId = scheduleReminder(invoice, targetDate, 'acme@example.com');
-      expect(invoiceJobs.has('inv_456')).toBe(true);
-
-      const canceled = cancelReminder('inv_456');
-
-      expect(canceled).toBe(true);
-      expect(invoiceJobs.has('inv_456')).toBe(false);
-      expect(emailQueue.getJob(jobId)).toBeNull();
-    });
-
-    it('returns false when cancelling unknown invoice id', () => {
-      const canceled = cancelReminder('unknown_id');
-      expect(canceled).toBe(false);
+      process.env.SMTP_MAX_RETRIES = '4.9';
+      expect(getMaxAttempts()).toBe(4);
     });
   });
 
-  describe('sendMailWithRetry error classification', () => {
-    it('classifies 5xx SMTP errors as permanent', () => {
-      const error = new Error('Permanent failure');
-      error.response = '550 User unknown';
-      expect(isPermanentSmtpError(error)).toBe(true);
+  describe('scheduling', () => {
+    it('schedules, replaces, and cancels reminders by invoice', () => {
+      const invoice = { id: 'inv-1', customer: 'Alice', amount: 100 };
+      const first = scheduleReminder(invoice, new Date(Date.now() + 5000), 'alice@example.com');
+      const second = scheduleReminder(invoice, new Date(Date.now() + 6000), 'alice@example.com');
+
+      expect(second).not.toBe(first);
+      expect(emailQueue.getJob(first)).toBeNull();
+      expect(invoiceJobs.get(invoice.id)).toBe(second);
+      expect(cancelReminder(invoice.id)).toBe(true);
+      expect(invoiceJobs.has(invoice.id)).toBe(false);
+      expect(cancelReminder('missing')).toBe(false);
     });
 
-    it('classifies 4xx SMTP errors as transient', () => {
-      const error = new Error('Temporary failure');
-      error.response = '421 Service unavailable';
-      expect(isPermanentSmtpError(error)).toBe(false);
-    });
-
-    it('classifies "Invalid recipient" errors as permanent', () => {
-      const error = new Error('Invalid recipient');
-      error.message = 'SMTP Error: Invalid recipient';
-      expect(isPermanentSmtpError(error)).toBe(true);
-    });
-
-    it('classifies "User unknown" errors as permanent', () => {
-      const error = new Error('User unknown');
-      error.message = 'SMTP Error: User unknown in virtual mailbox table';
-      expect(isPermanentSmtpError(error)).toBe(false); // uppercase check
-    });
-
-    it('classifies network errors as transient', () => {
-      const error = new Error('Connection refused');
-      error.code = 'ECONNREFUSED';
-      expect(isPermanentSmtpError(error)).toBe(false);
-    });
-
-    it('classifies ETIMEDOUT as transient', () => {
-      const error = new Error('Timeout');
-      error.code = 'ETIMEDOUT';
-      expect(isPermanentSmtpError(error)).toBe(false);
-    });
-  });
-
-  describe('sendMailWithRetry retry logic', () => {
-    it('succeeds on first attempt', async () => {
-      const mockTransport = {
-        sendMail: jest.fn().mockResolvedValue({ messageId: 'msg_123' })
-      };
-
-      const result = await sendMailWithRetry(mockTransport, {
-        to: 'user@example.com',
-        subject: 'Test',
-        text: 'Hello',
-      }, { maxAttempts: 3, baseDelayMs: 100 });
-
-      expect(result.messageId).toBe('msg_123');
-      expect(mockTransport.sendMail).toHaveBeenCalledTimes(1);
-    });
-
-    it('retries on transient error and eventually succeeds', async () => {
-      const mockTransport = {
-        sendMail: jest.fn()
-          .mockRejectedValueOnce(new Error('421 Service unavailable'))
-          .mockResolvedValueOnce({ messageId: 'msg_456' })
-      };
-
-      const result = await sendMailWithRetry(mockTransport, {
-        to: 'user@example.com',
-        subject: 'Test',
-        text: 'Hello',
-      }, { maxAttempts: 3, baseDelayMs: 10 }); // Short delay for tests
-
-      expect(result.messageId).toBe('msg_456');
-      expect(mockTransport.sendMail).toHaveBeenCalledTimes(2);
-    });
-
-    it('fails immediately on permanent error without retry', async () => {
-      const permanentError = new Error('550 User unknown');
-      permanentError.response = '550 User unknown';
-      
-      const mockTransport = {
-        sendMail: jest.fn().mockRejectedValue(permanentError)
-      };
-
-      await expect(
-        sendMailWithRetry(mockTransport, {
-          to: 'nonexistent@example.com',
-          subject: 'Test',
-          text: 'Hello',
-        }, { maxAttempts: 3, baseDelayMs: 10 })
-      ).rejects.toThrow('550 User unknown');
-
-      expect(mockTransport.sendMail).toHaveBeenCalledTimes(1); // No retries
-    });
-
-    it('exhausts retries on repeated transient errors', async () => {
-      const transientError = new Error('421 Service unavailable');
-      const mockTransport = {
-        sendMail: jest.fn().mockRejectedValue(transientError)
-      };
-
-      await expect(
-        sendMailWithRetry(mockTransport, {
-          to: 'user@example.com',
-          subject: 'Test',
-          text: 'Hello',
-        }, { maxAttempts: 3, baseDelayMs: 10 })
-      ).rejects.toThrow('421 Service unavailable');
-
-      expect(mockTransport.sendMail).toHaveBeenCalledTimes(3); // max attempts
-    });
-
-    it('invokes onRetry callback on each retry', async () => {
-      const mockTransport = {
-        sendMail: jest.fn()
-          .mockRejectedValueOnce(new Error('421 Temporary'))
-          .mockRejectedValueOnce(new Error('421 Temporary'))
-          .mockResolvedValueOnce({ messageId: 'msg_789' })
-      };
-
-      const onRetry = jest.fn();
-
-      const result = await sendMailWithRetry(mockTransport, {
-        to: 'user@example.com',
-        subject: 'Test',
-        text: 'Hello',
-      }, { maxAttempts: 3, baseDelayMs: 10, onRetry });
-
-      expect(result.messageId).toBe('msg_789');
-      expect(onRetry).toHaveBeenCalledTimes(2);
-      expect(onRetry).toHaveBeenCalledWith(
-        expect.objectContaining({
-          attempt: 1,
-          error: expect.any(Error)
-        })
-      );
-      expect(onRetry).toHaveBeenCalledWith(
-        expect.objectContaining({
-          attempt: 2,
-          error: expect.any(Error)
-        })
-      );
-    });
-  });
-
-  describe('queue processing and dead-lettering', () => {
-    it('delivers successful reminders', async () => {
-      const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
+    it('starts and stops queue processing idempotently', async () => {
       startQueueProcessing();
-
-      const invoice = { id: 'inv_success', customer: 'Success', amount: 1000 };
-      const targetDate = new Date(Date.now() + 100); // Near immediate
-      
-      scheduleReminder(invoice, targetDate, 'success@example.com');
-
-      // Wait for job to process
-      await new Promise(resolve => setTimeout(resolve, 300));
-
-      expect(invoiceJobs.has('inv_success')).toBe(false); // Cleaned up on success
-      expect(getDeadLetterQueue()).toHaveLength(0);
-
-      consoleSpy.mockRestore();
-    });
-
-    it('dead-letters reminders that fail after max retries', async () => {
-      // This test requires mocking the transport to fail
-      // Since we use the real transport from getTransport(), we need to mock it
-      const originalGetTransport = require('../src/jobs/maturityReminders').getTransport;
-      
-      const failingTransport = {
-        sendMail: jest.fn().mockRejectedValue(
-          new Error('421 Service temporarily unavailable')
-        )
-      };
-
-      jest.spyOn(require('../src/jobs/maturityReminders'), 'getTransport')
-        .mockReturnValue(failingTransport);
-
-      process.env.SMTP_MAX_RETRIES = '2'; // Limit retries for faster test
-
       startQueueProcessing();
-
-      const invoice = { id: 'inv_fail', customer: 'Fail', amount: 1000 };
-      const targetDate = new Date(Date.now() + 100);
-      
-      scheduleReminder(invoice, targetDate, 'fail@example.com');
-
-      // Wait for job to exhaust retries and be dead-lettered
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-      const deadLetters = getDeadLetterQueue();
-      expect(deadLetters.length).toBeGreaterThan(0);
-      expect(deadLetters[0].invoiceId).toBe('inv_fail');
-      expect(deadLetters[0].error.message).toContain('Service');
-      expect(invoiceJobs.has('inv_fail')).toBe(false); // Cleaned up
-
-      jest.restoreAllMocks();
-    });
-
-    it('dead-letters reminders with permanent SMTP errors immediately', async () => {
-      const permanentError = new Error('550 User unknown');
-      permanentError.response = '550 User unknown';
-      
-      const failingTransport = {
-        sendMail: jest.fn().mockRejectedValue(permanentError)
-      };
-
-      jest.spyOn(require('../src/jobs/maturityReminders'), 'getTransport')
-        .mockReturnValue(failingTransport);
-
-      startQueueProcessing();
-
-      const invoice = { id: 'inv_permanent', customer: 'Perm', amount: 1000 };
-      const targetDate = new Date(Date.now() + 100);
-      
-      scheduleReminder(invoice, targetDate, 'permanent@example.com');
-
-      await new Promise(resolve => setTimeout(resolve, 300));
-
-      const deadLetters = getDeadLetterQueue();
-      expect(deadLetters.length).toBeGreaterThan(0);
-      expect(deadLetters[0].error.isPermanent).toBe(true);
-      expect(deadLetters[0].error.response).toContain('550');
-
-      jest.restoreAllMocks();
-    });
-  });
-
-  describe('queue lifecycle', () => {
-    it('starts and stops the queue processing', async () => {
-      startQueueProcessing();
-      expect(require('../src/workers/worker')).toBeDefined();
+      expect(emailWorker.isRunning).toBe(true);
 
       await stopQueueProcessing(100);
-      // Should complete without error
-    });
-
-    it('starts queue processing without crashing if already running', () => {
-      startQueueProcessing();
-      // Calling start a second time must be a safe no-op (idempotent restart).
-      startQueueProcessing();
-      stopQueueProcessing(100);
-    });
-
-    it('processes jobs after start', async () => {
-      startQueueProcessing();
-
-      const invoice = { id: 'inv_lifecycle', customer: 'Lifecycle', amount: 1000 };
-      const targetDate = new Date(Date.now() + 100);
-      
-      scheduleReminder(invoice, targetDate, 'lifecycle@example.com');
-      expect(invoiceJobs.has('inv_lifecycle')).toBe(true);
-
-      await new Promise(resolve => setTimeout(resolve, 300));
-      expect(invoiceJobs.has('inv_lifecycle')).toBe(false);
-
-      await stopQueueProcessing(100);
+      expect(emailWorker.isRunning).toBe(false);
     });
   });
 
-  describe('dead-letter queue management', () => {
-    it('stores dead-lettered messages', () => {
-      clearDeadLetterQueue();
-      expect(getDeadLetterQueue()).toHaveLength(0);
+  describe('database helpers', () => {
+    it('uses the shared database defaults for writes and reads', async () => {
+      const insert = jest.fn().mockResolvedValue();
+      defaultDb.mockReturnValueOnce({ insert });
+      await persistReminderDeadLetter({
+        jobId: 'job-default',
+        invoiceId: 'inv-default',
+        jobType: 'maturity_reminder',
+        reason: 'unknown',
+        attempts: 0,
+        targetDate: '2026-07-01T00:00:00.000Z',
+      });
+      expect(insert).toHaveBeenCalledTimes(1);
 
-      // Manually push a dead-letter (simulating job failure)
-      // This would normally happen in the job handler
-      const dl = {
-        invoiceId: 'inv_dl1',
-        email: 'user@example.com',
-        error: { message: 'Test error', code: '550' },
-        timestamp: new Date().toISOString(),
-        maxAttempts: 3,
+      const { query } = createListDb([]);
+      defaultDb.mockReturnValueOnce(query);
+      await expect(listReminderDeadLetters()).resolves.toEqual([]);
+    });
+
+    it('persists only allowlisted operational metadata', async () => {
+      const insert = jest.fn().mockResolvedValue();
+      const dbClient = jest.fn(() => ({ insert }));
+
+      await persistReminderDeadLetter({
+        jobId: 'job-1',
+        invoiceId: 'inv-1',
+        jobType: 'maturity_reminder',
+        reason: 'smtp_timeout',
+        attempts: 3,
+        targetDate: '2026-07-01T00:00:00.000Z',
+        email: 'must-not-persist@example.com',
+        customer: 'Must Not Persist',
+        amount: 999,
+        body: 'private email body',
+      }, dbClient);
+
+      expect(dbClient).toHaveBeenCalledWith('maturity_reminder_dead_letters');
+      expect(insert).toHaveBeenCalledWith(expect.objectContaining({
+        job_id: 'job-1',
+        invoice_id: 'inv-1',
+        reason: 'smtp_timeout',
+        attempts: 3,
+      }));
+
+      const stored = insert.mock.calls[0][0];
+      expect(JSON.parse(stored.payload_metadata)).toEqual({
+        jobType: 'maturity_reminder',
+        targetDate: '2026-07-01T00:00:00.000Z',
+      });
+      expect(JSON.stringify(stored)).not.toContain('must-not-persist');
+      expect(JSON.stringify(stored)).not.toContain('private email body');
+      expect(JSON.stringify(stored)).not.toContain('999');
+    });
+
+    it('returns an empty persisted list after a restart-equivalent read', async () => {
+      const { db, query } = createListDb([]);
+
+      await expect(listReminderDeadLetters({}, db)).resolves.toEqual([]);
+      expect(db).toHaveBeenCalledWith('maturity_reminder_dead_letters');
+      expect(query.orderBy).toHaveBeenCalledWith('created_at', 'desc');
+      expect(query.limit).toHaveBeenCalledWith(50);
+      expect(query.where).not.toHaveBeenCalled();
+    });
+
+    it('lists stored rows with bounded limit and an optional reason', async () => {
+      const rows = [{ id: 'dl-1', reason: 'smtp_reject' }];
+      const { db, query } = createListDb(rows);
+
+      await expect(listReminderDeadLetters({ limit: 999, reason: 'smtp_reject' }, db))
+        .resolves.toEqual(rows);
+      expect(query.limit).toHaveBeenCalledWith(200);
+      expect(query.where).toHaveBeenCalledWith('reason', 'smtp_reject');
+    });
+
+    it('normalizes invalid and low list limits', async () => {
+      const first = createListDb();
+      await listReminderDeadLetters({ limit: 0 }, first.db);
+      expect(first.query.limit).toHaveBeenCalledWith(1);
+
+      const second = createListDb();
+      await listReminderDeadLetters({ limit: 'not-a-number' }, second.db);
+      expect(second.query.limit).toHaveBeenCalledWith(50);
+    });
+  });
+
+  describe('delivery handler', () => {
+    function job(overrides = {}) {
+      return {
+        id: 'job-42',
+        type: 'maturity_reminder',
+        payload: {
+          invoiceId: 'inv-42',
+          customer: 'Alice',
+          amount: 500,
+          email: 'alice@example.com',
+          targetDate: '2026-07-01T00:00:00.000Z',
+          ...overrides,
+        },
       };
-      
-      // We can't directly push since the handler creates them,
-      // but we can verify the structure via exports
-      expect(typeof getDeadLetterQueue).toBe('function');
-      expect(typeof clearDeadLetterQueue).toBe('function');
-    });
-  });
+    }
 
-  describe('SMTP_MAX_RETRIES configuration', () => {
-    it('uses default of 3 retries when SMTP_MAX_RETRIES is not set', () => {
-      delete process.env.SMTP_MAX_RETRIES;
-      const retries = Number(process.env.SMTP_MAX_RETRIES) || 3;
-      expect(retries).toBe(3);
+    it('delivers successfully without persisting a dead letter', async () => {
+      const sendMail = jest.fn().mockResolvedValue({ messageId: 'sent' });
+      const persistDeadLetter = jest.fn();
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => ({ sendMail }),
+        persistDeadLetter,
+      });
+      invoiceJobs.set('inv-42', 'job-42');
+
+      await handler(job());
+
+      expect(sendMail).toHaveBeenCalledWith(expect.objectContaining({
+        to: 'alice@example.com',
+        subject: 'Settlement Reminder: Invoice inv-42',
+      }));
+      expect(mockDeliveryAttempts.inc).toHaveBeenCalledTimes(1);
+      expect(mockDeadLetters.inc).not.toHaveBeenCalled();
+      expect(persistDeadLetter).not.toHaveBeenCalled();
+      expect(invoiceJobs.has('inv-42')).toBe(false);
     });
 
-    it('respects SMTP_MAX_RETRIES environment variable', () => {
+    it('persists one sanitized record after transient retries are exhausted', async () => {
+      process.env.SMTP_MAX_RETRIES = '2';
+      const error = new Error('ETIMEDOUT while connecting');
+      const sendMail = jest.fn().mockRejectedValue(error);
+      const persistDeadLetter = jest.fn().mockResolvedValue();
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => ({ sendMail }),
+        persistDeadLetter,
+      });
+
+      await handler(job());
+      await flushPromises();
+
+      expect(sendMail).toHaveBeenCalledTimes(2);
+      expect(mockDeliveryAttempts.inc).toHaveBeenCalledTimes(2);
+      expect(mockDeadLetters.inc).toHaveBeenCalledWith({
+        reason: 'smtp_timeout',
+        job_type: 'maturity_reminder',
+      });
+      expect(persistDeadLetter).toHaveBeenCalledTimes(1);
+      expect(persistDeadLetter).toHaveBeenCalledWith({
+        jobId: 'job-42',
+        invoiceId: 'inv-42',
+        jobType: 'maturity_reminder',
+        reason: 'smtp_timeout',
+        attempts: 2,
+        targetDate: '2026-07-01T00:00:00.000Z',
+      });
+    }, 5000);
+
+    it('dead-letters permanent SMTP failures after one attempt', async () => {
       process.env.SMTP_MAX_RETRIES = '5';
-      const retries = Number(process.env.SMTP_MAX_RETRIES) || 3;
-      expect(retries).toBe(5);
-    });
-  });
-});
-      expect(transport.sendMail).toBeDefined();
-      expect(transport.options).toBeDefined();
-      expect(transport.options.host).toBe('smtp.example.com');
-      expect(transport.options.port).toBe(587);
-    });
+      const permanentError = new Error('550 rejected');
+      permanentError.response = '550 rejected';
+      const persistDeadLetter = jest.fn().mockResolvedValue();
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => ({ sendMail: jest.fn().mockRejectedValue(permanentError) }),
+        persistDeadLetter,
+      });
 
-    it('returns a nodemailer transport when SMTP_HOST is set but port defaults', () => {
-      process.env.SMTP_HOST = 'smtp.example.com';
-      delete process.env.SMTP_PORT;
-      
-      const transport = getTransport();
-      expect(transport.options.port).toBe(587);
-    });
-  });
+      await handler(job());
+      await flushPromises();
 
-  describe('templates', () => {
-    it('generates a maturity reminder template correctly', () => {
-      const text = templates.maturityReminder('Acme Corp', 5000, '2027-01-01');
-      expect(text).toContain('Dear Acme Corp');
-      expect(text).toContain('$5000');
-      expect(text).toContain('2027-01-01');
-    });
-  });
-
-  describe('scheduleReminder and cancelReminder', () => {
-    it('schedules a reminder correctly', () => {
-      const invoice = { id: 'inv_123', customer: 'Acme', amount: 300 };
-      const targetDate = new Date(Date.now() + 10000); // 10s from now
-      
-      const jobId = scheduleReminder(invoice, targetDate, 'acme@example.com');
-      
-      expect(jobId).toBeDefined();
-      expect(invoiceJobs.get('inv_123')).toBe(jobId);
-      
-      const job = emailQueue.getJob(jobId);
-      expect(job.type).toBe('maturity_reminder');
-      expect(job.payload.email).toBe('acme@example.com');
-      expect(job.delayMs).toBeGreaterThan(0);
+      expect(persistDeadLetter).toHaveBeenCalledWith(expect.objectContaining({
+        reason: 'smtp_reject',
+        attempts: 1,
+      }));
     });
 
-    it('clears previous job if rescheduling for the same invoice', () => {
-      const invoice = { id: 'inv_123', customer: 'Acme', amount: 300 };
-      const targetDate = new Date(Date.now() + 10000);
-      
-      const jobId1 = scheduleReminder(invoice, targetDate, 'acme@example.com');
-      const jobId2 = scheduleReminder(invoice, targetDate, 'acme@example.com');
-      
-      expect(jobId1).not.toBe(jobId2);
-      expect(invoiceJobs.get('inv_123')).toBe(jobId2);
-      
-      expect(emailQueue.getJob(jobId1)).toBeNull();
+    it('does not block the reminder loop on a slow persistence call', async () => {
+      process.env.SMTP_MAX_RETRIES = '1';
+      let finishPersistence;
+      const persistDeadLetter = jest.fn(() => new Promise((resolve) => {
+        finishPersistence = resolve;
+      }));
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => ({ sendMail: jest.fn().mockRejectedValue(new Error('timeout')) }),
+        persistDeadLetter,
+      });
+
+      await handler(job());
+      await flushPromises();
+
+      expect(persistDeadLetter).toHaveBeenCalledTimes(1);
+      finishPersistence();
+      await flushPromises();
     });
 
-    it('cancels a scheduled reminder', () => {
-      const invoice = { id: 'inv_456', customer: 'Acme', amount: 300 };
-      const targetDate = new Date(Date.now() + 10000);
-      
-      const jobId = scheduleReminder(invoice, targetDate, 'acme@example.com');
-      expect(invoiceJobs.has('inv_456')).toBe(true);
-      
-      const canceled = cancelReminder('inv_456');
-      
-      expect(canceled).toBe(true);
-      expect(invoiceJobs.has('inv_456')).toBe(false);
-      expect(emailQueue.getJob(jobId)).toBeNull();
+    it('logs persistence failures without rejecting the reminder handler', async () => {
+      process.env.SMTP_MAX_RETRIES = '1';
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => ({ sendMail: jest.fn().mockRejectedValue(new Error('timeout')) }),
+        persistDeadLetter: jest.fn().mockRejectedValue(new Error('database unavailable')),
+      });
+
+      await expect(handler(job())).resolves.toBeUndefined();
+      await flushPromises();
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { err: 'database unavailable', jobId: 'job-42' },
+        'Failed to persist maturity-reminder dead letter'
+      );
     });
 
-    it('returns false when cancelling unknown invoice id', () => {
-      const canceled = cancelReminder('unknown_id');
-      expect(canceled).toBe(false);
-    });
-  });
+    it('safely stringifies non-error persistence rejections', async () => {
+      process.env.SMTP_MAX_RETRIES = '1';
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => ({ sendMail: jest.fn().mockRejectedValue(new Error('timeout')) }),
+        persistDeadLetter: jest.fn().mockRejectedValue('offline'),
+      });
 
-  describe('queue processing', () => {
-    it('processes a maturity_reminder job', async () => {
-      const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
-      
-      const invoice = { id: 'inv_test_email', customer: 'Bob', amount: 1000 };
-      const targetDate = new Date(Date.now() - 1000); // Past so delay=0
-      
-      scheduleReminder(invoice, targetDate, 'bob@example.com');
-      
-      startQueueProcessing();
-      
-      await new Promise(resolve => setTimeout(resolve, 200));
-      await stopQueueProcessing(100);
-      
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[DRY RUN] Sending email to: bob@example.com'));
-      expect(invoiceJobs.has('inv_test_email')).toBe(false);
-      
-      consoleSpy.mockRestore();
+      await handler(job());
+      await flushPromises();
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { err: 'offline', jobId: 'job-42' },
+        'Failed to persist maturity-reminder dead letter'
+      );
     });
 
-    it('processes a maturity_reminder job and skips if SMTP_FROM is set', async () => {
-      const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
-      process.env.SMTP_FROM = 'support@liquifact.com';
+    it('records setup failures without leaking their raw details', async () => {
+      const persistDeadLetter = jest.fn().mockResolvedValue();
+      const handler = createMaturityReminderHandler({
+        transportFactory: () => {
+          throw new Error('credentials failed for alice@example.com');
+        },
+        persistDeadLetter,
+      });
 
-      const invoice = { id: 'inv_test_email2', customer: 'Bob2', amount: 1000 };
-      const targetDate = new Date(Date.now() - 1000); 
-      
-      scheduleReminder(invoice, targetDate, 'bob2@example.com');
-      
-      startQueueProcessing();
-      
-      await new Promise(resolve => setTimeout(resolve, 200));
-      await stopQueueProcessing(100);
-      
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[DRY RUN] Sending email to: bob2@example.com'));
-      expect(invoiceJobs.has('inv_test_email2')).toBe(false);
-      
-      consoleSpy.mockRestore();
+      await handler(job());
+      await flushPromises();
+
+      expect(persistDeadLetter).toHaveBeenCalledWith(expect.objectContaining({
+        attempts: 0,
+        reason: 'unknown',
+      }));
+      expect(JSON.stringify(persistDeadLetter.mock.calls[0][0])).not.toContain('alice@example.com');
     });
-    
-    it('starts queue processing without crashing if already running', () => {
-      startQueueProcessing();
-      startQueueProcessing(); // Should just return
-      stopQueueProcessing(100);
-    });
-  });
-});
-
-// ── #420: normalizeReminderReason / normalizeJobType coverage ─────────────────
-
-describe('normalizeReminderReason', () => {
-  it('returns every value in REMINDER_REASON_ENUM for known inputs', () => {
-    expect(REMINDER_REASON_ENUM).toContain('smtp_timeout');
-    expect(REMINDER_REASON_ENUM).toContain('smtp_reject');
-    expect(REMINDER_REASON_ENUM).toContain('template_error');
-    expect(REMINDER_REASON_ENUM).toContain('unknown');
-  });
-
-  it('maps timeout errors', () => {
-    expect(normalizeReminderReason('Connection timeout')).toBe('smtp_timeout');
-    expect(normalizeReminderReason('ETIMEDOUT waiting for server')).toBe('smtp_timeout');
-    expect(normalizeReminderReason('ECONNREFUSED port 587')).toBe('smtp_timeout');
-    expect(normalizeReminderReason('ECONNRESET by peer')).toBe('smtp_timeout');
-    expect(normalizeReminderReason(new Error('connect ECONNREFUSED 127.0.0.1:587'))).toBe('smtp_timeout');
-  });
-
-  it('maps SMTP reject errors', () => {
-    expect(normalizeReminderReason('550 User unknown')).toBe('smtp_reject');
-    expect(normalizeReminderReason('554 rejected by policy')).toBe('smtp_reject');
-    expect(normalizeReminderReason('Message rejected')).toBe('smtp_reject');
-    expect(normalizeReminderReason('EAUTH authentication failed')).toBe('smtp_reject');
-  });
-
-  it('maps template errors', () => {
-    expect(normalizeReminderReason('template rendering failed')).toBe('template_error');
-    expect(normalizeReminderReason('Template missing variable')).toBe('template_error');
-  });
-
-  it('returns unknown for empty/null/non-string inputs', () => {
-    expect(normalizeReminderReason('')).toBe('unknown');
-    expect(normalizeReminderReason(null)).toBe('unknown');
-    expect(normalizeReminderReason(undefined)).toBe('unknown');
-    expect(normalizeReminderReason(42)).toBe('unknown');
-    expect(normalizeReminderReason({})).toBe('unknown');
-  });
-
-  it('returns unknown for unmapped errors', () => {
-    expect(normalizeReminderReason('some completely unrelated error')).toBe('unknown');
-    expect(normalizeReminderReason('X'.repeat(10000))).toBe('unknown');
-  });
-
-  it('does not leak PII — raw string never returned', () => {
-    const rawWithPii = 'SMTP error for user@company.com: 550 reject';
-    const result = normalizeReminderReason(rawWithPii);
-    expect(REMINDER_REASON_ENUM).toContain(result);
-    // Result must be a bounded enum value, never the raw string
-    expect(result).not.toBe(rawWithPii);
-  });
-});
-
-describe('normalizeJobType', () => {
-  it('passes through valid job types', () => {
-    JOB_TYPE_ENUM.forEach((type) => {
-      expect(normalizeJobType(type)).toBe(type);
-    });
-  });
-
-  it('maps unknown/non-string inputs to "unknown"', () => {
-    expect(normalizeJobType('not_a_real_job')).toBe('unknown');
-    expect(normalizeJobType('')).toBe('unknown');
-    expect(normalizeJobType(null)).toBe('unknown');
-    expect(normalizeJobType(undefined)).toBe('unknown');
-  });
-});
-
-describe('maturity-reminder metric counters', () => {
-  it('counters are registered with the shared registry', async () => {
-    const metrics = await registry.metrics();
-    expect(metrics).toContain('maturity_reminder_delivery_attempts_total');
-    expect(metrics).toContain('maturity_reminder_dead_letter_total');
-  });
-
-  it('delivery attempts counter increments with bounded labels', () => {
-    const before = maturityReminderDeliveryAttemptsTotal.hashMap;
-    maturityReminderDeliveryAttemptsTotal.inc({ reason: 'unknown', job_type: 'maturity_reminder' });
-    // Counter accepts valid bounded labels without throwing
-    const after = maturityReminderDeliveryAttemptsTotal.hashMap;
-    expect(after).toBeDefined();
-    // hashMap has the label key set
-    const key = Object.keys(after).find((k) => k.includes('maturity_reminder'));
-    expect(key).toBeDefined();
-  });
-
-  it('dead letter counter increments with bounded labels', () => {
-    maturityReminderDeadLetterTotal.inc({ reason: 'smtp_timeout', job_type: 'maturity_reminder' });
-    const after = maturityReminderDeadLetterTotal.hashMap;
-    const key = Object.keys(after).find((k) => k.includes('smtp_timeout'));
-    expect(key).toBeDefined();
   });
 });

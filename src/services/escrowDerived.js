@@ -43,7 +43,6 @@
  */
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const SECONDS_PER_DAY = 24 * 60 * 60;
 
 // ── Validation constants ──────────────────────────────────────────────────────
 
@@ -96,8 +95,8 @@ function validateLedgerCloseTimeUnit(value) {
     return null;
   }
 
-  // Magnitude check: if > threshold, likely milliseconds, not seconds
-  if (num > EPOCH_SECONDS_THRESHOLD) {
+  // Magnitude check: values at or above the threshold are not epoch seconds.
+  if (num >= EPOCH_SECONDS_THRESHOLD) {
     console.warn(
       '[escrowDerived] ledgerCloseTime ' + num + ' exceeds threshold ' + EPOCH_SECONDS_THRESHOLD + '; unit mismatch suspected (milliseconds passed as seconds?). Rejecting.'
     );
@@ -242,14 +241,14 @@ function computeFundedPercent(fundedAmount, totalAmount) {
  * ≥ 1 year overdue grace). Absurd dates return null.
  *
  * @param {Date|string|number|null|undefined} maturityDate
- * @param {Date|Object} [refOrOpts] - A `Date` reference time **or** an options
+ * @param {Date|Object} [opts] - A `Date` reference time **or** an options
  *   object with `ledgerCloseTime` / `now` fields.  When a `Date` is passed it
  *   is used directly.  When an object is passed, time is resolved via
  *   {@link resolveReferenceTime} with `ledgerCloseTime` taking precedence
  *   over `now`.
- * @param {number|Date|null|undefined} [refOrOpts.ledgerCloseTime] - Stellar
+ * @param {number|Date|null|undefined} [opts.ledgerCloseTime] - Stellar
  *   ledger close time in Unix epoch **seconds**.  Takes precedence.
- * @param {Date|null|undefined} [refOrOpts.now] - Explicit reference time.
+ * @param {Date|null|undefined} [opts.now] - Explicit reference time.
  * @returns {number|null} Null when maturityDate is absent, unparseable, or out of bounds.
  */
 function computeDaysToMaturity(maturityDate, opts = {}) {
