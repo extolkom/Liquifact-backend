@@ -90,6 +90,7 @@ describe('Readiness probe (/readyz)', () => {
     process.env.SOROBAN_RPC_URL = 'http://localhost:8000';
     process.env.DATABASE_URL = 'postgres://user:pass@localhost:5432/test';
     registry.registerMetric(readinessGauge);
+    mockStorageProbe.mockResolvedValue({ status: 'in_memory' });
   });
 
   afterEach(() => {
@@ -358,6 +359,125 @@ describe('Readiness probe (/readyz)', () => {
 
       const metric = await readinessGauge.get();
       expect(metric.values[0].value).toBe(0);
+    });
+
+    describe('Pool saturation health checks', () => {
+      let savedClient;
+
+      function mockPool({ used, free, pending, max }) {
+        db.client = {
+          pool: {
+            numUsed: jest.fn().mockReturnValue(used),
+            numFree: jest.fn().mockReturnValue(free),
+            numPendingAcquires: jest.fn().mockReturnValue(pending),
+          },
+          config: { pool: { max } },
+        };
+      }
+
+      beforeEach(() => {
+        savedClient = db.client;
+        global.fetch = jest.fn(() =>
+          Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ result: 'ok' }) })
+        );
+      });
+
+      afterEach(() => {
+        db.client = savedClient;
+        delete process.env.DB_POOL_SATURATION_RATIO;
+        delete process.env.DB_HEALTH_PROBE_TIMEOUT_MS;
+      });
+
+      it('returns healthy when pool is within normal bounds', async () => {
+        mockPool({ used: 2, free: 8, pending: 0, max: 10 });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.checks.database.status).toBe('healthy');
+        expect(res.body.checks.database.pool).toEqual({ used: 2, free: 8, pending: 0, max: 10 });
+      });
+
+      it('returns degraded and still ready when pending acquisitions exist', async () => {
+        mockPool({ used: 10, free: 0, pending: 3, max: 10 });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.ready).toBe(true);
+        expect(res.body.checks.database.status).toBe('degraded');
+        expect(res.body.checks.database.pool.pending).toBe(3);
+
+        const metric = await readinessGauge.get();
+        expect(metric.values[0].value).toBe(0.5);
+      });
+
+      it('returns degraded when used connections meet or exceed the saturation ratio', async () => {
+        mockPool({ used: 8, free: 2, pending: 0, max: 10 });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.ready).toBe(true);
+        expect(res.body.checks.database.status).toBe('degraded');
+      });
+
+      it('returns healthy when used connections are below the saturation ratio', async () => {
+        mockPool({ used: 7, free: 3, pending: 0, max: 10 });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.checks.database.status).toBe('healthy');
+      });
+
+      it('respects a custom DB_POOL_SATURATION_RATIO', async () => {
+        process.env.DB_POOL_SATURATION_RATIO = '0.5';
+        mockPool({ used: 6, free: 4, pending: 0, max: 10 });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.checks.database.status).toBe('degraded');
+      });
+
+      it('returns unhealthy on pool acquisition timeout', async () => {
+        process.env.DB_HEALTH_PROBE_TIMEOUT_MS = '10';
+        db.raw.mockImplementation(
+          () => new Promise(resolve => setTimeout(resolve, 500))
+        );
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(503);
+        expect(res.body.ready).toBe(false);
+        expect(res.body.checks.database.status).toBe('unhealthy');
+        expect(res.body.checks.database.error).toBe('Connection pool acquire timeout');
+
+        const metric = await readinessGauge.get();
+        expect(metric.values[0].value).toBe(0);
+      });
+
+      it('does not expose credentials or host info alongside pool metrics', async () => {
+        mockPool({ used: 10, free: 0, pending: 5, max: 10 });
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        const body = JSON.stringify(res.body);
+        expect(body).not.toMatch(/postgres:\/\//);
+        expect(body).not.toMatch(/user:pass/);
+        expect(body).not.toMatch(/DATABASE_URL/i);
+        expect(res.body.checks.database.pool).toEqual({ used: 10, free: 0, pending: 5, max: 10 });
+      });
+
+      it('returns healthy with no pool field when pool internals are inaccessible', async () => {
+        db.client = undefined;
+        db.raw.mockResolvedValue([{ '1': 1 }]);
+
+        const res = await request(app).get('/readyz');
+        expect(res.status).toBe(200);
+        expect(res.body.checks.database.status).toBe('healthy');
+        expect(res.body.checks.database.pool).toBeUndefined();
+      });
     });
   });
 });

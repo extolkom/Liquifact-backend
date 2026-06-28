@@ -62,24 +62,116 @@ async function checkSorobanHealth() {
 }
 
 /**
- * Checks if the database is reachable via a raw query.
- * Uses knex to run `SELECT 1` and measures latency.
- * Does not expose connection strings or hostnames in the response.
- * @returns {Promise<{status: string, latency?: number, error?: string}>}
+ * @typedef {Object} PoolMetrics
+ * @property {number} used - Connections currently checked out by active queries.
+ * @property {number} free - Idle connections available for acquisition.
+ * @property {number} pending - Requests queued waiting for a free connection.
+ * @property {number} max - Configured pool maximum size.
+ */
+
+/**
+ * Reads safe-to-expose connection-pool counters from a Knex instance.
+ *
+ * Accesses the underlying tarn pool object exposed at `knexInstance.client.pool`.
+ * Returns `null` when the pool is inaccessible (e.g. in-memory SQLite test mode
+ * where no real pool is initialised).
+ *
+ * Security note: only numeric counts are returned. Connection strings, host
+ * names, credentials, and raw pool-object internals are never included.
+ *
+ * @param {import('knex').Knex} knexInstance - Knex database instance to inspect.
+ * @returns {PoolMetrics|null} Current pool counters, or null when unavailable.
+ */
+function inspectPoolHealth(knexInstance) {
+  const pool = knexInstance && knexInstance.client && knexInstance.client.pool;
+  if (!pool) return null;
+
+  const used = typeof pool.numUsed === 'function' ? pool.numUsed() : 0;
+  const free = typeof pool.numFree === 'function' ? pool.numFree() : 0;
+  const pending = typeof pool.numPendingAcquires === 'function' ? pool.numPendingAcquires() : 0;
+  const max = (
+    knexInstance.client &&
+    knexInstance.client.config &&
+    knexInstance.client.config.pool &&
+    knexInstance.client.config.pool.max
+  ) || 10;
+
+  return { used, free, pending, max };
+}
+
+/**
+ * Checks database reachability and connection-pool saturation.
+ *
+ * Runs `SELECT 1` inside a short bounded timeout so the health probe never
+ * hangs on an exhausted pool. Pool metrics (used/free/pending/max) are
+ * captured before the query and returned alongside reachability status.
+ *
+ * Status values:
+ * - `'healthy'`       — DB is reachable and pool is within normal bounds.
+ * - `'degraded'`      — DB is reachable but pool is saturated (pending > 0
+ *                       or used connections at or above the saturation ratio).
+ * - `'unhealthy'`     — DB is unreachable or pool acquisition timed out.
+ * - `'not_configured'`— `DATABASE_URL` env var is absent.
+ *
+ * Tuning env vars:
+ * - `DB_HEALTH_PROBE_TIMEOUT_MS`  — milliseconds before the probe times out
+ *                                   (default 2000).
+ * - `DB_POOL_SATURATION_RATIO`    — fraction of `max` at which `used`
+ *                                   connections trigger `degraded` (default 0.8).
+ *
+ * Does not expose connection strings, host names, or credentials in the response.
+ *
+ * @returns {Promise<{
+ *   status: 'healthy'|'degraded'|'unhealthy'|'not_configured',
+ *   latency?: number,
+ *   pool?: PoolMetrics,
+ *   error?: string
+ * }>}
  */
 async function checkDatabaseHealth() {
   if (!process.env.DATABASE_URL) {
     return { status: 'not_configured' };
   }
 
+  const poolMetrics = inspectPoolHealth(db);
+  const probeTimeoutMs = parseInt(process.env.DB_HEALTH_PROBE_TIMEOUT_MS, 10) || 2000;
+  const saturationRatio = parseFloat(process.env.DB_POOL_SATURATION_RATIO) || 0.8;
+
   const start = Date.now();
+  let timedOut = false;
+  let timeoutId;
+
   try {
-    await db.raw('SELECT 1');
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        reject(new Error('POOL_ACQUIRE_TIMEOUT'));
+      }, probeTimeoutMs);
+      if (timeoutId.unref) timeoutId.unref();
+    });
+
+    await Promise.race([db.raw('SELECT 1'), timeoutPromise]);
+    clearTimeout(timeoutId);
+
     const latency = Date.now() - start;
-    return { status: 'healthy', latency };
-  } catch (_error) {
+
+    const hasPending = poolMetrics && poolMetrics.pending > 0;
+    const atSaturation = poolMetrics && poolMetrics.used >= Math.ceil(poolMetrics.max * saturationRatio);
+    const status = (hasPending || atSaturation) ? 'degraded' : 'healthy';
+
+    const result = { status, latency };
+    if (poolMetrics) result.pool = poolMetrics;
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId);
     const latency = Date.now() - start;
-    return { status: 'unhealthy', latency, error: 'Database unreachable' };
+    const result = {
+      status: 'unhealthy',
+      latency,
+      error: timedOut ? 'Connection pool acquire timeout' : 'Database unreachable',
+    };
+    if (poolMetrics) result.pool = poolMetrics;
+    return result;
   }
 }
 
@@ -295,16 +387,19 @@ async function performReadinessChecks() {
     storage.status === 'in_memory' ||
     storage.status === 'disabled';
 
-  // Determine overall readiness. Degraded Soroban RPC (slow) does NOT block readiness.
-  const healthy =
-    database.status === 'healthy' &&
-    (soroban.status === 'healthy' || soroban.status === 'degraded' || soroban.status === 'unknown') &&
-    storageOk;
+  // Determine overall readiness.
+  // - DB degraded (pool saturated) still allows traffic but signals pressure → ready.
+  // - DB unhealthy/not_configured → not ready.
+  // - Soroban degraded (slow) does NOT block readiness.
+  const dbReady = database.status === 'healthy' || database.status === 'degraded';
+  const sorobanReady = soroban.status === 'healthy' || soroban.status === 'degraded' || soroban.status === 'unknown';
+
+  const healthy = dbReady && sorobanReady && storageOk;
 
   // Set gauge: 1 = ready, 0.5 = degraded, 0 = not ready
-  if (database.status !== 'healthy' || !storageOk) {
+  if (!dbReady || !storageOk) {
     readinessGauge.set(0);
-  } else if (soroban.status === 'degraded') {
+  } else if (database.status === 'degraded' || soroban.status === 'degraded') {
     readinessGauge.set(0.5);
   } else {
     readinessGauge.set(healthy ? 1 : 0);
@@ -321,4 +416,5 @@ module.exports = {
   checkIndexerStaleness,
   performHealthChecks,
   performReadinessChecks,
+  inspectPoolHealth,
 };
