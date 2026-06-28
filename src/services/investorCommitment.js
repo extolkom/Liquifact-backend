@@ -16,11 +16,9 @@
 'use strict';
 
 const db = require('../db/knex');
+const { isValidStellarAddress } = require('../utils/stellarAddress');
 
 const TABLE = 'investor_commitments';
-
-// Stellar public key: G or C followed by exactly 55 base-32 characters (A-Z2-7)
-const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
 
 // Sane upper bound: 10^18 stroops (≈ 10 billion XLM — exceeds total supply)
 const MAX_STROOP_AMOUNT = 10n ** 18n;
@@ -109,7 +107,7 @@ function validateAddress(address) {
   if (!address || typeof address !== 'string') {
     return { valid: false, reason: 'invalid Stellar address: must be a non-empty string' };
   }
-  if (!STELLAR_ADDRESS_RE.test(address)) {
+  if (!isValidStellarAddress(address)) {
     return {
       valid: false,
       reason: 'invalid Stellar address: must start with G or C and be 56 base-32 characters',
