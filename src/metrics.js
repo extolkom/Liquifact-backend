@@ -105,13 +105,6 @@ const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
 let refreshTimer = null;
 
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
 const queueDepthGauge = new client.Gauge({
   name: 'liquifact_job_queue_depth',
   help: 'Number of pending jobs currently waiting in background queues',
@@ -171,6 +164,14 @@ const WEBHOOK_REPLAY_OUTCOME_ENUM = Object.freeze([
   'not_found',
   'already_resolved',
 ]);
+
+/**
+ * Refreshes all aggregated metrics by reading current stats from registered queues and workers.
+ * @returns {void}
+ */
+function refreshMetrics() {
+  let queueLength = 0;
+  let retryQueueLength = 0;
 
   for (const queue of registeredJobQueues) {
     try {
@@ -270,42 +271,6 @@ function normalizeJobType(raw) {
   return JOB_TYPE_ENUM.includes(str) ? str : 'unknown';
 }
 
-// ── Maturity-reminder counters ────────────────────────────────────────────────
-
-/**
- * Total maturity-reminder delivery attempts, labelled by bounded `reason` and `job_type`.
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeliveryAttemptsTotal = new client.Counter({
-  name: 'maturity_reminder_delivery_attempts_total',
-  help: 'Total number of maturity-reminder delivery attempts',
-  labelNames: ['reason', 'job_type'],
-  registers: [],
-});
-
-/**
- * Total maturity-reminder dead-letter events, labelled by bounded `reason` and `job_type`.
- * @type {import('prom-client').Counter}
- */
-const maturityReminderDeadLetterTotal = new client.Counter({
-  name: 'maturity_reminder_dead_letter_total',
-  help: 'Total number of maturity-reminder messages moved to the dead-letter queue',
-  labelNames: ['reason', 'job_type'],
-  registers: [],
-});
-
-/**
- * Total webhook replay attempts, labelled by bounded `outcome`.
- * Outcomes: success | failure | not_found | already_resolved
- * @type {import('prom-client').Counter}
- */
-const webhookReplayTotal = new client.Counter({
-  name: 'webhook_replay_total',
-  help: 'Total number of webhook dead-letter replay attempts',
-  labelNames: ['outcome'],
-  registers: [],
-});
-
 /**
  * Resets all metrics state for test isolation.
  * Clears registered queues, workers, and resets gauge values to zero.
@@ -343,11 +308,6 @@ function safeEqual(a, b) {
   }
   return result === 0;
 }
-
-// Register bounded counters with the shared registry
-registry.registerMetric(maturityReminderDeliveryAttemptsTotal);
-registry.registerMetric(maturityReminderDeadLetterTotal);
-registry.registerMetric(webhookReplayTotal);
 
 /**
  * Set of loopback IP addresses that are allowed when no bearer token is
@@ -637,6 +597,46 @@ const contractWasmVersionMismatchAlertsTotal = new client.Counter({
   registers: [registry],
 });
 
+/**
+ * Counter: Request body-size limit rejections (413 Payload Too Large), labelled by `type`.
+ * @type {import('prom-client').Counter}
+ */
+const bodySizeLimitRejectionsTotal = new client.Counter({
+  name: 'body_size_limit_rejections_total',
+  help: 'Total number of request body-size limit rejections (413 Payload Too Large), labelled by limit type',
+  labelNames: ['type'],
+  registers: [registry],
+});
+
+/**
+ * Counter: Webhook dead-letter replay attempts, labelled by bounded `outcome`.
+ * @type {import('prom-client').Counter}
+ */
+const webhookReplayTotal = new client.Counter({
+  name: 'webhook_replay_total',
+  help: 'Total number of webhook dead-letter replay attempts',
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
+/**
+ * Registers a job queue for metric collection.
+ * @param {object} queue - Queue instance with a getStats() method.
+ * @returns {void}
+ */
+function registerJobQueue(queue) {
+  registeredJobQueues.add(queue);
+}
+
+/**
+ * Registers a worker for metric collection.
+ * @param {object} worker - Worker instance with a getStats() method.
+ * @returns {void}
+ */
+function registerWorker(worker) {
+  registeredWorkers.add(worker);
+}
+
 module.exports = {
   registry,
   metricsAuth,
@@ -646,4 +646,25 @@ module.exports = {
   refreshMetrics,
   resetMetricsForTests,
   contractWasmVersionMismatchAlertsTotal,
+  readinessGauge,
+  escrowIndexerLastCursorAdvanceTimestampSeconds,
+  escrowIndexerEventsProcessedTotal,
+  escrowIndexerEventsSkippedTotal,
+  escrowIndexerCycleFailuresTotal,
+  escrowReconciliationMismatches,
+  escrowReconciliationMismatchedInvoicesGauge,
+  escrowReconciliationDriftMagnitudeGauge,
+  escrowReconciliationDriftAlertsTotal,
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
+  maturityReminderDeadLetterTotal,
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+  sorobanCircuitBreakerStateTransitionsTotal,
+  webhookReplayTotal,
+  bodySizeLimitRejectionsTotal,
+  normalizeJobType,
+  startMetricsRefresh,
+  stopMetricsRefresh,
 };
