@@ -113,6 +113,45 @@ describe('escapeCsvField', () => {
     // Numbers are coerced to string; "-100" starts with - so it gets prefixed
     expect(escapeCsvField(-100)).toBe("'-100");
   });
+
+  // ── Leading-whitespace regression (issue fix) ─────────────────────────────
+
+  it('neutralizes a field with a leading space then "=" (whitespace bypass)', () => {
+    expect(escapeCsvField(' =HYPERLINK("http://evil.com")')).toBe("' =HYPERLINK(\"http://evil.com\")");
+  });
+
+  it('neutralizes a field with multiple leading spaces then "+"', () => {
+    expect(escapeCsvField('   +cmd')).toBe("'   +cmd");
+  });
+
+  it('neutralizes a field with a leading tab then "=" (tab-prefix bypass)', () => {
+    expect(escapeCsvField('\t=MALICIOUS()')).toBe("'\t=MALICIOUS()");
+  });
+
+  it('neutralizes a field with leading space then "-"', () => {
+    expect(escapeCsvField(' -2+3')).toBe("' -2+3");
+  });
+
+  it('neutralizes a field with leading space then "@"', () => {
+    expect(escapeCsvField(' @SUM(1)')).toBe("' @SUM(1)");
+  });
+
+  // ── Pipe (|) prefix (OWASP DDE) ──────────────────────────────────────────
+
+  it('prefixes | with a single quote (DDE/pipe injection)', () => {
+    expect(escapeCsvField('|calc.exe')).toBe("'|calc.exe");
+  });
+
+  it('neutralizes a field with leading space then "|"', () => {
+    expect(escapeCsvField(' |calc.exe')).toBe("' |calc.exe");
+  });
+
+  // ── Whitespace-only and all-whitespace edge cases ─────────────────────────
+
+  it('does not prefix whitespace-only values', () => {
+    expect(escapeCsvField('   ')).toBe('   ');
+    expect(escapeCsvField('\t')).toBe('\t');
+  });
 });
 
 // ── rowToCsvLine ──────────────────────────────────────────────────────────────
