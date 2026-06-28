@@ -424,6 +424,21 @@ docker run --rm --entrypoint id liquifact-backend:latest
 | Health check during startup | `--start-period=5s` absorbs boot time; probe retried up to 3× |
 | Non-root file permissions | `chown -R appuser:appgroup /app` grants app full access to its own tree |
 
+### Graceful Shutdown
+
+The application implements coordinated graceful shutdown to prevent request interruption, prevent database pool leaking, and allow background jobs to drain properly.
+
+When a termination signal (`SIGTERM` or `SIGINT`) is received:
+1. **HTTP Listener Closure**: The server immediately stops accepting new HTTP connections via `server.close()`.
+2. **Request Draining**: Existing active HTTP requests are allowed to complete. Idle keep-alive connections are closed immediately.
+3. **Background Worker Stop**: The active background worker is stopped gracefully using `worker.stop()`, allowing in-flight jobs to complete.
+4. **Knex Pool Destruction**: The Knex database connection pool is closed (`db.destroy()`).
+5. **Clean Exit**: The process exits cleanly with status code `0`.
+
+#### Configuration
+
+- `SHUTDOWN_TIMEOUT_MS`: The maximum time (in milliseconds) to wait for all phases of graceful shutdown to complete before forcing a process exit with status code `1` (defaults to `10000` / 10 seconds).
+
 ---
 
 ## Development

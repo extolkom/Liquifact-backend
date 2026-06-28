@@ -14,6 +14,7 @@ require('dotenv').config();
 
 const app = require('./app');
 const { validate, logRedactedSummary } = require('./config');
+const shutdownCoordinator = require('./utils/shutdownCoordinator');
 
 /**
  * Runs the S3 connectivity probe at startup. Failures are logged but never
@@ -59,7 +60,10 @@ function startServer() {
   const port = process.env.PORT || 3001;
   // Fire-and-forget probe — do not await, so startup is not blocked.
   scheduleStartupStorageProbe();
-  return app.listen(port);
+  const server = app.listen(port);
+  shutdownCoordinator.register({ server });
+  shutdownCoordinator.setupSignalListeners();
+  return server;
 }
 
 /**
