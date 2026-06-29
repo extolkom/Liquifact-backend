@@ -23,6 +23,17 @@ Applied in this order before any route handler runs:
 
 The request ID middleware accepts a client-supplied header only when it is a non-empty string of at most 128 characters and contains only the safe characters `[A-Za-z0-9._-]`. Values with control characters, newlines, whitespace, or other disallowed bytes are rejected and replaced with a server-generated UUID. The sanitized value is then attached to `req.id`, propagated into child loggers, and echoed in the `X-Request-Id` response header.
 
+## Body Size Limits
+
+The JSON, URL-encoded, and invoice body guards reject requests early when a
+trustworthy `Content-Length` declares a body larger than the configured limit.
+Requests without a valid `Content-Length`, including `Transfer-Encoding:
+chunked`, are not treated as zero-byte bodies. They continue into the Express
+body parser, which enforces the same byte cap without buffering beyond its
+configured limit. Parser-raised 413 responses reuse the guard's stored limit
+context so `bodySizeLimitRejectionsTotal` keeps the correct `json`,
+`urlencoded`, or `invoice` label.
+
 ## Inline routes (defined on `app` directly)
 
 Health probes (`/health`, `/healthz`, `/ready`, `/readyz`), API info (`/api`),
