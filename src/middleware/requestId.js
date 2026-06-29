@@ -17,88 +17,14 @@
  * @module middleware/requestId
  */
 
-const { randomUUID } = require('crypto');
 const { createRequestLogger } = require('../logger');
-const REQUEST_ID_HEADER_NAMES = ['x-request-id', 'request-id'];
-
-/**
- * Maximum accepted length, in characters, for a client-supplied request id.
- * Values longer than this are rejected and replaced with a generated id.
- *
- * @type {number}
- */
-const MAX_REQUEST_ID_LENGTH = 128;
-
-/**
- * Strict charset for an acceptable inbound request id.
- *
- * Only unreserved URL characters are allowed (`[A-Za-z0-9._-]`), which excludes
- * whitespace, newlines (CR/LF), and all control characters that would otherwise
- * be vectors for log injection. The bound `{1,128}` also rejects empty and
- * oversized values.
- *
- * @type {RegExp}
- */
-const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
-
-/**
- * Validate and sanitize a client-supplied request id.
- *
- * Returns the value unchanged only when it is a non-empty string within the
- * length bound and composed exclusively of the allowed charset. Any other
- * input - a non-string (e.g. a repeated header parsed as an array), an empty
- * string, an oversized string, or a string containing control characters,
- * newlines, or other disallowed bytes - yields `null`, signalling that a fresh
- * server-generated id must be used instead.
- *
- * @param {unknown} value - Candidate request id taken from an inbound header.
- * @returns {string|null} The validated id, or `null` when it must be replaced.
- */
-function sanitizeRequestId(value) {
-  if (typeof value !== 'string') {
-    return null;
-  }
-
-  // Cheap length guard first so oversized payloads never reach the regex.
-  if (value.length === 0 || value.length > MAX_REQUEST_ID_LENGTH) {
-    return null;
-  }
-
-  if (!REQUEST_ID_PATTERN.test(value)) {
-    return null;
-  }
-
-  return value;
-}
-
-/**
- * Generate a fresh, full-strength server-side request id.
- *
- * Uses a v4 UUID (122 bits of entropy) so fallback ids are as strong as the
- * fallback used by {@link module:middleware/correlationId}.
- *
- * @returns {string} A newly generated UUID.
- */
-function generateRequestId() {
-  return randomUUID();
-}
-
-/**
- * Resolve the first acceptable request id from supported inbound header names.
- *
- * @param {NodeJS.Dict<string | string[]> | undefined} headers - Inbound request headers.
- * @returns {string|null} The first validated request id, or `null` when none are acceptable.
- */
-function resolveRequestIdFromHeaders(headers) {
-  for (const headerName of REQUEST_ID_HEADER_NAMES) {
-    const value = sanitizeRequestId(headers?.[headerName]);
-    if (value) {
-      return value;
-    }
-  }
-
-  return null;
-}
+const {
+  MAX_REQUEST_IDENTIFIER_LENGTH,
+  REQUEST_IDENTIFIER_PATTERN,
+  sanitizeRequestIdentifier,
+  generateRequestIdentifier,
+  resolveRequestIdentifierFromHeaders,
+} = require('./requestIdentifier');
 
 /**
  * Attaches a validated, bounded request ID to the request and response objects.
@@ -112,12 +38,14 @@ function resolveRequestIdFromHeaders(headers) {
  * @param {import('express').NextFunction} next - Express next function
  */
 const requestId = (req, res, next) => {
-  // Prefer a validated client-supplied id (standard for distributed tracing),
-  // otherwise fall back to a fresh server-generated id.
-  const id = resolveRequestIdFromHeaders(req.headers) || generateRequestId();
+  // Prefer a validated client-supplied id, otherwise fall back to a fresh
+  // server-generated id. This is the canonical id for both request and
+  // correlation fields.
+  const id = resolveRequestIdentifierFromHeaders(req.headers) || generateRequestIdentifier();
 
   // Attach to request object for use in subsequent middleware/handlers.
   req.id = id;
+  req.correlationId = id;
   req.log = createRequestLogger(req);
 
   // Echo the validated id so clients/proxies can see it.
@@ -127,9 +55,8 @@ const requestId = (req, res, next) => {
 };
 
 module.exports = requestId;
-module.exports.sanitizeRequestId = sanitizeRequestId;
-module.exports.generateRequestId = generateRequestId;
-module.exports.resolveRequestIdFromHeaders = resolveRequestIdFromHeaders;
-module.exports.MAX_REQUEST_ID_LENGTH = MAX_REQUEST_ID_LENGTH;
-module.exports.REQUEST_ID_PATTERN = REQUEST_ID_PATTERN;
-
+module.exports.sanitizeRequestId = sanitizeRequestIdentifier;
+module.exports.generateRequestId = generateRequestIdentifier;
+module.exports.resolveRequestIdFromHeaders = resolveRequestIdentifierFromHeaders;
+module.exports.MAX_REQUEST_ID_LENGTH = MAX_REQUEST_IDENTIFIER_LENGTH;
+module.exports.REQUEST_ID_PATTERN = REQUEST_IDENTIFIER_PATTERN;

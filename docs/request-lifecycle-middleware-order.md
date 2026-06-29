@@ -16,12 +16,12 @@ Applied in this order before any route handler runs:
 | 3 | URL-encoded body limit | Form payloads (50 KB) |
 | 4 | Security headers (`createSecurityMiddleware`) | Helmet-style hardening |
 | 5 | Audit middleware | Structured request audit trail |
-| 6 | Request ID | Validates and propagates `req.id` for logging; only `X-Request-Id`/`X-Request-ID` values matching `[A-Za-z0-9._-]{1,128}` are trusted, otherwise a fresh UUID is generated and echoed back in the response header |
-| 7 | Correlation ID | Cross-service trace correlation |
+| 6 | Request ID | Resolves the canonical request identifier from `X-Request-Id`, `request-id`, or `X-Correlation-Id`, then attaches it to both `req.id` and `req.correlationId` for logging |
+| 7 | Correlation ID | Echoes the canonical identifier in `X-Correlation-Id` and refreshes the request-scoped logger bindings |
 
-## Request ID header contract
+## Request identifier header contract
 
-The request ID middleware accepts a client-supplied header only when it is a non-empty string of at most 128 characters and contains only the safe characters `[A-Za-z0-9._-]`. Values with control characters, newlines, whitespace, or other disallowed bytes are rejected and replaced with a server-generated UUID. The sanitized value is then attached to `req.id`, propagated into child loggers, and echoed in the `X-Request-Id` response header.
+The identifier pipeline accepts a client-supplied request or correlation header only when it is 8 to 64 characters long and contains only the safe characters `[A-Za-z0-9_-]`. Values with dots, control characters, newlines, whitespace, or other disallowed bytes are rejected. `X-Request-Id` and `request-id` take precedence over `X-Correlation-Id` when multiple valid headers are present. The sanitized value is attached to both `req.id` and `req.correlationId`, propagated into child loggers as `requestId` and `correlationId`, and echoed in `X-Request-Id` and `X-Correlation-Id`. If no inbound identifier is trusted, the server generates a full-strength `req_` identifier from UUID entropy.
 
 ## Inline routes (defined on `app` directly)
 
