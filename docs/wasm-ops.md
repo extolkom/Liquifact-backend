@@ -211,7 +211,9 @@ scheduled runs, only the **first** occurrence emits a metric increment and log.
 The de-dupe state for a contract is cleared automatically once its version
 returns to `current`, so a later regression re-alerts. It re-alerts immediately
 if the observed version changes to a new pair. State can be reset manually via
-`resetVersionMismatchAlertState()` (exported for tests/ops).
+`resetVersionMismatchAlertState()` (exported for tests/ops). The alert helper
+returns `true` only when it emits a new metric/log alert and `false` when an
+identical signature is suppressed.
 
 > Note: because de-dupe state is in-process, a service restart resets it and the
 > next run will alert once for any still-present mismatch — this is intentional

@@ -21,10 +21,15 @@ jest.mock('../src/config/escrowVersions', () => ({
   compareVersions: jest.fn(),
 }));
 
+jest.mock('../src/metrics', () => ({
+  contractWasmVersionMismatchAlertsTotal: { inc: jest.fn() },
+}));
+
 const { getOnChainSchemaVersion, compareVersions } = require('../src/config/escrowVersions');
 const logger = require('../src/logger');
 const metrics = require('../src/metrics');
 const {
+  raiseVersionMismatchAlert,
   runContractListRefresh,
   resetVersionMismatchAlertState,
 } = require('../src/jobs/contractListRefresh');
@@ -79,6 +84,70 @@ describe('contractListRefresh version-mismatch alert (issue #457)', () => {
       status: 'ahead',
     });
     expect(message).toMatch(/mismatch/i);
+  });
+
+  it('returns false and suppresses metric/log output for an identical direct alert', () => {
+    const mismatch = {
+      contractId: 'contract-a',
+      observedVersion: 4,
+      expectedVersion: '1.2.0',
+      status: 'ahead',
+    };
+
+    const firstRaised = raiseVersionMismatchAlert(mismatch);
+    const secondRaised = raiseVersionMismatchAlert(mismatch);
+
+    expect(firstRaised).toBe(true);
+    expect(secondRaised).toBe(false);
+    expect(incSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns true again when the direct alert signature changes for the same contract', () => {
+    const firstRaised = raiseVersionMismatchAlert({
+      contractId: 'contract-a',
+      observedVersion: 4,
+      expectedVersion: '1.2.0',
+      status: 'ahead',
+    });
+
+    const changedObservedRaised = raiseVersionMismatchAlert({
+      contractId: 'contract-a',
+      observedVersion: 5,
+      expectedVersion: '1.2.0',
+      status: 'ahead',
+    });
+
+    const changedExpectedRaised = raiseVersionMismatchAlert({
+      contractId: 'contract-a',
+      observedVersion: 5,
+      expectedVersion: '1.3.0',
+      status: 'ahead',
+    });
+
+    expect(firstRaised).toBe(true);
+    expect(changedObservedRaised).toBe(true);
+    expect(changedExpectedRaised).toBe(true);
+    expect(incSpy).toHaveBeenCalledTimes(3);
+    expect(errorSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('re-alerts after resetVersionMismatchAlertState clears a direct alert signature', () => {
+    const mismatch = {
+      contractId: 'contract-a',
+      observedVersion: 4,
+      expectedVersion: '1.2.0',
+      status: 'ahead',
+    };
+
+    expect(raiseVersionMismatchAlert(mismatch)).toBe(true);
+    expect(raiseVersionMismatchAlert(mismatch)).toBe(false);
+
+    resetVersionMismatchAlertState();
+
+    expect(raiseVersionMismatchAlert(mismatch)).toBe(true);
+    expect(incSpy).toHaveBeenCalledTimes(2);
+    expect(errorSpy).toHaveBeenCalledTimes(2);
   });
 
   it('raises an alert on an "unknown" version mismatch', async () => {
