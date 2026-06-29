@@ -8,11 +8,14 @@
  * - Pretty printing (for local development)
  * - Standardized log levels
  * - Request correlation via request IDs
+ * - Automatic enrichment from the AsyncLocalStorage request context
+ *   (requestId, correlationId, tenantId, userId) — no manual threading needed.
  *
  * @module logger
  */
 
 const pino = require('pino');
+const { get: getContext } = require('./requestContext');
 
 /**
  * Configure the Pino logger instance.
@@ -32,19 +35,73 @@ const transport =
       }
     : undefined;
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  base: {
-    service: 'liquifact-api',
-    env: process.env.NODE_ENV || 'development',
-  },
-  timestamp: pino.stdTimeFunctions.isoTime,
-  formatters: {
-    level: (label) => {
-      return { level: label.toUpperCase() };
+const _base = pino(
+  {
+    level: process.env.LOG_LEVEL || 'info',
+    base: {
+      service: 'liquifact-api',
+      env: process.env.NODE_ENV || 'development',
+    },
+    timestamp: pino.stdTimeFunctions.isoTime,
+    formatters: {
+      level: (label) => ({ level: label.toUpperCase() }),
     },
   },
-}, transport ? pino.transport(transport) : undefined);
+  transport ? pino.transport(transport) : undefined
+);
+
+/**
+ * Build a merged bindings object from the ambient context plus any
+ * caller-supplied overrides. Explicit values always win.
+ *
+ * @param {Record<string, unknown>} [overrides] - Per-call bindings.
+ * @returns {Record<string, unknown>} Merged bindings.
+ */
+function _mergeContext(overrides) {
+  const ctx = getContext();
+  // Ambient context first so caller overrides take precedence.
+  return Object.keys(ctx).length === 0 && !overrides
+    ? {}
+    : { ...ctx, ...overrides };
+}
+
+/**
+ * Thin proxy that enriches every log call with the ambient request context.
+ * Explicit per-call fields passed to `logger.info({ … }, msg)` override the
+ * ambient values for that call only.
+ *
+ * @type {import('pino').Logger}
+ */
+const logger = new Proxy(_base, {
+  get(target, prop) {
+    const LEVEL_METHODS = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+    if (typeof prop === 'string' && LEVEL_METHODS.has(prop)) {
+      return function enrichedLog(objOrMsg, ...rest) {
+        const ctx = getContext();
+        const hasCtx = Object.keys(ctx).length > 0;
+
+        if (!hasCtx) {
+          // No ambient context — call through unchanged (background jobs).
+          return target[prop](objOrMsg, ...rest);
+        }
+
+        if (typeof objOrMsg === 'string') {
+          // Signature: logger.info('message')
+          return target[prop]({ ...ctx }, objOrMsg, ...rest);
+        }
+
+        if (objOrMsg && typeof objOrMsg === 'object') {
+          // Signature: logger.info({ key: val }, 'message')
+          // Explicit fields override ambient.
+          return target[prop]({ ...ctx, ...objOrMsg }, ...rest);
+        }
+
+        return target[prop](objOrMsg, ...rest);
+      };
+    }
+    return target[prop];
+  },
+});
 
 /**
  * Create a per-request child logger bound only with safe correlation fields.
@@ -63,7 +120,7 @@ function createRequestLogger(req) {
     bindings.correlationId = req.correlationId;
   }
 
-  return logger.child(bindings);
+  return _base.child(bindings);
 }
 
 logger.createRequestLogger = createRequestLogger;
