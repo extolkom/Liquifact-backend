@@ -11,7 +11,7 @@
 
 const { callSorobanContract } = require('../services/soroban');
 const logger = require('../logger');
-const { isValidStellarContractAddress } = require('../utils/stellarAddress');
+const { isValidStellarContractAddress } = require('../utils/validators');
 
 /**
  * Known LiquifactEscrow deployments: semver -> SCHEMA_VERSION (u32).

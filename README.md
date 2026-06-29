@@ -600,7 +600,13 @@ The `src/middleware/smeAuth.js` middleware binds Stellar wallet authorization st
 
 ### Address format
 
-All wallet addresses are validated against `^G[A-Z2-7]{55}$` (Stellar Ed25519 public key format). Invalid formats yield a `400` before any capital-movement logic runs.
+All SME wallet addresses are validated as Stellar account public keys (`G...` StrKeys). Contract addresses (`C...`) are intentionally rejected here because this middleware binds user accounts to wallets, not escrow contracts. Invalid formats yield a `400` before any capital-movement logic runs.
+
+Shared StrKey validation lives in `src/utils/validators.js`:
+
+- `isValidStellarAccountAddress(value)` accepts only `G...` account public keys.
+- `isValidStellarContractAddress(value)` accepts only `C...` Soroban contract addresses.
+- `isValidStellarAddress(value)` accepts either form for routes and services that can work with both account and contract StrKeys.
 
 ### Error responses
 
@@ -1394,7 +1400,7 @@ Any violation throws a `CommitmentValidationError` with a typed `.code`:
 
 ### Address validation
 
-`validateAddress(address)` checks that the investor address is a valid Stellar public key (G… or C… prefix, 56 base-32 characters). It returns `{ valid, reason }` and is also called from the `GET /api/investor/locks` routes to validate the `funderAddress` query parameter.
+`validateAddress(address)` checks that the investor address is a valid Stellar StrKey address (`G...` account public key or `C...` contract address). It returns `{ valid, reason }` and is also called from the `GET /api/investor/locks` routes to validate the `funderAddress` query parameter.
 
 ### Idempotency
 

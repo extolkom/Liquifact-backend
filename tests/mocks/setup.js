@@ -128,6 +128,22 @@ jest.mock('@stellar/stellar-sdk', () => ({
     })),
   },
   StrKey: {
+    encodeEd25519PublicKey: jest.fn((payload) => {
+      const byte = Buffer.isBuffer(payload) && payload.length > 0 ? payload[0] : 1;
+      const alphabet = 'BCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+      return `G${'A'.repeat(54)}${alphabet[byte % alphabet.length]}`;
+    }),
+    encodeContract: jest.fn((payload) => {
+      const byte = Buffer.isBuffer(payload) && payload.length > 0 ? payload[0] : 1;
+      const alphabet = 'BCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+      return `C${'A'.repeat(54)}${alphabet[byte % alphabet.length]}`;
+    }),
+    isValidEd25519PublicKey: jest.fn((value) => {
+      return typeof value === 'string' && /^G[A-Z2-7]{55}$/.test(value) && !/^G{56}$/.test(value);
+    }),
+    isValidContract: jest.fn((value) => {
+      return typeof value === 'string' && /^C[A-Z2-7]{55}$/.test(value) && !/^C{56}$/.test(value);
+    }),
     isValidContractId: jest.fn((contractId) => {
       if (typeof contractId !== 'string') return false;
       const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;

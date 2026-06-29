@@ -16,7 +16,7 @@
 'use strict';
 
 const db = require('../db/knex');
-const { isValidStellarAddress } = require('../utils/stellarAddress');
+const { isValidStellarAddress } = require('../utils/validators');
 
 const TABLE = 'investor_commitments';
 
@@ -98,7 +98,7 @@ function validateAmountStroops(value) {
 }
 
 /**
- * Validate a Stellar public key (G... or C..., 56 characters total).
+ * Validate a Stellar StrKey address (G... account or C... contract).
  *
  * @param {string} address - The candidate Stellar address.
  * @returns {{ valid: boolean, reason: string }} Result object.

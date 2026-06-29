@@ -20,7 +20,7 @@ const logger = require('../logger');
 const {
   isValidStellarAccountAddress,
   isValidStellarContractAddress,
-} = require('../utils/stellarAddress');
+} = require('../utils/validators');
 
 /**
  * Default TTL for token metadata cache in milliseconds (30 minutes).

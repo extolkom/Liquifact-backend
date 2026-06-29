@@ -16,6 +16,11 @@ const {
   validateInvoicePayload,
   SUPPORTED_CURRENCIES,
 } = require('../schemas/invoice');
+const {
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+  isValidStellarAddress,
+} = require('./stellarAddress');
 
 /**
  * Supported ISO 4217 currency codes (Set for O(1) look-up).
@@ -230,4 +235,7 @@ module.exports = {
   validateMarketplaceQueryParams,
   validateInvoicePayload,
   VALID_CURRENCIES,
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+  isValidStellarAddress,
 };
