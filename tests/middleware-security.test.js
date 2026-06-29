@@ -43,6 +43,33 @@ function assertStructuredError(response, expected) {
   assert.equal(response.headers['x-correlation-id'], response.body.error.correlation_id);
 }
 
+test('identifier middleware echoes one canonical id across request and correlation headers', async () => {
+  const app = createApp({ enableTestRoutes: true, securityToken: VALID_TOKEN });
+  const response = await request(app)
+    .get('/missing-route')
+    .set('X-Request-Id', 'request-abc123')
+    .set('X-Correlation-Id', 'correl-xyz789');
+
+  assert.equal(response.status, 404);
+  assert.equal(response.body.error.correlation_id, 'request-abc123');
+  assert.equal(response.headers['x-request-id'], 'request-abc123');
+  assert.equal(response.headers['x-correlation-id'], 'request-abc123');
+});
+
+test('identifier middleware rejects invalid request-id aliases before using correlation id', async () => {
+  const app = createApp({ enableTestRoutes: true, securityToken: VALID_TOKEN });
+  const response = await request(app)
+    .get('/missing-route')
+    .set('X-Request-Id', 'bad id with spaces')
+    .set('request-id', 'bad.id.with.dots')
+    .set('X-Correlation-Id', 'trace-safe-123');
+
+  assert.equal(response.status, 404);
+  assert.equal(response.body.error.correlation_id, 'trace-safe-123');
+  assert.equal(response.headers['x-request-id'], 'trace-safe-123');
+  assert.equal(response.headers['x-correlation-id'], 'trace-safe-123');
+});
+
 test('protected endpoint rejects requests without Authorization header', async () => {
   const app = createApp({ enableTestRoutes: true, securityToken: VALID_TOKEN });
   const response = await request(app).get('/__test__/auth');
