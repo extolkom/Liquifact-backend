@@ -80,6 +80,10 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `KYC_PROVIDER_API_KEY` | string | External KYC disabled when unset | Required with `KYC_PROVIDER_URL` outside test | **Secret** | [`src/config/index.js`](../src/config/index.js), [`src/services/kycService.js`](../src/services/kycService.js) |
 | `KYC_PROVIDER_SECRET` | string | Optional webhook/request HMAC validation | No | **Secret** | [`src/config/index.js`](../src/config/index.js), [`src/services/kycService.js`](../src/services/kycService.js) |
 | `LIQUIFACT_ESCROW_CONTRACT_ID` | Stellar contract ID | None | Required for escrow funding stubs that resolve a contract | No | [`tests/escrowSubmit.stub.test.js`](../tests/escrowSubmit.stub.test.js) |
+| `IDEMPOTENCY_KEY_TTL_HOURS` | integer hours | `24` | No | No | [`src/middleware/idempotency.js`](../src/middleware/idempotency.js) |
+| `IDEMPOTENCY_PURGE_BATCH_SIZE` | integer, `1..10000` | `1000` | No | No | [`src/jobs/idempotencyPurge.js`](../src/jobs/idempotencyPurge.js) |
+| `IDEMPOTENCY_PURGE_INTERVAL_MS` | integer milliseconds, min `60000` | `3600000` | No | No | [`src/jobs/idempotencyPurge.js`](../src/jobs/idempotencyPurge.js) |
+| `IDEMPOTENCY_PURGE_MAX_BATCHES` | integer, `1..1000` | `100` | No | No | [`src/jobs/idempotencyPurge.js`](../src/jobs/idempotencyPurge.js) |
 <!-- env-reference:end -->
 
 ## Sync Notes

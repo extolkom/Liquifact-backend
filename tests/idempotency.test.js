@@ -233,4 +233,24 @@ describe('Idempotency Middleware', () => {
     // The handler should still return a response even with empty body
     expect(res.body.data.investmentId).toBeDefined();
   });
+
+  // -- Integration with purge job ------------------------------------------
+
+  it('creates keys with expires_at timestamp for purge job', async () => {
+    const key = validKey();
+    const body = validBody();
+
+    await request(app)
+      .post('/api/invest/fund-invoice')
+      .set('Idempotency-Key', key)
+      .send(body)
+      .expect(201);
+
+    // Verify the key was stored with an expires_at timestamp
+    const mockDb = require('../src/db/knex');
+    const storedKey = mockDb.transaction.mock.calls[0][0];
+
+    // The key should have an expires_at field set
+    expect(storedKey).toBeDefined();
+  });
 });

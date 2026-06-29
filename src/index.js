@@ -70,7 +70,12 @@ function createApp() {
 }
 
 
+// Start background workers when running as main module (not in tests)
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
+  // Start the idempotency purge worker
+  const { startPurgeWorker } = require('./jobs/idempotencyPurge');
+  startPurgeWorker();
+
   startServer();
 }
 

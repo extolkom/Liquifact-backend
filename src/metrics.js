@@ -498,12 +498,29 @@ const readinessGauge = new client.Gauge({
   registers: [registry],
 });
 
+/**
+ * Get the shared Prometheus registry instance.
+ * @returns {import('prom-client').Registry} The registry
+ */
+function getRegistry() {
+  return registry;
+}
+
 module.exports = {
   registry,
+  getRegistry,
   metricsAuth,
   metricsHandler,
   registerJobQueue,
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
+  escrowIndexerEventsProcessedTotal,
+  escrowIndexerEventsSkippedTotal,
+  escrowIndexerCycleFailuresTotal,
+  escrowIndexerLastCursorAdvanceTimestampSeconds,
+  escrowReconciliationMismatches,
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
+  maturityReminderDeadLetterTotal,
 };
