@@ -78,6 +78,9 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `RATE_LIMIT_API_KEY_WINDOW_MS` | integer milliseconds | `900000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
 | `RATE_LIMIT_API_KEY_MAX` | integer | `1000` | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) |
 | `WEB_CONCURRENCY` | integer | `1` (single-instance default) | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issues #429 cluster-detection signal |
+| `INVOICE_FRAUD_CEILING` | number > 0 | `10000000` | No | No | [`src/config/verificationThresholds.js`](../src/config/verificationThresholds.js) |
+| `INVOICE_MANUAL_REVIEW_THRESHOLD` | number > 0, `<= INVOICE_FRAUD_CEILING` | `1000000` | No | No | [`src/config/verificationThresholds.js`](../src/config/verificationThresholds.js) |
+| `INVOICE_TENANT_THRESHOLDS` | JSON object of per-tenant overrides | Empty (defaults apply to all tenants) | No | No | [`src/config/verificationThresholds.js`](../src/config/verificationThresholds.js) |
 | `CLUSTER_WORKERS` | integer | `1` (single-instance default) | No | No | [`src/middleware/rateLimit.js`](../src/middleware/rateLimit.js) — issues #429 alt cluster-detection signal |
 | `SOROBAN_BATCH_CONCURRENCY` | integer, `1..50` | `5` | No | No | [`src/config/index.js`](../src/config/index.js) |
 | `SOROBAN_BATCH_TIMEOUT_MS` | integer milliseconds, `100..30000` | `5000` | No | No | [`src/config/index.js`](../src/config/index.js) |
@@ -95,6 +98,50 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `IDEMPOTENCY_PURGE_INTERVAL_MS` | integer milliseconds, min `60000` | `3600000` | No | No | [`src/jobs/idempotencyPurge.js`](../src/jobs/idempotencyPurge.js) |
 | `IDEMPOTENCY_PURGE_MAX_BATCHES` | integer, `1..1000` | `100` | No | No | [`src/jobs/idempotencyPurge.js`](../src/jobs/idempotencyPurge.js) |
 <!-- env-reference:end -->
+
+## Invoice Verification Thresholds
+
+The invoice-verification service ([`src/services/invoiceVerification.js`](../src/services/invoiceVerification.js)) screens invoice amounts against two configurable thresholds, resolved by [`src/config/verificationThresholds.js`](../src/config/verificationThresholds.js):
+
+| Threshold | Decision when matched | Comparison | Env var | Default |
+| --- | --- | --- | --- | --- |
+| Fraud ceiling | `REJECTED` | `amount > fraudCeiling` (strictly greater) | `INVOICE_FRAUD_CEILING` | `10000000` |
+| Manual-review threshold | `MANUAL_REVIEW` | `amount >= manualReviewThreshold` (at or above) | `INVOICE_MANUAL_REVIEW_THRESHOLD` | `1000000` |
+
+The defaults reproduce the previously hardcoded behavior, so an existing deployment that sets neither variable observes no change.
+
+**Validation.** Each value must be a finite number greater than `0`, and `manualReviewThreshold` must be `<= fraudCeiling` (otherwise the manual-review band is unreachable). Invalid configuration is rejected: `resolveThresholds()` throws a `VerificationConfigError`, and the verification service **fails closed** — it returns `MANUAL_REVIEW` with reason code `CONFIG_UNAVAILABLE` rather than auto-approving or hard-rejecting.
+
+### Per-Tenant Overrides
+
+`INVOICE_TENANT_THRESHOLDS` is a JSON object keyed by tenant id. Each entry may override either or both fields; omitted fields fall back to the global defaults. Overrides are validated with the same rules as the globals.
+
+```json
+{
+  "tenant-acme":   { "fraudCeiling": 5000000, "manualReviewThreshold": 500000 },
+  "tenant-globex": { "manualReviewThreshold": 250000 }
+}
+```
+
+In the example above, `tenant-acme` gets a stricter ceiling and review threshold, while `tenant-globex` only tightens the review threshold and keeps the default `10000000` fraud ceiling. A tenant id with no entry — and a request with no tenant id — uses the global defaults.
+
+**Security.** Thresholds and overrides come exclusively from configuration set by an operator/admin via the environment. The per-tenant map is parsed into a `Map`, so prototype-pollution keys such as `__proto__` cannot be resolved as tenants. The tenant id passed to `verifyInvoice(payload, { tenantId })` must originate from the **trusted authenticated context** — never from the untrusted invoice payload. Any `tenantId` (or threshold-like field) present on the payload itself is ignored.
+
+### Reason Codes
+
+Every non-approval decision carries a stable, machine-readable `reasonCode` (in addition to the human-readable `reason`) so downstream handlers can branch reliably without string matching. `VERIFIED` outcomes carry no reason code.
+
+| `reasonCode` | Status | Meaning |
+| --- | --- | --- |
+| `INVALID_PAYLOAD` | `REJECTED` | Payload missing or not an object. |
+| `INVALID_AMOUNT` | `REJECTED` | Amount not a positive, finite number. |
+| `INVALID_CUSTOMER` | `REJECTED` | Customer missing, not a string, or empty/whitespace. |
+| `AMOUNT_EXCEEDS_FRAUD_CEILING` | `REJECTED` | Amount exceeded the resolved fraud ceiling. |
+| `MANUAL_REVIEW_REQUIRED` | `MANUAL_REVIEW` | Amount met or exceeded the resolved manual-review threshold. |
+| `SUSPICIOUS_CUSTOMER` | `REJECTED` | Customer string contained injection characters (`< > { } $`). |
+| `CONFIG_UNAVAILABLE` | `MANUAL_REVIEW` | Threshold configuration was invalid; failed closed to manual review. |
+
+These codes are part of the service contract: existing values must not be renamed or repurposed.
 
 ## Sync Notes
 
