@@ -76,8 +76,10 @@ Clients can bypass the cache by sending a `Cache-Control: no-cache` request head
 | Endpoint                                | Cache key format                                           | TTL      |
 |-----------------------------------------|------------------------------------------------------------|----------|
 | `GET /api/marketplace`                  | `marketplace:<tenantId>:<originalUrl>`                     | 15s      |
-| `GET /api/investor/locks`               | `investor:locks:<tenantId>:<originalUrl>`                  | 15s      |
-| `GET /api/investor/locks/:invoiceId`    | `investor:lock:<tenantId>:<invoiceId>:<funderAddress>`     | 15s      |
+| `GET /api/investor/locks`               | `investor:locks:<tenantId>:<principalScope>:<originalUrl>` | 15s      |
+| `GET /api/investor/locks/:invoiceId`    | `investor:lock:<tenantId>:<principalScope>:<invoiceId>:<funderAddress>` | 15s      |
+
+For investor-lock responses, `<principalScope>` is `admin:<role>` for tenant-wide admin or owner reads, or `funder:<boundAddress>` for non-admin investor reads. This prevents one authenticated principal from receiving another principal's cached lock response when the URL is otherwise identical.
 
 ### Tenant isolation
 
@@ -1390,7 +1392,7 @@ Any violation throws a `CommitmentValidationError` with a typed `.code`:
 
 ### Address validation
 
-`validateAddress(address)` checks that the investor address is a valid Stellar public key (G… or C… prefix, 56 base-32 characters). It returns `{ valid, reason }` and is also called from the `GET /api/investor/locks` routes to validate the `funderAddress` query parameter.
+`validateAddress(address)` checks that the investor address is a valid Stellar public key (G… or C… prefix, 56 base-32 characters). It returns `{ valid, reason }` and is also called from the `GET /api/investor/locks` routes to validate the requested `funderAddress` query parameter and the funder address bound to a non-admin caller.
 
 ### Idempotency
 
@@ -1413,10 +1415,10 @@ The service maintains a `Map`-backed lock cache (claimNotBefore, investorEffecti
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/investor/locks` | List locks, optional `funderAddress` / `invoiceId` filters |
-| `GET` | `/api/investor/locks/:invoiceId` | Single lock for a specific invoice and funder |
+| `GET` | `/api/investor/locks` | List the caller's funder locks, with optional `funderAddress` / `invoiceId` filters |
+| `GET` | `/api/investor/locks/:invoiceId` | Single lock for a specific invoice and authorized funder |
 
-Both routes require a valid JWT (`Authorization: Bearer <token>`). An invalid `funderAddress` returns `400` with `{ error: "invalid Stellar address: …" }`.
+Both routes require a valid JWT (`Authorization: Bearer <token>`). Non-admin callers are scoped to the `funderAddress`, `walletAddress`, `stellarAddress`, or `investorAddress` claim on their authenticated principal. If they omit `funderAddress`, the routes use the bound funder address automatically. If they request a different funder, the routes return `403`. Admin and owner callers may list all tenant locks or inspect any funder. An invalid `funderAddress` returns `400` with `{ error: "invalid Stellar address: …" }`.
 
 ---
 

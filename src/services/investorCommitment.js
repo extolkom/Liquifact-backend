@@ -341,7 +341,7 @@ function clearInvestorLocks() {
 /** Seed representative test fixtures (test helper). */
 function seedInvestorLocks() {
   const addr1 = 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK';
-  const addr2 = 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL';
+  const addr2 = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA';
 
   for (let i = 1; i <= 5; i++) {
     setInvestorLock({ funderAddress: addr1, claimNotBefore: `2026-0${i}-01T00:00:00Z`, investorEffectiveYieldBps: 500 + i * 50, invoiceId: `inv_${7788 + i - 1}` });

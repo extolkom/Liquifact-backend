@@ -26,6 +26,7 @@
 
 const logger = require('../logger');
 const { cacheStoreErrorsTotal } = require('../metrics');
+const { getInvestorLockPrincipalScope } = require('../utils/investorLockScope');
 
 /**
  * Creates an Express middleware that caches JSON responses with a TTL.
@@ -130,7 +131,7 @@ function makeMarketplaceKey(req) {
  */
 function makeInvestorLocksKey(req) {
   const tenantId = req.tenantId || 'unknown';
-  return 'investor:locks:' + tenantId + ':' + req.originalUrl;
+  return 'investor:locks:' + tenantId + ':' + getInvestorLockPrincipalScope(req) + ':' + req.originalUrl;
 }
 
 /**
@@ -142,7 +143,7 @@ function makeInvestorLocksKey(req) {
  */
 function makeInvestorLockKey(req) {
   const tenantId = req.tenantId || 'unknown';
-  return 'investor:lock:' + tenantId + ':' + req.params.invoiceId + ':' + req.query.funderAddress;
+  return 'investor:lock:' + tenantId + ':' + getInvestorLockPrincipalScope(req) + ':' + req.params.invoiceId + ':' + req.query.funderAddress;
 }
 
 /**
