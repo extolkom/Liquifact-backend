@@ -19,6 +19,9 @@ const ConfigSchema = z
     JWT_ALGORITHMS: z.string().optional().default('HS256'), // Comma-separated allowlist, e.g. HS256,RS256
     JWT_ISSUER: z.string().optional(), // Optional issuer claim to enforce
     JWT_AUDIENCE: z.string().optional(), // Optional audience claim to enforce
+    CURSOR_SECRET: z.string().min(32).optional(), // Dedicated marketplace cursor HMAC secret
+    CURSOR_TTL_ENABLED: z.enum(['true', 'false']).default('false'),
+    CURSOR_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
     CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
     NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
@@ -36,6 +39,13 @@ const ConfigSchema = z
   })
   .superRefine((data, ctx) => {
     if (data.NODE_ENV === 'test') { return; }
+    if (data.NODE_ENV === 'production' && !data.CURSOR_SECRET && !data.JWT_SECRET) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'CURSOR_SECRET or JWT_SECRET must be configured in production.',
+        path: ['CURSOR_SECRET'],
+      });
+    }
     const hasUrl = Boolean(data.KYC_PROVIDER_URL);
     const hasKey = Boolean(data.KYC_PROVIDER_API_KEY);
     if (hasUrl !== hasKey) {

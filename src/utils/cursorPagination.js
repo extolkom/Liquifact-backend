@@ -7,16 +7,40 @@
 
 const crypto = require('crypto');
 
-const CURSOR_SECRET = process.env.CURSOR_SECRET || process.env.JWT_SECRET || 'dev-cursor-secret-change-in-prod';
+const DEV_CURSOR_SECRET = 'dev-cursor-secret-change-in-prod';
 
 const ALLOWED_SORT_FIELDS = Object.freeze(['yield_bps', 'maturity_date', 'funded_ratio', 'amount', 'created_at']);
 
 /**
+ * Resolves the HMAC secret used to sign and verify opaque cursors.
+ * Production must use a real CURSOR_SECRET or JWT_SECRET. The public dev
+ * fallback is available only for local development and test runs.
+ *
+ * @returns {string} Cursor signing secret.
+ * @throws {Error} When no real secret is configured outside development/test.
+ */
+function _resolveCursorSecret() {
+  const configuredSecret = process.env.CURSOR_SECRET || process.env.JWT_SECRET;
+  if (configuredSecret) {
+    return configuredSecret;
+  }
+
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  if (nodeEnv === 'development' || nodeEnv === 'test') {
+    return DEV_CURSOR_SECRET;
+  }
+
+  throw new Error('CURSOR_SECRET or JWT_SECRET must be configured for cursor pagination outside development/test');
+}
+
+/**
+ * Signs a base64url cursor payload with the resolved HMAC secret.
+ *
  * @param {string} payload
  * @returns {string}
  */
 function _sign(payload) {
-  return crypto.createHmac('sha256', CURSOR_SECRET).update(payload).digest('hex');
+  return crypto.createHmac('sha256', _resolveCursorSecret()).update(payload).digest('hex');
 }
 
 /**
@@ -117,6 +141,8 @@ function decodeCursor(cursor, expectedSortField) {
  */
 class CursorError extends Error {
   /**
+   * Create a cursor domain error.
+   *
    * @param {string} message
    */
   constructor(message) {
