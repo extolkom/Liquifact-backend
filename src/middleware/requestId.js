@@ -19,6 +19,7 @@
 
 const { randomUUID } = require('crypto');
 const { createRequestLogger } = require('../logger');
+const { run } = require('../requestContext');
 const REQUEST_ID_HEADER_NAMES = ['x-request-id', 'request-id'];
 
 /**
@@ -123,7 +124,9 @@ const requestId = (req, res, next) => {
   // Echo the validated id so clients/proxies can see it.
   res.setHeader('X-Request-Id', id);
 
-  next();
+  // Seed the AsyncLocalStorage context so all downstream async work
+  // (services, jobs dispatched within the request) automatically inherit it.
+  run({ requestId: id }, next);
 };
 
 module.exports = requestId;
