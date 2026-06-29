@@ -38,6 +38,7 @@ Part of the LiquiFact stack: frontend (Next.js) | backend (this repo) | contract
 
    > [!IMPORTANT]
    > **Startup Validation Gate**: The application validates all required environment variables at boot time before binding to a port. If the configuration is invalid (e.g. `JWT_SECRET` is shorter than 32 characters or KYC keys are half-configured), the server will print a redacted error summary showing the failed keys and exit immediately. Secret values are never exposed in validation output.
+   > Authentication uses the validated `JWT_SECRET`, algorithm allowlist, issuer, and audience settings from the central config. The literal `test-secret` fallback is only permitted when `NODE_ENV=test`; in every other environment unavailable auth config rejects the request instead of accepting forgeable tokens.
 
 4. Start database services
 
