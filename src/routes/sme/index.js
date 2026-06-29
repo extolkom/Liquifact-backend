@@ -10,6 +10,9 @@ const router = express.Router();
 const metricsRoutes = require('./metrics');
 const multer = require('multer');
 const storageService = require('../../services/storage');
+const { extractTenant } = require('../../middleware/tenant');
+const idempotencyMiddleware = require('../../middleware/idempotency');
+const logger = require('../../logger');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -21,7 +24,8 @@ const upload = multer({
 router.use('/', metricsRoutes);
 
 // POST /api/sme/invoice/presigned-url - Request a presigned upload URL
-router.post('/invoice/presigned-url', express.json(), async (req, res) => {
+router.post('/invoice/presigned-url', express.json(), extractTenant, idempotencyMiddleware, async (req, res) => {
+  const requestLogger = logger.createRequestLogger(req);
   try {
     const { fileName, mimeType, fileSize } = req.body;
 
@@ -31,7 +35,7 @@ router.post('/invoice/presigned-url', express.json(), async (req, res) => {
       });
     }
 
-    const tenantId = req.user?.id || req.user?.sub || 'unknown';
+    const tenantId = req.tenantId;
     const invoiceId = req.body.invoiceId || crypto.randomUUID();
 
     const result = await storageService.getPresignedUploadUrl({
@@ -49,22 +53,23 @@ router.post('/invoice/presigned-url', express.json(), async (req, res) => {
       invoiceId,
     });
   } catch (error) {
-    if (error.code === 'INVALID_MIME_TYPE' || error.code === 'FILE_TOO_LARGE') {
+    if (error.code === 'INVALID_MIME_TYPE' || error.code === 'FILE_TOO_LARGE' || error.code === 'INVALID_TENANT_ID') {
       return res.status(400).json({ error: error.message });
     }
-    console.error('Presigned URL error:', error);
+    requestLogger.error({ err: error }, 'Presigned URL error');
     res.status(500).json({ error: 'Failed to generate presigned upload URL' });
   }
 });
 
 // POST /api/sme/invoice - Upload PDF invoice
-router.post('/invoice', upload.single('invoice'), async (req, res) => {
+router.post('/invoice', upload.single('invoice'), extractTenant, async (req, res) => {
+  const requestLogger = logger.createRequestLogger(req);
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'Invoice file is required' });
     }
 
-    const tenantId = req.user?.id || req.user?.sub || 'unknown';
+    const tenantId = req.tenantId;
     const invoiceId = req.body?.invoiceId || crypto.randomUUID();
 
     const key = await storageService.uploadFile(
@@ -84,10 +89,10 @@ router.post('/invoice', upload.single('invoice'), async (req, res) => {
       invoiceId,
     });
   } catch (error) {
-    if (error.code === 'INVALID_MIME_TYPE' || error.code === 'FILE_TOO_LARGE') {
+    if (error.code === 'INVALID_MIME_TYPE' || error.code === 'FILE_TOO_LARGE' || error.code === 'INVALID_TENANT_ID') {
       return res.status(400).json({ error: error.message });
     }
-    console.error('Upload error:', error);
+    requestLogger.error({ err: error }, 'Upload error');
     res.status(500).json({ error: 'Failed to upload invoice' });
   }
 });

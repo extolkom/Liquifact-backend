@@ -5,7 +5,7 @@
  */
 
 const crypto = require('crypto');
-const logger = require('../logger');
+const metrics = require('../metrics');
 
 const JOB_STATUS = {
   PENDING:    'pending',
@@ -25,10 +25,17 @@ class JobQueue {
   constructor(options = {}) {
     this.maxRetries   = Math.min(options.maxRetries ?? 3, 10);
     this.maxQueueSize = options.maxQueueSize || 10000;
-    this._persistence = options.persistence ?? null;
-    this.jobs         = new Map();
-    this.queue        = [];
-    this.retryQueue   = [];
+    
+    // Using Map for efficient O(1) lookups
+    this.jobs = new Map();
+    
+    // Queue structure: array of job IDs
+    this.queue = [];
+    
+    // Retry queue: separate queue for jobs that need retrying
+    this.retryQueue = [];
+
+    metrics.registerJobQueue(this);
   }
 
   /**

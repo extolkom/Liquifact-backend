@@ -39,16 +39,39 @@ The system distinguishes between **permanent** and **transient** SMTP errors:
 
 ### Dead-Lettering
 When a maturity reminder fails after exhausting all retries (or encounters a permanent error):
-1. The email is **dead-lettered** to an in-memory queue for manual inspection
+1. A sanitized record is written to `maturity_reminder_dead_letters` for durable inspection
 2. A Prometheus counter (`maturity_reminder_dead_letter_total`) is incremented with the failure reason
-3. Logging records the error details for debugging and alerting
+3. Persistence runs asynchronously so a database outage cannot stall the reminder loop
 
 Dead-letter entries include:
-- `invoiceId`: Invoice associated with the failed reminder
-- `email`: Recipient email address
-- `error`: Error object with code, message, SMTP response, and permanent/transient classification
-- `timestamp`: ISO-8601 timestamp of the failure
-- `maxAttempts`: Number of retry attempts that were made
+- `id`: Durable dead-letter identifier
+- `job_id`: Background job identifier
+- `invoice_id`: Invoice associated with the failed reminder
+- `reason`: Bounded failure category used by the existing metric
+- `attempts`: Number of SMTP delivery attempts
+- `payload_metadata`: Job type and target date only
+- `created_at`: Database insertion timestamp
+
+Recipient email, customer name, invoice amount, generated email subject/body, and raw SMTP error text are deliberately excluded. Operators can correlate `invoice_id` with access-controlled invoice records when investigation requires more context.
+
+### Inspecting Dead Letters
+
+Use the service read path from an authenticated admin workflow or an operations REPL:
+
+```javascript
+const { listReminderDeadLetters } = require('./src/jobs/maturityReminders');
+
+// Newest failures first; limit is capped at 200.
+const failures = await listReminderDeadLetters({ limit: 50 });
+
+// Narrow an investigation to one bounded failure category.
+const timeouts = await listReminderDeadLetters({
+  reason: 'smtp_timeout',
+  limit: 50,
+});
+```
+
+Because this read path queries the database rather than process memory, entries remain inspectable after an application restart. An empty result is returned as `[]`.
 
 ## Metrics
 
@@ -76,7 +99,7 @@ sum by (reason) (rate(maturity_reminder_dead_letter_total[5m]))
 Our job execution manages `cancellable jobs`. E.g., if an invoice is settled well before the maturity date, we should refrain from bothering the end-user with a reminder. We achieve this with a localized map mapping `invoiceId`s to `jobId`s.
 The localized map does not pose a significant memory constraint since successful deliveries cleanly evict mapped keys, keeping state extremely lightweight.
 
-The dead-letter queue is also bounded to 1000 entries to prevent unbounded memory growth. When the limit is reached, the oldest entry is discarded.
+Dead letters are stored in the database and inspection queries are capped at 200 rows per call.
 
 ## Code Interactions
 
@@ -87,11 +110,8 @@ It handles deduplication seamlessly: re-scheduling a reminder manually drops the
 ### `cancelReminder(invoiceId)`
 A straightforward utility for the Express controller. Pass the invoice ID if the invoice is successfully settled entirely, which prunes it off the BackgroundWorker's waiting block.
 
-### `getDeadLetterQueue()`
-Retrieves a copy of the dead-letter queue for debugging and manual recovery operations.
-
-### `clearDeadLetterQueue()`
-Clears the dead-letter queue after manual investigation or recovery.
+### `listReminderDeadLetters(options)`
+Queries durable dead letters, newest first. Supported options are `limit` (default 50, maximum 200) and `reason`.
 
 ## Testing manually using Node.js REPL
 
@@ -101,7 +121,7 @@ const {
   scheduleReminder,
   startQueueProcessing,
   templates,
-  getDeadLetterQueue
+  listReminderDeadLetters
 } = require('./src/jobs/maturityReminders');
 
 startQueueProcessing();
@@ -110,9 +130,9 @@ const simulatedInvoice = { id: 'test_123', customer: 'Alice', amount: 50 };
 // Schedules immediately (since it's in the past)
 scheduleReminder(simulatedInvoice, new Date(), 'alice@example.com');
 
-// After a few seconds, check dead-letter queue (if delivery failed)
-setTimeout(() => {
-  console.log('Dead letters:', getDeadLetterQueue());
+// After a few seconds, query durable dead letters (if delivery failed)
+setTimeout(async () => {
+  console.log('Dead letters:', await listReminderDeadLetters({ limit: 20 }));
 }, 2000);
 ```
 
@@ -201,3 +221,55 @@ Direct upload via multipart form (multer), validated server-side.
 | `AWS_SECRET_ACCESS_KEY` | - | S3 secret key |
 | `S3_BUCKET` | `liquifact-invoices` | S3 bucket name |
 | `BODY_LIMIT_INVOICE` | `512kb` | Max invoice file size |
+
+---
+
+## Observability — Prometheus Metrics
+
+Two counters are emitted per delivery attempt. Both carry **bounded** label sets to prevent Prometheus time-series cardinality explosion.
+
+### `maturity_reminder_delivery_attempts_total`
+
+Incremented once per attempt, regardless of outcome.
+
+**Labels:**
+
+| Label      | Allowed values                                          |
+|------------|---------------------------------------------------------|
+| `reason`   | `smtp_timeout`, `smtp_reject`, `template_error`, `unknown` |
+| `job_type` | `maturity_reminder`, `unknown`                          |
+
+On a successful send the `reason` label is `unknown` (no failure to categorise).
+
+### `maturity_reminder_dead_letter_total`
+
+Incremented only when the job handler throws (i.e. the message is dead-lettered).
+
+**Labels:** same as above, with `reason` populated by the failure class.
+
+### Reason normalisation
+
+Raw SMTP error strings are **never** written directly to a label. The `normalizeReminderReason` helper (in `src/metrics.js`) maps them to one of the four bounded values:
+
+| Raw error pattern                             | Label value      |
+|-----------------------------------------------|------------------|
+| "timeout", "ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "connect" | `smtp_timeout` |
+| "reject", "550"–"554", "421"–"452", "EAUTH"  | `smtp_reject`    |
+| "template"                                    | `template_error` |
+| Everything else / non-string / empty          | `unknown`        |
+
+**PII guarantee:** the raw error message is never stored in any label value. No recipient email address or invoice content can appear in Prometheus time series.
+
+### Dashboard / alert queries
+
+```promql
+# Delivery failure rate (5 m window)
+rate(maturity_reminder_dead_letter_total[5m])
+
+# SMTP timeouts in the last hour
+increase(maturity_reminder_dead_letter_total{reason="smtp_timeout"}[1h])
+
+# Total attempts by job type
+rate(maturity_reminder_delivery_attempts_total[5m])
+```
+

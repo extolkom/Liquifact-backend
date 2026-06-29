@@ -14,8 +14,19 @@
  * state machine, investor commitment) flush groups of related cache entries
  * without knowing the exact keys.
  *
+ * Cache store read/write failures are reported through the structured logger
+ * (`req.log` when available, falling back to the root application logger) and
+ * recorded on the `cache_store_errors_total` Prometheus counter — the request
+ * always falls through so a cache outage never blocks the caller.
+ *
+ * Cached payloads are never included in log output.
+ *
  * @module middleware/cache
  */
+
+const logger = require('../logger');
+const { cacheStoreErrorsTotal } = require('../metrics');
+const { getInvestorLockPrincipalScope } = require('../utils/investorLockScope');
 
 /**
  * Creates an Express middleware that caches JSON responses with a TTL.
@@ -27,8 +38,10 @@
  * The cache is bypassed when the request carries a `Cache-Control: no-cache`
  * header, allowing clients to always fetch fresh data.
  *
- * Cache store errors are caught and logged — the request always falls through
- * to the next handler so the cache never blocks a request.
+ * Cache store errors are caught and reported through the structured logger
+ * with request context (requestId, correlationId) — the request always falls
+ * through to the next handler so the cache never blocks a request. Cached
+ * values are never written to log output.
  *
  * @param {object}    options          - Middleware configuration.
  * @param {number}    options.ttl      - Cache TTL in milliseconds.
@@ -59,7 +72,8 @@ function cacheResponse({ ttl, store, keyFn }) {
     try {
       cached = store.get(key);
     } catch (err) {
-      console.warn('Cache store get error, falling through:', err.message);
+      cacheStoreErrorsTotal.inc();
+      (req.log || logger).warn({ err, component: 'cache' }, 'Cache store get error, falling through');
       return next();
     }
 
@@ -83,7 +97,8 @@ function cacheResponse({ ttl, store, keyFn }) {
         try {
           store.set(key, body, ttl);
         } catch (err) {
-          console.warn('Cache store set error:', err.message);
+          cacheStoreErrorsTotal.inc();
+          (req.log || logger).warn({ err, component: 'cache' }, 'Cache store set error');
         }
       }
       return originalJson(body);
@@ -116,7 +131,7 @@ function makeMarketplaceKey(req) {
  */
 function makeInvestorLocksKey(req) {
   const tenantId = req.tenantId || 'unknown';
-  return 'investor:locks:' + tenantId + ':' + req.originalUrl;
+  return 'investor:locks:' + tenantId + ':' + getInvestorLockPrincipalScope(req) + ':' + req.originalUrl;
 }
 
 /**
@@ -128,7 +143,7 @@ function makeInvestorLocksKey(req) {
  */
 function makeInvestorLockKey(req) {
   const tenantId = req.tenantId || 'unknown';
-  return 'investor:lock:' + tenantId + ':' + req.params.invoiceId + ':' + req.query.funderAddress;
+  return 'investor:lock:' + tenantId + ':' + getInvestorLockPrincipalScope(req) + ':' + req.params.invoiceId + ':' + req.query.funderAddress;
 }
 
 /**
@@ -137,7 +152,8 @@ function makeInvestorLockKey(req) {
  * This is called by write-side services (invoice state machine, investor
  * commitment) so that subsequent reads return fresh data.
  *
- * Errors from the store are caught and logged — invalidation failures never
+ * Errors from the store are caught and reported through the structured logger
+ * and the `cache_store_errors_total` counter — invalidation failures never
  * propagate to the caller.
  *
  * @param {object} store  - Cache store instance with a `delByPrefix` method.
@@ -148,7 +164,8 @@ function invalidatePrefix(store, prefix) {
   try {
     store.delByPrefix(prefix);
   } catch (err) {
-    console.warn('Cache invalidation error:', err.message);
+    cacheStoreErrorsTotal.inc();
+    logger.warn({ err, component: 'cache', cachePrefix: prefix }, 'Cache invalidation error');
   }
 }
 

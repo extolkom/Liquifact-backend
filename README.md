@@ -38,6 +38,7 @@ Part of the LiquiFact stack: frontend (Next.js) | backend (this repo) | contract
 
    > [!IMPORTANT]
    > **Startup Validation Gate**: The application validates all required environment variables at boot time before binding to a port. If the configuration is invalid (e.g. `JWT_SECRET` is shorter than 32 characters or KYC keys are half-configured), the server will print a redacted error summary showing the failed keys and exit immediately. Secret values are never exposed in validation output.
+   > Authentication uses the validated `JWT_SECRET`, algorithm allowlist, issuer, and audience settings from the central config. The literal `test-secret` fallback is only permitted when `NODE_ENV=test`; in every other environment unavailable auth config rejects the request instead of accepting forgeable tokens.
 
 4. Start database services
 
@@ -53,6 +54,9 @@ Part of the LiquiFact stack: frontend (Next.js) | backend (this repo) | contract
 
 ---
 
+## Configuration Reference
+
+For a complete, tested mapping of every environment variable to its type, default, consumer, and secret status, see [`docs/configuration.md`](./docs/configuration.md).
 ## Response Caching
 
 The backend includes a TTL-based response-cache middleware backed by an in-memory store. Caching is applied to expensive read endpoints to reduce latency and database load.
@@ -73,8 +77,10 @@ Clients can bypass the cache by sending a `Cache-Control: no-cache` request head
 | Endpoint                                | Cache key format                                           | TTL      |
 |-----------------------------------------|------------------------------------------------------------|----------|
 | `GET /api/marketplace`                  | `marketplace:<tenantId>:<originalUrl>`                     | 15s      |
-| `GET /api/investor/locks`               | `investor:locks:<tenantId>:<originalUrl>`                  | 15s      |
-| `GET /api/investor/locks/:invoiceId`    | `investor:lock:<tenantId>:<invoiceId>:<funderAddress>`     | 15s      |
+| `GET /api/investor/locks`               | `investor:locks:<tenantId>:<principalScope>:<originalUrl>` | 15s      |
+| `GET /api/investor/locks/:invoiceId`    | `investor:lock:<tenantId>:<principalScope>:<invoiceId>:<funderAddress>` | 15s      |
+
+For investor-lock responses, `<principalScope>` is `admin:<role>` for tenant-wide admin or owner reads, or `funder:<boundAddress>` for non-admin investor reads. This prevents one authenticated principal from receiving another principal's cached lock response when the URL is otherwise identical.
 
 ### Tenant isolation
 
@@ -165,11 +171,107 @@ Health state is also surfaced as a Prometheus gauge (`readiness_gauge`).
 
 Environment variables:
 
+- `SOROBAN_RPC_URL` - Optional Soroban RPC endpoint. When unset, Soroban readiness reports `unknown` and does not block readiness.
+- `SOROBAN_HEALTH_TIMEOUT_MS` - Soroban readiness probe abort timeout in milliseconds. Defaults to `5000` and is clamped to `250-10000`.
+- `SOROBAN_LATENCY_WARN_MS` - RPC latency at or below this value is reported as `healthy`. Defaults to `200`.
+- `SOROBAN_LATENCY_FAIL_MS` - RPC latency above this value is reported as `unhealthy`, with `degraded` between warn and fail. Defaults to `500`.
 - `SENTRY_DSN` — Optional Sentry DSN. Example: `https://<PUBLIC_KEY>@o<ORG_ID>.ingest.sentry.io/<PROJECT_ID>`
 - `SENTRY_RELEASE` — Optional release tag. Defaults to package version when available.
 - `SENTRY_ENVIRONMENT` — Optional environment tag. Defaults to `NODE_ENV`.
 
 Do not store secrets in source control. Use `.env` locally and deployment secrets in production.
+
+### Prometheus metrics
+
+The application exposes Prometheus metrics on `GET /metrics` (subject to the same auth rules). Additional gauges added for background job observability:
+
+- `liquifact_job_queue_depth`: Number of pending jobs currently waiting in background queues (includes main queue across registered job queues).
+- `liquifact_job_retry_queue_size`: Number of jobs currently waiting in retry queues across registered job queues.
+- `liquifact_worker_inflight_count`: Number of jobs currently being processed by registered background workers.
+- `soroban_rpc_call_duration_seconds`: Histogram of end-to-end Soroban RPC wrapper latency, labelled by bounded `method` and `outcome` values. The timing includes retry delays because it measures the full `callSorobanContract()` wrapper path.
+- `soroban_rpc_retry_causes_total`: Counter of Soroban retry attempts, labelled by bounded `cause` values (`timeout`, `429`, `5xx`, `unknown`).
+
+These gauges are updated by sampling registered `JobQueue` and `BackgroundWorker` instances and are intentionally bounded to avoid high-cardinality labels.
+
+Soroban metric labels are intentionally coarse and bounded:
+
+- `method` is normalized to a small allowlist of method families such as `contract_call`, `simulate_transaction`, and `get_ledger_entries`. Unknown or untrusted values are collapsed to `unknown`.
+- `outcome` is limited to `success`, `error`, or `circuit_open`.
+- `cause` is limited to `timeout`, `429`, `5xx`, or `unknown`.
+
+No request payloads, contract arguments, presigned URLs, bearer tokens, or other secrets are included in metric labels.
+
+Example PromQL:
+
+```promql
+# 95th percentile end-to-end Soroban latency by method
+histogram_quantile(
+  0.95,
+  sum(rate(soroban_rpc_call_duration_seconds_bucket[5m])) by (le, method)
+)
+
+# Retry rate by retry cause
+sum(rate(soroban_rpc_retry_causes_total[5m])) by (cause)
+```
+
+### Body-size limit rejection metrics
+
+The `body_size_limit_rejections_total` counter tracks every request rejected with HTTP 413 Payload Too Large, labelled by the body parser type that rejected it:
+
+| Label `type` | Trigger |
+|---|---|
+| `json` | Rejected by the global JSON body parser (default 100 KB) |
+| `urlencoded` | Rejected by the URL-encoded body parser (default 50 KB) |
+| `invoice` | Rejected by the stricter invoice upload parser (default 512 KB) |
+| `unknown` | Rejected by the generic error handler when content-type cannot be determined |
+
+This counter is designed for **DoS detection**: a sudden spike in any `type` label indicates a potential attack attempting to overwhelm the API with oversized payloads.
+
+#### DoS detection alert rules
+
+The following PromQL alerts detect rapid increases in body-size rejections. A sustained rate of 10+ rejections per minute is a strong signal of a volumetric DoS attempt.
+
+```promql
+# Alert when JSON body-size rejections exceed 10 per minute (potential DoS)
+rate(body_size_limit_rejections_total{type="json"}[5m]) > 0.167
+
+# Alert when urlencoded body-size rejections exceed 10 per minute
+rate(body_size_limit_rejections_total{type="urlencoded"}[5m]) > 0.167
+
+# Aggregate alert across ALL body-size limit types
+sum(rate(body_size_limit_rejections_total[5m])) > 0.167
+```
+
+**Tuning guidance:**
+
+| Environment | Suggested rate threshold | Rationale |
+|---|---|---|
+| Development / CI | `> 0.5` (30/min) | Higher baseline from automated test traffic |
+| Production (normal) | `> 0.167` (10/min) | Expected occasional oversized payloads from legitimate clients |
+| Production (locked down) | `> 0.017` (1/min) | Very low tolerance — almost all oversized payloads are malicious |
+
+For production deployments, include the full YAML alert rule from [`docs/prometheus-rules.yml`](./docs/prometheus-rules.yml).
+
+### Grafana dashboard
+
+Import the pre-built Grafana dashboard to visualize body-size limit rejection metrics over time:
+
+  1. Open Grafana → **+** → **Import**.
+  2. Upload or paste [`docs/grafana-dashboard.json`](./docs/grafana-dashboard.json).
+  3. Select your Prometheus data source.
+  4. Click **Import**.
+
+The dashboard includes the following panels:
+
+| Panel | Type | Description |
+|---|---|---|
+| Rejection Rate by Type | Time series | `rate(body_size_limit_rejections_total[5m])` per `type` label (json, urlencoded, invoice, unknown) + aggregate |
+| Current Rejection Rate | Stat | Live rate with green/yellow/red background thresholds matching alert severity |
+| Rejections by Type (Current) | Bar gauge | Instant per-type rates for quick scanning |
+| Cumulative Rejections (Last Hour) | Bar gauge | `increase()[1h]` per type — sustained values > 600 suggest probing |
+| Cumulative Rejections Over Time | Time series | Hourly increase per type over the selected time window |
+| Alert Threshold Reference | Bar gauge | Combined rate with visual threshold markers |
+| Historical Rejection Heatmap | Time series (step) | All-types aggregate with color-coded severity bands |
 
 ---
 
@@ -279,6 +381,96 @@ On success, `req.apiClient` is set to `{ clientId, scopes }`.
 
 ---
 
+## Docker / Deployment
+
+The production image is built with two hardening measures that address
+container-security best practices (CIS Docker Benchmark):
+
+### Image overview
+
+| Property | Value |
+|---|---|
+| Base image | `node:20-slim` |
+| Build strategy | Multi-stage (deps → runtime) |
+| Runtime user | `appuser` (UID 1001, non-root) |
+| Dependency install | `npm ci --omit=dev` against committed `package-lock.json` |
+| Health probe | `GET /readyz` (HTTP 200 = healthy) |
+| Exposed port | `3001` |
+
+### Non-root runtime user
+
+The final image creates a dedicated `appuser`/`appgroup` (UID/GID 1001) and
+switches to that identity before `CMD`. The process therefore runs without
+`root` privileges, limiting the blast radius of any application-layer exploit.
+
+```dockerfile
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid appgroup --no-create-home --shell /bin/false appuser
+...
+USER appuser
+```
+
+### Lockfile-verified install
+
+`npm ci` requires `package-lock.json` to be present and in sync with
+`package.json`. If the lockfile is absent or diverged the build fails
+immediately — no silent version drift into production.
+
+> **Note:** `package-lock.json` must be committed to the repository.
+> The `.gitignore` was updated to allow this file; run
+> `npm install` locally and commit the generated lockfile before building the
+> Docker image.
+
+### Multi-stage build
+
+The `deps` stage installs dependencies; the `runtime` stage copies only the
+resolved `node_modules` and application source. Build tooling, npm itself,
+and any intermediate files never reach the final layer.
+
+### Building and running
+
+```bash
+# Build the hardened image
+docker build -t liquifact-backend:latest .
+
+# Run with required environment variables
+docker run --rm \
+  -p 3001:3001 \
+  -e NODE_ENV=production \
+  -e DATABASE_URL=postgresql://user:pass@host:5432/db \
+  liquifact-backend:latest
+
+# Verify the container runs as a non-root user
+docker run --rm --entrypoint id liquifact-backend:latest
+# Expected output: uid=1001(appuser) gid=1001(appgroup) groups=1001(appgroup)
+```
+
+### Edge cases
+
+| Scenario | Behaviour |
+|---|---|
+| `package-lock.json` missing | `npm ci` fails; `docker build` exits non-zero |
+| `package-lock.json` out of sync | `npm ci` fails; `docker build` exits non-zero |
+| Health check during startup | `--start-period=5s` absorbs boot time; probe retried up to 3× |
+| Non-root file permissions | `chown -R appuser:appgroup /app` grants app full access to its own tree |
+
+### Graceful Shutdown
+
+The application implements coordinated graceful shutdown to prevent request interruption, prevent database pool leaking, and allow background jobs to drain properly.
+
+When a termination signal (`SIGTERM` or `SIGINT`) is received:
+1. **HTTP Listener Closure**: The server immediately stops accepting new HTTP connections via `server.close()`.
+2. **Request Draining**: Existing active HTTP requests are allowed to complete. Idle keep-alive connections are closed immediately.
+3. **Background Worker Stop**: The active background worker is stopped gracefully using `worker.stop()`, allowing in-flight jobs to complete.
+4. **Knex Pool Destruction**: The Knex database connection pool is closed (`db.destroy()`).
+5. **Clean Exit**: The process exits cleanly with status code `0`.
+
+#### Configuration
+
+- `SHUTDOWN_TIMEOUT_MS`: The maximum time (in milliseconds) to wait for all phases of graceful shutdown to complete before forcing a process exit with status code `1` (defaults to `10000` / 10 seconds).
+
+---
+
 ## Development
 
 | Command | Description |
@@ -342,7 +534,7 @@ npm run db:migrate
 
 ### Key Features
 
-- **Multi-tenant isolation** with tenant-scoped data
+- **Multi-tenant isolation** with tenant-scoped data (see [`docs/multi-tenancy.md`](./docs/multi-tenancy.md))
 - **Soft deletes** for data recovery
 - **Audit trail** for compliance
 - **UUID primary keys** for distributed systems
@@ -360,12 +552,15 @@ The API is documented using OpenAPI 3.0 specification.
 - **Interactive Docs**: `GET /docs` - Swagger UI for exploring and testing the API
 - **Correlation Strategy**: See [`docs/invoice-correlation.md`](./docs/invoice-correlation.md) for details on how `invoiceId` correlates with on-chain Stellar and Soroban data.
 - **Signing Modes**: See [`docs/ops-signing.md`](./docs/ops-signing.md) for details on the escrow transaction signing modes (delegated, custodial, stubbed).
+- **Multi-Tenancy Model**: See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md) for details on the multi-tenant architecture and data isolation constraints.
 
 The documentation covers all public endpoints including health checks, invoice management, escrow operations, and investment opportunities.
 
 - **Marketplace**: `GET /api/marketplace` - Search and sort invoices by yield, maturity, and funded ratio. Supports advanced filtering (`yieldBpsMin`, `maturityDateTo`, `fundedRatioMin`, etc.) and both **cursor-based** and offset pagination.
 
   **Cursor pagination (recommended)** — stable under inserts/deletes; use the `nextCursor` value from one response as the `cursor` param in the next request. Cursors are opaque and HMAC-signed; any modification returns 400.
+
+  Cursor signatures use `CURSOR_SECRET` when set, otherwise `JWT_SECRET`. The public development fallback is only available in `development` and `test`; production deployments must configure a real secret before signing or verifying cursors. For production, prefer `CURSOR_TTL_ENABLED=true` with a bounded `CURSOR_TTL_SECONDS` such as `3600` to limit replay windows. Shorter TTLs reduce replay risk but can expire long-running pagination sessions.
 
   **Offset pagination (legacy)** — use `page` + `limit` as before. `nextCursor` and `hasMore` are also returned so clients can migrate incrementally.
 
@@ -410,7 +605,13 @@ The `src/middleware/smeAuth.js` middleware binds Stellar wallet authorization st
 
 ### Address format
 
-All wallet addresses are validated against `^G[A-Z2-7]{55}$` (Stellar Ed25519 public key format). Invalid formats yield a `400` before any capital-movement logic runs.
+All SME wallet addresses are validated as Stellar account public keys (`G...` StrKeys). Contract addresses (`C...`) are intentionally rejected here because this middleware binds user accounts to wallets, not escrow contracts. Invalid formats yield a `400` before any capital-movement logic runs.
+
+Shared StrKey validation lives in `src/utils/validators.js`:
+
+- `isValidStellarAccountAddress(value)` accepts only `G...` account public keys.
+- `isValidStellarContractAddress(value)` accepts only `C...` Soroban contract addresses.
+- `isValidStellarAddress(value)` accepts either form for routes and services that can work with both account and contract StrKeys.
 
 ### Error responses
 
@@ -490,6 +691,10 @@ invoice.pdf            -> accepted
 
 ### Tenant and Invoice Validation
 
+Tenant IDs are **required** for all SME upload operations, provided either via:
+- `X-Tenant-Id` header (service-to-service), or
+- `tenantId` JWT claim (authenticated users).
+
 Tenant IDs and invoice IDs are validated before key generation.
 
 Allowed characters:
@@ -509,6 +714,14 @@ Rejected examples:
 tenant/admin
 inv/123
 ```
+
+### Idempotency for Presigned URL Generation
+
+The `POST /api/sme/invoice/presigned-url` endpoint **requires an `Idempotency-Key` header** to prevent duplicate invoiceId creation and ensure retries don't generate new presigned URLs.
+
+- Valid key format: 8–128 URL-safe characters (a-z, A-Z, 0-9, ., _, :, -)
+- Same key + same body → returns cached response (same invoiceId and presigned URL)
+- Same key + different body → returns 409 Conflict
 
 ### MIME Type Validation
 
@@ -607,6 +820,113 @@ liquifact-backend/
 ## Escrow integration
 
 For the full end-to-end model (indexer → projection → `GET /api/escrow`, funding via `escrowSubmit`, reconciliation, signing modes, and env contracts), see **[`docs/escrow-integration-overview.md`](./docs/escrow-integration-overview.md)**.
+
+---
+
+## Escrow Reconciliation
+
+Nightly reconciliation compares the DB-side `fundedTotal` against the on-chain `funded_amount` for every invoice in `linked_escrow`, `funded`, or `partially_funded` state. Each run is persisted to the `reconciliation_runs` table and metrics are emitted to Prometheus.
+
+### Architecture
+
+| Component | Location | Notes |
+|-----------|----------|-------|
+| Job | `src/jobs/reconcileEscrow.js` | Injectable `dbClient` and `escrowAdapter` for testability |
+| Metrics | `src/metrics.js` | Four new Prometheus instruments (see below) |
+| History API | `GET /api/admin/reconciliation/runs` | Admin-only, tenant-scoped, paginated |
+| Migration | `migrations/20260429000000_create_reconciliation_runs.js` | One row per run; `reconciled_at` indexed |
+| Ops guide | `docs/ops-reconcile.md` | Full architecture, alerting rules, troubleshooting |
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `escrow_reconciliation_mismatches_total` | Counter | Cumulative per-invoice mismatch count (use with `increase()` in alerts) |
+| `escrow_reconciliation_mismatched_invoices` | Gauge | Mismatch count in the **most recent** run |
+| `escrow_reconciliation_drift_magnitude` | Gauge | Sum of `|DB − on-chain|` across all mismatches in the most recent run |
+| `escrow_reconciliation_drift_alerts_total` | Counter | Runs that breached `RECONCILIATION_DRIFT_THRESHOLD` |
+
+Suggested Prometheus alert rules:
+
+```promql
+# Alert on any drift detected in the last 26 hours:
+increase(escrow_reconciliation_mismatches_total[26h]) > 0
+
+# Alert when a run explicitly exceeded the configured threshold:
+increase(escrow_reconciliation_drift_alerts_total[26h]) > 0
+```
+
+### Drift threshold alerting
+
+Set `RECONCILIATION_DRIFT_THRESHOLD` (integer, default `1`) to control when a run is treated as a threshold breach. When the number of mismatches in a single run meets or exceeds this value:
+
+1. `escrow_reconciliation_drift_alerts_total` is incremented.
+2. An **error-level** structured log is emitted with `mismatches`, `threshold`, `totalDrift`, and `reconciledAt` fields.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RECONCILIATION_DRIFT_THRESHOLD` | `1` | Mismatch count that triggers a drift alert log and counter increment |
+
+### History endpoint
+
+```
+GET /api/admin/reconciliation/runs
+Authorization: Bearer <admin-token>   (or X-API-Key)
+X-Tenant-Id: <tenant-id>
+```
+
+Returns a paginated list of recent reconciliation run summaries, newest first. Per-invoice `results` are excluded from list rows — raw on-chain values are never leaked here.
+
+**Query parameters**
+
+| Param | Default | Range | Description |
+|-------|---------|-------|-------------|
+| `limit` | 20 | 1–100 | Rows per page |
+| `page` | 1 | ≥ 1 | 1-based page number |
+
+**Example response**
+
+```json
+{
+  "data": [
+    {
+      "id": "b1c2d3e4-...",
+      "total": 150,
+      "matches": 148,
+      "mismatches": 2,
+      "errors": 0,
+      "reconciled_at": "2026-06-25T02:00:00.000Z",
+      "created_at": "2026-06-25T02:00:01.000Z"
+    }
+  ],
+  "meta": {
+    "total": 42,
+    "page": 1,
+    "limit": 20,
+    "totalPages": 3,
+    "hasMore": true,
+    "timestamp": "...",
+    "version": "0.1.0"
+  },
+  "message": "Reconciliation runs retrieved successfully."
+}
+```
+
+**Security**
+
+- Admin-only: requires a valid JWT bearer token or API key.
+- Tenant-scoped: `x-tenant-id` header or JWT `tenantId` claim required.
+- No raw on-chain values (contract addresses, XDR, ledger keys) are surfaced in any response or error.
+
+### Running reconciliation manually
+
+```bash
+node -e "require('./src/jobs/reconcileEscrow').performReconciliation().then(s => console.log(s))"
+```
+
+For full ops guidance (cron scheduling, Soroban RPC config, error handling, troubleshooting), see [`docs/ops-reconcile.md`](./docs/ops-reconcile.md).
+
+---
 
 ## Escrow Address Mapping
 
@@ -843,13 +1163,86 @@ tests/load/reports/
 
 ## Resiliency & Retries
 
-### Soroban RPC Circuit Breaker
+### Circuit Breaker (`src/utils/circuitBreaker.js`)
 
-Soroban RPC reads are routed through a circuit breaker to prevent cascading failures during sustained RPC outages.
-The breaker trips to an `OPEN` state after a configurable threshold of failures (default 5) and begins failing fast,
-returning a `503 Service Unavailable` with `code = 'CIRCUIT_OPEN'`.
+The project uses a circuit breaker pattern to protect against cascading failures from unstable external dependencies
+(Soroban RPC, Redis, KYC provider, etc.).
 
-After a recovery timeout (default 10s), the breaker transitions to `HALF_OPEN` and probes the RPC. If successful, it closes and resumes normal operation; if it fails, it re-opens. State transitions are tracked as a Prometheus metric: `soroban_circuit_breaker_state_transitions_total`.
+#### State lifecycle
+
+```
+CLOSED → (failureThreshold reached) → OPEN → (recoveryTimeout elapsed) → HALF_OPEN → (success) → CLOSED
+                                                                                      → (failure) → OPEN
+```
+
+- **CLOSED** — Normal operation; requests pass through to the dependency.
+- **OPEN** — Requests fail fast (or return a fallback) without calling the dependency.
+- **HALF_OPEN** — A single probe request is allowed; success recovers the breaker, failure re-opens it.
+
+#### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `name` | `'default'` | Unique label attached to Prometheus metrics so each dependency is distinguishable |
+| `failureThreshold` | `5` | Consecutive failures before the breaker trips to OPEN |
+| `recoveryTimeout` | `10000` | Milliseconds before OPEN → HALF_OPEN transition |
+| `fallbackLogic` | `null` | Function returning alternative data when the circuit is OPEN |
+| `onStateChange` | `null` | Callback `(oldState, newState)` fired on every state transition |
+
+#### `reset()` method
+
+Forces the breaker back to the **CLOSED** state and clears the failure count. Operators can call `reset()`
+after deploying a fix to a dependency (e.g., restarting Soroban RPC, redeploying Redis) without waiting
+for the recovery timeout.
+
+```js
+breaker.reset();
+console.log(breaker.state);       // 'CLOSED'
+console.log(breaker.failureCount); // 0
+```
+
+> **Security:** `reset()` is an instance method — it cannot be triggered by untrusted HTTP input. No external
+> caller can force-reset a breaker that it does not hold a reference to.
+
+#### Metrics
+
+Every state transition emits a Prometheus counter:
+
+```
+soroban_circuit_breaker_state_transitions_total{breaker_name="soroban",state="OPEN"}
+```
+
+Labels:
+- `breaker_name` — Distinguishes breakers per dependency (`soroban`, `redis`, `kyc`, …)
+- `state` — The target state (`CLOSED`, `OPEN`, `HALF_OPEN`)
+
+Cardinality is bounded: (#breaker names) × (3 states). The counter is defined in `src/metrics.js` and
+shims gracefully when `prom-client` is not installed (no throws, no-ops).
+
+#### Usage examples
+
+Creating a named breaker:
+
+```js
+const { CircuitBreaker } = require('./utils/circuitBreaker');
+
+const redisBreaker = new CircuitBreaker({
+  name: 'redis',
+  failureThreshold: 3,
+  recoveryTimeout: 5000,
+  fallbackLogic: () => null,
+});
+```
+
+#### Soroban RPC Circuit Breaker
+
+Soroban RPC reads are routed through the shared breaker (`src/services/soroban.js`, name `soroban`).
+Configuration is read from environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOROBAN_CB_FAILURE_THRESHOLD` | `5` | Consecutive failures before tripping |
+| `SOROBAN_CB_RECOVERY_TIMEOUT` | `10000` | Milliseconds before half-open probe |
 
 ### Security notes
 
@@ -915,6 +1308,7 @@ All API failures now return a consistent structured error payload:
 - The API returns it in both the response body and the `X-Correlation-Id` header.
 - If a client sends `X-Correlation-Id` and it matches the accepted pattern, the value is echoed back.
 - Invalid client-supplied IDs are ignored and replaced with a generated ID.
+- Each request also gets a per-request child logger attached to `req.log`, which carries the request ID and correlation ID in structured log fields without binding secrets or request payloads.
 
 ### Structured failure behavior
 
@@ -1011,7 +1405,7 @@ Any violation throws a `CommitmentValidationError` with a typed `.code`:
 
 ### Address validation
 
-`validateAddress(address)` checks that the investor address is a valid Stellar public key (G… or C… prefix, 56 base-32 characters). It returns `{ valid, reason }` and is also called from the `GET /api/investor/locks` routes to validate the `funderAddress` query parameter.
+`validateAddress(address)` checks that the investor address is a valid Stellar public key (G… or C… prefix, 56 base-32 characters). It returns `{ valid, reason }` and is also called from the `GET /api/investor/locks` routes to validate the requested `funderAddress` query parameter and the funder address bound to a non-admin caller.
 
 ### Idempotency
 
@@ -1034,10 +1428,10 @@ The service maintains a `Map`-backed lock cache (claimNotBefore, investorEffecti
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/investor/locks` | List locks, optional `funderAddress` / `invoiceId` filters |
-| `GET` | `/api/investor/locks/:invoiceId` | Single lock for a specific invoice and funder |
+| `GET` | `/api/investor/locks` | List the caller's funder locks, with optional `funderAddress` / `invoiceId` filters |
+| `GET` | `/api/investor/locks/:invoiceId` | Single lock for a specific invoice and authorized funder |
 
-Both routes require a valid JWT (`Authorization: Bearer <token>`). An invalid `funderAddress` returns `400` with `{ error: "invalid Stellar address: …" }`.
+Both routes require a valid JWT (`Authorization: Bearer <token>`). Non-admin callers are scoped to the `funderAddress`, `walletAddress`, `stellarAddress`, or `investorAddress` claim on their authenticated principal. If they omit `funderAddress`, the routes use the bound funder address automatically. If they request a different funder, the routes return `403`. Admin and owner callers may list all tenant locks or inspect any funder. An invalid `funderAddress` returns `400` with `{ error: "invalid Stellar address: …" }`.
 
 ---
 
@@ -1091,8 +1485,9 @@ Both ends of the pipeline attach `error` listeners. If the database stream or th
 
 Every CSV field is processed by `escapeCsvField()` in `src/services/auditLogStore.js`:
 
-1. **Leading-character neutralisation** — cells beginning with `=`, `+`, `-`, `@`, TAB, or CR are prefixed with a single quote (`'`). This prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or a DDE command.
-2. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
+1. **Leading-whitespace normalisation** — the field is checked after stripping leading whitespace (`trimStart()`), so values like ` =HYPERLINK(...)` or `\t=cmd` are caught even when the dangerous character is not in position 0.
+2. **Leading-character neutralisation** — cells whose first non-whitespace character is `=`, `+`, `-`, `@`, `|`, TAB, or CR are prefixed with a single quote (`'`). This covers the full OWASP CSV Injection list and prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or DDE command.
+3. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
 
 #### Tenant isolation
 
@@ -1234,7 +1629,7 @@ The backend sends maturity reminders to relevant parties before invoices reach t
 
 - **Exponential backoff**: Transient SMTP failures (4xx, network errors) are automatically retried with configurable backoff (default: 3 attempts, ~1s base delay, doubling each attempt)
 - **Error classification**: Permanent SMTP failures (5xx, invalid recipient) fail immediately without retry to avoid wasting resources
-- **Dead-lettering**: Emails that fail after all retries are dead-lettered to an in-memory queue for manual inspection and recovery
+- **Dead-lettering**: Emails that fail after all retries are recorded as sanitized rows in `maturity_reminder_dead_letters` for durable inspection
 - **Observability**: Prometheus counters track delivery attempts, successes, and dead-lettered messages with fine-grained failure reasons
 
 #### Configuration

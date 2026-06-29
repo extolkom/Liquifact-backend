@@ -9,12 +9,18 @@
  * there so all callers continue to work without modification.
  */
 
+const { ALL_INVOICE_STATUSES } = require('../services/invoiceStateMachine');
 // ── Zod-backed invoice payload validator (re-export) ─────────────────────────
 
 const {
   validateInvoicePayload,
   SUPPORTED_CURRENCIES,
 } = require('../schemas/invoice');
+const {
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+  isValidStellarAddress,
+} = require('./stellarAddress');
 
 /**
  * Supported ISO 4217 currency codes (Set for O(1) look-up).
@@ -38,7 +44,7 @@ function validateInvoiceQueryParams(query) {
   const { status, smeId, buyerId, dateFrom, dateTo, sortBy, order } = query;
 
   if (status !== undefined) {
-    const validStatuses = ['paid', 'pending', 'overdue'];
+    const validStatuses = ALL_INVOICE_STATUSES;
     if (validStatuses.includes(status)) {
       validatedParams.filters.status = status;
     } else {
@@ -137,7 +143,7 @@ function validateMarketplaceQueryParams(query) {
   } = query;
 
   if (status !== undefined) {
-    const validStatuses = ['pending_verification', 'verified', 'funded', 'partially_funded', 'completed', 'defaulted'];
+    const validStatuses = ALL_INVOICE_STATUSES;
     if (validStatuses.includes(status)) {
       validatedParams.filters.status = status;
     } else {
@@ -229,4 +235,7 @@ module.exports = {
   validateMarketplaceQueryParams,
   validateInvoicePayload,
   VALID_CURRENCIES,
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+  isValidStellarAddress,
 };

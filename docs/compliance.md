@@ -550,6 +550,97 @@ curl -X POST http://localhost:3001/api/invest/fund-invoice \
 
 ---
 
+## Legal-Hold Compliance Gate — Fail-Closed Policy (issue #424)
+
+**Status**: Production-ready.  
+**Date**: June 2026.  
+**Relates to**: Issue #424 — Treat an unknown legal-hold read result as fail-closed instead of defaulting to false.
+
+### Why fail-closed
+
+The legal-hold flag is a compliance gate. A held escrow MUST NOT receive
+funding. Prior to issue #424, `src/services/escrowRead.js#fetchLegalHold`
+collapsed any read failure (RPC outage, timeout, circuit-breaker open)
+into `false`, downstream `/api/escrow/:invoiceId/fund` then proceeded as
+if "not held". That is a silent compliance bypass: every transient Soroban
+outage is a window during which a held invoice could be funded.
+
+### Tri-state outcome
+
+`fetchLegalHoldStatus(invoiceId, adapter)` returns a tri-state envelope:
+
+| Status     | Meaning                                            | Funding gate response         |
+|------------|----------------------------------------------------|-------------------------------|
+| `held`     | On-chain flag is truthy.                           | `423 Locked` RFC 7807         |
+| `not_held` | On-chain flag is falsy.                            | `next()` — funding permitted   |
+| `unknown`  | RPC error / circuit open / timeout / adapter throw | `503 Service Unavailable`     |
+
+The `unknown` case additionally:
+
+1. Increments the dedicated counter `legal_hold_unknown_blocks_total{reason}`.
+2. Emits a structured `logger.warn({event: 'legal_hold_status_unavailable',
+   component, invoiceId, reason, errorCode}, ...)`.
+3. Returns a problem+json response of type
+   `https://liquifact.com/probs/legal-hold-status-unavailable`.
+
+### Read-side fail-closed
+
+For backwards compatibility, `state.legal_hold` (boolean) reflects
+**both** `held` and `unknown` as `true`. This means any legacy caller of
+`/api/escrow/:invoiceId` that branches on `if (state.legal_hold === false)`
+is also fail-closed: a read that produced `unknown` will not be flagged as
+"safe to fund". The full tri-state is available as `state.legalHoldStatus`,
+`state.legalHoldReason`, and `state.legalHoldErrorCode` for operators and
+dashboards that need to distinguish a verified hold from an outage.
+
+### Operational runbook
+
+- **Alert on `rate(legal_hold_unknown_blocks_total[5m]) > 0`** — every
+  occurrence is a Soroban read outage impacting funding paths.
+- **Group by `reason`** — `rpc_error` is from upstream, `adapter_error`
+  is from a misbehaving caller-supplied adapter, `service_unavailable`
+  is from the gate missing a usable service factory.
+- **Reconciliation** — the existing reconcile job will surface stuck
+  funding requests whose hold status moved from `unknown → held` once
+  the upstream service recovers.
+- **Per-invoiceId triage** — the `legalHoldUnknownBlocksTotal` counter
+  intentionally does NOT carry an `invoiceId` label to keep Prometheus
+  series cardinality bounded. Per-invoice triage is performed via the
+  structured warn log (event=`legal_hold_status_unavailable`) or by
+  inspecting `state.legalHoldErrorCode` on individual escrow-read
+  responses.
+- **Held blocks** — `legal_hold_blocks_total{outcome="held"}` is the
+  separate counter for verified holds. Operators querying "how many
+  funding requests did we block today" should sum both counters and
+  group by `outcome`.
+- **No manual override** — operators do NOT have a "skip gate" knob. The
+  only safe remediation is to wait for the upstream service and retry.
+
+### Tests
+
+`tests/escrow.legalhold.test.js` covers:
+
+- `fetchLegalHoldStatus`: all four outcomes (truthy, falsy, RPC error,
+  generic throw), plus the canonical `LEGAL_HOLD_STATUS` constant.
+- `fetchLegalHold` (legacy boolean projection): `true → true`, `false →
+  false`, `unknown → false` (explicit fail-closed documentation in the
+  test).
+- `readEscrowState` (fail-closed at the data layer): `legal_hold === true`
+  on both `held` and `unknown`; `legalHoldStatus`, `legalHoldReason`,
+  `legalHoldErrorCode` populated on the unknown case.
+- `legalHoldGate()`: 423 on `held`, 200 on `not_held`, 503 RFC 7807 on
+  `unknown`, metric increment, structured warn log, 400 on missing
+  invoiceId, 400 on empty invoiceId, falling closed when an adapter
+  throws, boolean-adapter coercion.
+
+Run:
+
+```bash
+npm test -- tests/escrow.legalhold.test.js
+```
+
+---
+
 ## Support & Troubleshooting
 
 ### Common Issues
@@ -614,125 +705,54 @@ Before production deployment:
 
 ---
 
-## Invoice Audit Trail & State-Transition History API
+## Audit-Trail Per-Invoice Authorization (Issue #426)
 
-**Status**: Implemented  
-**Date**: May 2026  
-**Relates to**: Issue #208 — Add admin endpoint for invoice audit trail and state-transition history export
+### Problem
 
-### Overview
+The audit-trail endpoint previously scoped queries only by `req.tenantId`. A tenant member could iterate `invoiceId` values and read audit logs for invoices they had no relationship to within the same tenant.
 
-Compliance operators can retrieve and export the full audit history for any invoice, including all mutations and state transitions. All endpoints are admin-gated and tenant-isolated.
+### Authorization rule
 
-### Endpoints
+Before streaming audit events, the endpoint enforces three conditions via `assertInvoiceEntitlement`:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/admin/audit/invoices/:invoiceId` | Paginated audit trail |
-| GET | `/api/admin/audit/invoices/:invoiceId/transitions` | State-transition history |
-| GET | `/api/admin/audit/invoices/:invoiceId/export` | Export as JSON or CSV |
+1. **Invoice exists** — the invoice must be present and not soft-deleted.
+2. **Tenant ownership** — the invoice's `tenant_id` must match the caller's `req.tenantId`.
+3. **Role check** — the caller's JWT `role` claim must be `admin` or `owner`. Any other role (e.g. `investor`, `viewer`, absent) is denied.
 
-### Authentication
+**All failure cases return `404 Not Found`** — not `403 Forbidden`. This prevents existence leakage: a caller cannot distinguish "invoice doesn't exist" from "invoice belongs to another tenant" from "insufficient role".
 
-All endpoints accept either:
-- `Authorization: Bearer <JWT>` — admin JWT with `tenantId` claim
-- `X-API-KEY: <key>` — service-to-service API key
-
-Tenant context is resolved from the `x-tenant-id` header (highest priority) or the `tenantId` JWT claim. Requests without a resolvable tenant are rejected with `400`.
-
-### Tenant Isolation
-
-Every query is scoped to the authenticated operator's tenant. An operator cannot retrieve audit records belonging to another tenant.
-
-### Pagination
-
-Query params: `limit` (1–500, default 50) and `offset` (default 0).
-
-```bash
-GET /api/admin/audit/invoices/inv-001?limit=20&offset=40
-```
-
-Response includes a `meta` object:
-```json
-{
-  "data": [...],
-  "meta": { "invoiceId": "inv-001", "limit": 20, "offset": 40, "total": 87 }
-}
-```
-
-### Export Formats
-
-#### JSON (default)
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     -H "x-tenant-id: tenant-alpha" \
-     "http://localhost:3001/api/admin/audit/invoices/inv-001/export"
-```
-
-Returns `application/json` — a JSON array of audit log entries.
-
-#### CSV
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     -H "x-tenant-id: tenant-alpha" \
-     "http://localhost:3001/api/admin/audit/invoices/inv-001/export?format=csv" \
-     -o audit-inv-001.csv
-```
-
-Returns `text/csv` with `Content-Disposition: attachment`. CSV columns:
+### Middleware stack
 
 ```
-id,timestamp,actor,action,resourceType,resourceId,statusCode,ipAddress,userAgent
+GET /api/audit-trail/:invoiceId
+  → authenticateToken   (401 if missing/invalid JWT)
+  → extractTenant       (400 if no tenant context)
+  → assertInvoiceEntitlement  (404 for any entitlement failure)
+  → stream audit events
 ```
 
-Fields containing commas, double-quotes, or newlines are RFC 4180-escaped (wrapped in double-quotes, internal quotes doubled).
+### Security properties
 
-### Secret Redaction
+- **Enumeration resistance**: foreign invoices and nonexistent invoices return the same `404` response with no distinguishing body fields.
+- **No tenant leakage**: the response body never includes the `tenant_id` of the requested invoice.
+- **Role minimum**: only `admin` and `owner` may read audit trails. The role check is performed before the DB query so an unpermitted role never triggers a lookup.
 
-Sensitive fields (`password`, `token`, `secret`, `apiKey`, `privateKey`, etc.) are redacted to `***REDACTED***` before any log entry is stored or exported. This is enforced at write time by `sanitizeSensitiveData` in `src/services/auditLog.js` and `redactValue` in `src/services/auditLogStore.js`.
+### Test coverage
 
-### State-Transition History
+File: `tests/auditTrail.api.test.js`
 
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     -H "x-tenant-id: tenant-alpha" \
-     "http://localhost:3001/api/admin/audit/invoices/inv-001/transitions"
-```
+| Scenario | Expected |
+|---|---|
+| admin role, own tenant invoice | 200 with events |
+| owner role, own tenant invoice | 200 with events |
+| investor role | 404 |
+| no role claim in JWT | 404 |
+| invoice from different tenant | 404 |
+| nonexistent invoice | 404 |
+| foreign vs nonexistent indistinguishable | both 404, same body shape |
+| no Authorization header | 401 |
+| tampered token | 401 |
+| no tenant context | 400 |
 
-Response:
-```json
-{
-  "data": [
-    {
-      "id": "AUDIT-...",
-      "timestamp": "2026-05-30T10:00:00.000Z",
-      "actor": "admin-1",
-      "fromState": "pending",
-      "toState": "approved",
-      "reason": null,
-      "ipAddress": "127.0.0.1"
-    }
-  ],
-  "meta": { "invoiceId": "inv-001" }
-}
-```
-
-### Security Notes
-
-- Endpoints are read-only; no mutations are possible through this API.
-- Input validation rejects `invoiceId` values longer than 128 characters.
-- Pagination bounds are clamped server-side (max 500 per page).
-- All responses omit internal stack traces and infrastructure details.
-- The audit log store is append-only at the database layer (see `migrations/202604260002_enforce_audit_log_append_only.sql`).
-
-### Deployment Checklist
-
-- [ ] Ensure `JWT_SECRET` is set in deployment secrets
-- [ ] Confirm `x-tenant-id` header is forwarded by API gateway / load balancer
-- [ ] Verify audit log DB migrations have run (`npm run db:migrate`)
-- [ ] Run tests: `npx jest tests/auditTrail.api.test.js`
-
-**Last Updated**: May 30, 2026  
-**Relates to**: Issue #208
+**Last Updated**: June 2026
+**Relates to**: Issue #426 — Enforce per-invoice authorization on the audit-trail endpoint

@@ -10,9 +10,46 @@ const MAX_TTL_SECONDS = 300;
 const DEFAULT_LEDGER_GAP_THRESHOLD = 3;
 const MAX_LEDGER_GAP_THRESHOLD = 1000;
 
+const redis = require('redis');
+
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+let redisClient = null;
+let isRedisConnected = false;
+
+if (process.env.NODE_ENV !== 'test' || process.env.USE_REDIS_TEST === 'true') {
+  redisClient = redis.createClient({ url: REDIS_URL });
+
+  redisClient.on('connect', () => {
+    isRedisConnected = true;
+    console.log('Redis client linked securely.');
+  });
+
+  redisClient.on('error', (err) => {
+    isRedisConnected = false;
+    console.warn('Redis connection degraded or broken:', err.message);
+  });
+
+  redisClient.connect().catch((err) => {
+    console.warn('Initial Redis connection handshake failed:', err.message);
+  });
+}
+
+/**
+ * Returns the active Redis client context along with its real-time health availability flag.
+ *
+ * Used by [`src/middleware/rateLimit.js`](../middleware/rateLimit.js) to share
+ * the cache-layer Redis client for distributed counters when the operator has
+ * not passed an explicit `redisClient` to createRateLimiter(...).
+ *
+ * @returns {{client: object|null, isAvailable: boolean}} Active client + liveness.
+ */
+function getRedisClient() {
+  return { client: redisClient, isAvailable: isRedisConnected };
+}
 const DEFAULT_TIMEOUT_MS = 500;
 const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 5000;
+
 
 /**
  * Parses a raw value into a positive integer within a specified range.
@@ -260,6 +297,10 @@ function createRedisEscrowSummaryCache({ env = process.env, client, RedisCtor } 
 }
 
 module.exports = {
+  // Primary public surface — kept at top of exports so existing callers that
+  // imported the cache module from an older snapshot continue to work.
+  getRedisClient,
+  // Cache layer API.
   RedisEscrowSummaryCache,
   createRedisClient,
   createRedisEscrowSummaryCache,

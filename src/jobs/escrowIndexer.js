@@ -10,9 +10,46 @@ const {
   escrowIndexerLastCursorAdvanceTimestampSeconds,
 } = require('../metrics');
 
+const { StrKey } = require('@stellar/stellar-sdk');
+
 const INVOICE_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
 const DEFAULT_POLL_INTERVAL_MS = 15_000;
 const DEFAULT_BATCH_SIZE = 100;
+
+/**
+ * Validates a Stellar contract ID using StrKey encoding rules (starts with 'C', correct length, and valid checksum).
+ *
+ * @param {string} contractId - The contract ID to validate.
+ * @returns {boolean} True if the contract ID is valid.
+ */
+function isValidStellarContractId(contractId) {
+  if (typeof contractId !== 'string') {
+    return false;
+  }
+  const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+  if (!CONTRACT_ID_RE.test(contractId)) {
+    return false;
+  }
+  try {
+    return StrKey.isValidContractId(contractId);
+  } catch (_err) {
+    return false;
+  }
+}
+
+/**
+ * Validates a transaction hash (exactly 64 hexadecimal characters, case-insensitive, no prefixes).
+ *
+ * @param {string} txHash - The transaction hash to validate.
+ * @returns {boolean} True if the transaction hash is valid.
+ */
+function isValidTxHash(txHash) {
+  if (typeof txHash !== 'string') {
+    return false;
+  }
+  const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
+  return TX_HASH_RE.test(txHash);
+}
 
 /**
  * Attempts to derive a usable invoice ID from a Horizon/Soroban contract event
@@ -80,6 +117,9 @@ function deriveInvoiceId(record, reverseLookup = resolveInvoiceByAddress) {
   // 3. Reverse lookup by contract address.
   if (record.contract_id && typeof reverseLookup === 'function') {
     const resolved = reverseLookup(String(record.contract_id));
+    if (resolved === String(record.contract_id) || isValidStellarContractId(resolved)) {
+      return null;
+    }
     const fromMap = isValid(resolved);
     if (fromMap) {
       return fromMap;
@@ -121,14 +161,28 @@ function normalizeEvent(rawEvent) {
     throw new Error('ledgerSequence must be a positive integer.');
   }
 
+  const contractId = rawEvent.contractId ? String(rawEvent.contractId).trim() : null;
+  if (contractId !== null && contractId !== '') {
+    if (!isValidStellarContractId(contractId)) {
+      throw new Error('Invalid contractId format or checksum.');
+    }
+  }
+
+  const txHash = rawEvent.txHash ? String(rawEvent.txHash).trim() : null;
+  if (txHash !== null && txHash !== '') {
+    if (!isValidTxHash(txHash)) {
+      throw new Error('Invalid txHash format.');
+    }
+  }
+
   return {
     eventId,
     invoiceId,
     eventType,
     ledgerSequence,
     pagingToken,
-    contractId: rawEvent.contractId ? String(rawEvent.contractId) : null,
-    txHash: rawEvent.txHash ? String(rawEvent.txHash) : null,
+    contractId,
+    txHash,
     eventBody: rawEvent.eventBody || {},
     observedAt: rawEvent.observedAt || new Date().toISOString(),
   };
@@ -472,4 +526,6 @@ module.exports = {
   persistEscrowEvent,
   runEscrowIndexerCycle,
   shouldReplaceProjection,
+  isValidStellarContractId,
+  isValidTxHash,
 };

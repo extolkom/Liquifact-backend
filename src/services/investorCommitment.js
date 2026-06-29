@@ -16,13 +16,9 @@
 'use strict';
 
 const db = require('../db/knex');
-const { getSharedStore } = require('./cacheStore');
-const { invalidatePrefix } = require('../middleware/cache');
+const { isValidStellarAddress } = require('../utils/validators');
 
 const TABLE = 'investor_commitments';
-
-// Stellar public key: G or C followed by exactly 55 base-32 characters (A-Z2-7)
-const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
 
 // Sane upper bound: 10^18 stroops (≈ 10 billion XLM — exceeds total supply)
 const MAX_STROOP_AMOUNT = 10n ** 18n;
@@ -34,6 +30,7 @@ const MAX_STROOP_AMOUNT = 10n ** 18n;
  */
 class CommitmentValidationError extends Error {
   /**
+   * Constructs a CommitmentValidationError.
    * @param {string} message - Human-readable description.
    * @param {string} code    - Machine-readable error code.
    */
@@ -101,7 +98,7 @@ function validateAmountStroops(value) {
 }
 
 /**
- * Validate a Stellar public key (G... or C..., 56 characters total).
+ * Validate a Stellar StrKey address (G... account or C... contract).
  *
  * @param {string} address - The candidate Stellar address.
  * @returns {{ valid: boolean, reason: string }} Result object.
@@ -110,7 +107,7 @@ function validateAddress(address) {
   if (!address || typeof address !== 'string') {
     return { valid: false, reason: 'invalid Stellar address: must be a non-empty string' };
   }
-  if (!STELLAR_ADDRESS_RE.test(address)) {
+  if (!isValidStellarAddress(address)) {
     return {
       valid: false,
       reason: 'invalid Stellar address: must start with G or C and be 56 base-32 characters',
@@ -245,22 +242,6 @@ async function updateCommitment(id, fields) {
 const _lockStore = new Map();
 
 /**
- * Validates a Stellar account address (G... or C..., 56 chars, base32).
- *
- * @param {string} address
- * @returns {{ valid: boolean, reason?: string }}
- */
-function validateAddress(address) {
-  if (!address || typeof address !== 'string') {
-    return { valid: false, reason: 'funderAddress is required and must be a string' };
-  }
-  if (!/^[GC][A-Z2-7]{55}$/.test(address)) {
-    return { valid: false, reason: `invalid Stellar address: "${address}"` };
-  }
-  return { valid: true };
-}
-
-/**
  * Upsert a lock record into the in-memory store.
  *
  * @param {Object} params
@@ -360,7 +341,7 @@ function clearInvestorLocks() {
 /** Seed representative test fixtures (test helper). */
 function seedInvestorLocks() {
   const addr1 = 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK';
-  const addr2 = 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL';
+  const addr2 = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA';
 
   for (let i = 1; i <= 5; i++) {
     setInvestorLock({ funderAddress: addr1, claimNotBefore: `2026-0${i}-01T00:00:00Z`, investorEffectiveYieldBps: 500 + i * 50, invoiceId: `inv_${7788 + i - 1}` });

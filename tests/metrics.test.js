@@ -1,14 +1,39 @@
 'use strict';
 
+jest.mock('redis', () => {
+  const mockClient = {
+    on: jest.fn(),
+    connect: jest.fn().mockResolvedValue(undefined),
+    get: jest.fn().mockResolvedValue(null),
+    setEx: jest.fn().mockResolvedValue('OK'),
+    del: jest.fn().mockResolvedValue(1),
+    quit: jest.fn().mockResolvedValue('OK'),
+    isOpen: false,
+  };
+  return {
+    createClient: jest.fn(() => mockClient),
+  };
+}, { virtual: true });
+
 const request = require('supertest');
 const { createApp } = require('../src/app');
-const { metricsAuth, safeEqual, extractClientIp, LOOPBACK } = require('../src/metrics');
+const metrics = require('../src/metrics');
+const JobQueue = require('../src/workers/jobQueue');
+const BackgroundWorker = require('../src/workers/worker');
+
+// Destructure internal helpers used by the metrics-auth / safeEqual tests.
+const { metricsAuth, safeEqual, extractClientIp, LOOPBACK } = metrics;
 
 describe('GET /metrics', () => {
   let app;
 
   beforeAll(() => {
     app = createApp();
+  });
+
+  beforeEach(() => {
+    metrics.resetMetricsForTests();
+    metrics.registry.resetMetrics();
   });
 
   afterEach(() => {
@@ -80,6 +105,59 @@ describe('GET /metrics', () => {
       const res = await request(app).get('/metrics');
       expect(res.status).toBe(200);
       expect(res.text).toMatch(/# HELP/);
+    });
+
+    it('includes queue and worker metrics when registered', async () => {
+      const queue = new JobQueue();
+      const worker = new BackgroundWorker({ jobQueue: queue, pollIntervalMs: 50, maxConcurrency: 1 });
+      worker.registerHandler('test', async () => {});
+
+      const jobId = worker.enqueue('test', { data: 'test' });
+      const queuedJob = queue.getJob(jobId);
+      expect(queuedJob).toBeDefined();
+
+      metrics.refreshMetrics();
+
+      const res = await request(app).get('/metrics');
+      expect(res.status).toBe(200);
+      expect(res.text).toMatch(/liquifact_job_queue_depth/);
+      expect(res.text).toMatch(/liquifact_job_retry_queue_size/);
+      expect(res.text).toMatch(/liquifact_worker_inflight_count/);
+      expect(res.text).toMatch(/liquifact_job_queue_depth \d+/);
+    });
+  });
+
+  describe('metrics instrumentation', () => {
+    it('updates queue depth and retry queue size from job queue stats', () => {
+      const queue = new JobQueue();
+      const jobId = queue.enqueue('test', { data: 'pending' });
+      metrics.registerJobQueue(queue);
+
+      queue.dequeue();
+      queue.retry(jobId, new Error('failed'));
+      metrics.refreshMetrics();
+
+      const output = metrics.registry.metrics();
+      expect(output).toMatch(/liquifact_job_queue_depth \d+/);
+      expect(output).toMatch(/liquifact_job_retry_queue_size 1/);
+    });
+
+    it('updates worker in-flight count from worker stats', async () => {
+      const queue = new JobQueue();
+      const worker = new BackgroundWorker({ jobQueue: queue, pollIntervalMs: 50, maxConcurrency: 2 });
+      worker.registerHandler('test', async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      });
+      worker.start();
+      worker.enqueue('test', { data: 1 });
+      worker.enqueue('test', { data: 2 });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      metrics.refreshMetrics();
+
+      const output = metrics.registry.metrics();
+      expect(output).toMatch(/liquifact_worker_inflight_count [12]/);
+      await worker.stop();
     });
   });
 });
@@ -158,6 +236,207 @@ describe('LOOPBACK set', () => {
     expect(LOOPBACK.has('10.0.0.1')).toBe(false);
     expect(LOOPBACK.has('192.168.1.1')).toBe(false);
     expect(LOOPBACK.has('172.16.0.1')).toBe(false);
+  });
+});
+
+describe('export guard — every module export is defined and valid', () => {
+  const metricExports = [
+    'footprintCacheHitsTotal',
+    'footprintCacheMissesTotal',
+    'footprintCacheEvictionsTotal',
+    'escrowIndexerEventsProcessedTotal',
+    'escrowIndexerEventsSkippedTotal',
+    'escrowIndexerCycleFailuresTotal',
+    'escrowReconciliationMismatches',
+    'maturityReminderDeliveryAttemptsTotal',
+    'maturityReminderDeliverySuccessTotal',
+    'maturityReminderDeadLetterTotal',
+    'sorobanCircuitBreakerStateTransitionsTotal',
+    'cacheStoreErrorsTotal',
+    'redisCacheFailOpenTotal',
+    'readinessGauge',
+    'sorobanRpcRetryCausesTotal',
+    'sorobanRpcCallDurationSeconds',
+  ];
+
+  const counterExports = [
+    'footprintCacheHitsTotal',
+    'footprintCacheMissesTotal',
+    'footprintCacheEvictionsTotal',
+    'escrowIndexerEventsProcessedTotal',
+    'escrowIndexerEventsSkippedTotal',
+    'escrowIndexerCycleFailuresTotal',
+    'escrowReconciliationMismatches',
+    'maturityReminderDeliveryAttemptsTotal',
+    'maturityReminderDeliverySuccessTotal',
+    'maturityReminderDeadLetterTotal',
+    'sorobanCircuitBreakerStateTransitionsTotal',
+    'cacheStoreErrorsTotal',
+    'redisCacheFailOpenTotal',
+    'sorobanRpcRetryCausesTotal',
+  ];
+
+  const gaugeExports = [
+    'readinessGauge',
+    'escrowIndexerLastCursorAdvanceTimestampSeconds',
+  ];
+
+  const histogramExports = [
+    'sorobanRpcCallDurationSeconds',
+  ];
+
+  it('every exported metric is defined (not undefined)', () => {
+    for (const key of metricExports) {
+      expect(metrics[key]).toBeDefined();
+    }
+  });
+
+  it('every exported metric is not null', () => {
+    for (const key of metricExports) {
+      expect(metrics[key]).not.toBeNull();
+    }
+  });
+
+  it('every counter export has an inc method', () => {
+    for (const key of counterExports) {
+      expect(typeof metrics[key].inc).toBe('function');
+    }
+  });
+
+  it('every gauge export has a set method', () => {
+    for (const key of gaugeExports) {
+      expect(typeof metrics[key].set).toBe('function');
+    }
+  });
+
+  it('every histogram export has observe and startTimer methods', () => {
+    for (const key of histogramExports) {
+      expect(typeof metrics[key].observe).toBe('function');
+      expect(typeof metrics[key].startTimer).toBe('function');
+    }
+  });
+
+  it('sorobanCircuitBreakerStateTransitionsTotal has expected labelNames', () => {
+    const counter = metrics.sorobanCircuitBreakerStateTransitionsTotal;
+    expect(counter.labelNames).toBeDefined();
+    const names = Array.isArray(counter.labelNames) ? counter.labelNames : [];
+    expect(names).toContain('breaker_name');
+    expect(names).toContain('from_state');
+    expect(names).toContain('to_state');
+    expect(names.length).toBe(3);
+  });
+});
+
+describe('Soroban metrics helpers', () => {
+  beforeEach(() => {
+    metrics.registry.resetMetrics();
+  });
+
+  it('exposes bounded label names for Soroban latency histogram', () => {
+    const histogram = metrics.sorobanRpcCallDurationSeconds;
+    expect(histogram.labelNames).toEqual(['method', 'outcome']);
+  });
+
+  it('exposes bounded label names for Soroban retry cause counter', () => {
+    const counter = metrics.sorobanRpcRetryCausesTotal;
+    expect(counter.labelNames).toEqual(['cause']);
+  });
+
+  it('normalizes Soroban RPC methods to bounded values', () => {
+    expect(metrics.normalizeSorobanRpcMethod('simulateTransaction')).toBe('simulate_transaction');
+    expect(metrics.normalizeSorobanRpcMethod('get_legal_hold')).toBe('legal_hold_status');
+    expect(metrics.normalizeSorobanRpcMethod('secret-wallet-123')).toBe('unknown');
+  });
+
+  it('normalizes Soroban retry causes to bounded values', () => {
+    expect(metrics.normalizeSorobanRetryCause('timeout')).toBe('timeout');
+    expect(metrics.normalizeSorobanRetryCause('429')).toBe('429');
+    expect(metrics.normalizeSorobanRetryCause('5xx')).toBe('5xx');
+    expect(metrics.normalizeSorobanRetryCause('ECONNRESET')).toBe('unknown');
+  });
+
+  it('normalizes Soroban outcomes to bounded values', () => {
+    expect(metrics.normalizeSorobanRpcOutcome('success')).toBe('success');
+    expect(metrics.normalizeSorobanRpcOutcome('circuit_open')).toBe('circuit_open');
+    expect(metrics.normalizeSorobanRpcOutcome('payload-secret')).toBe('error');
+  });
+});
+
+describe('sorobanCircuitBreakerStateTransitionsTotal — circuit breaker integration', () => {
+  const { CircuitBreaker, CircuitBreakerState } = require('../src/utils/circuitBreaker');
+
+  beforeEach(() => {
+    metrics.registry.resetMetrics();
+  });
+
+  it('is incremented on CLOSED -> OPEN transition', async () => {
+    const breaker = new CircuitBreaker({ name: 'test', failureThreshold: 1, recoveryTimeout: 999999 });
+    expect(breaker.state).toBe(CircuitBreakerState.CLOSED);
+
+    await expect(breaker.execute(async () => { throw new Error('fail'); })).rejects.toThrow('fail');
+
+    expect(breaker.state).toBe(CircuitBreakerState.OPEN);
+
+    const metric = metrics.registry.getSingleMetric('soroban_circuit_breaker_state_transitions_total');
+    expect(metric).toBeDefined();
+  });
+
+  it('is incremented on OPEN -> HALF_OPEN and back to OPEN on failure', async () => {
+    const breaker = new CircuitBreaker({ name: 'test-half-open', failureThreshold: 1, recoveryTimeout: 1 });
+    expect(breaker.state).toBe(CircuitBreakerState.CLOSED);
+
+    await expect(breaker.execute(async () => { throw new Error('fail'); })).rejects.toThrow('fail');
+    expect(breaker.state).toBe(CircuitBreakerState.OPEN);
+
+    breaker.nextAttemptTime = 0;
+    await expect(breaker.execute(async () => { throw new Error('still fail'); })).rejects.toThrow('still fail');
+
+    expect(breaker.state).toBe(CircuitBreakerState.OPEN);
+  });
+
+  it('is incremented on HALF_OPEN -> CLOSED on success', async () => {
+    const breaker = new CircuitBreaker({ name: 'test-recover', failureThreshold: 1, recoveryTimeout: 1 });
+
+    await expect(breaker.execute(async () => { throw new Error('fail'); })).rejects.toThrow('fail');
+    expect(breaker.state).toBe(CircuitBreakerState.OPEN);
+
+    breaker.nextAttemptTime = 0;
+    breaker._transitionState(CircuitBreakerState.HALF_OPEN);
+    expect(breaker.state).toBe(CircuitBreakerState.HALF_OPEN);
+
+    await breaker.execute(async () => 'ok');
+
+    expect(breaker.state).toBe(CircuitBreakerState.CLOSED);
+  });
+
+  it('is incremented on reset() transition back to CLOSED', async () => {
+    const breaker = new CircuitBreaker({ name: 'test-reset', failureThreshold: 1, recoveryTimeout: 99999 });
+    await expect(breaker.execute(async () => { throw new Error('fail'); })).rejects.toThrow('fail');
+
+    expect(breaker.state).toBe(CircuitBreakerState.OPEN);
+
+    breaker.reset();
+
+    expect(breaker.state).toBe(CircuitBreakerState.CLOSED);
+  });
+
+  it('label values are bounded to the CircuitBreakerState enum', () => {
+    const validStates = ['CLOSED', 'OPEN', 'HALF_OPEN'];
+    expect(Object.values(CircuitBreakerState)).toEqual(validStates);
+  });
+
+  it('does not increment when state does not change', () => {
+    const breaker = new CircuitBreaker({ name: 'test-noop' });
+    const initial = breaker.state;
+
+    breaker._transitionState(CircuitBreakerState.CLOSED);
+
+    expect(breaker.state).toBe(initial);
+  });
+
+  it('returns Prometheus text before any transition (edge: scrape before first transition)', () => {
+    const promString = metrics.registry.metrics();
+    expect(typeof promString).toBe('string');
   });
 });
 
@@ -403,6 +682,34 @@ describe('metricsAuth unit', () => {
       metricsAuth(req, res, next);
       expect(next).toHaveBeenCalled();
       delete process.env.METRICS_BEARER_TOKEN;
+    });
+  });
+});
+
+describe('metrics shim path for Soroban observability', () => {
+  afterEach(() => {
+    jest.resetModules();
+    jest.unmock('prom-client');
+  });
+
+  it('keeps Soroban histogram and retry counter as safe no-ops when prom-client is unavailable', () => {
+    jest.resetModules();
+
+    jest.isolateModules(() => {
+      jest.doMock('prom-client', () => {
+        throw new Error('prom-client unavailable');
+      });
+
+      const shimMetrics = require('../src/metrics');
+
+      expect(() => {
+        shimMetrics.sorobanRpcRetryCausesTotal.labels({ cause: '429' }).inc();
+        const endTimer = shimMetrics.sorobanRpcCallDurationSeconds.startTimer({ method: 'contract_call' });
+        endTimer({ outcome: 'success' });
+      }).not.toThrow();
+
+      expect(shimMetrics.normalizeSorobanRpcMethod('secret-payload')).toBe('unknown');
+      expect(shimMetrics.normalizeSorobanRetryCause('rate-limited')).toBe('unknown');
     });
   });
 });

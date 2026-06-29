@@ -85,7 +85,13 @@ jest.mock('../src/services/tokenMeta', () => ({ getTokenMetadata: jest.fn() }), 
 
 // ---- Subject under test --------------------------------------------------
 
-const { registry, escrowReconciliationMismatches } = require('../src/metrics');
+const {
+  registry,
+  escrowReconciliationMismatches,
+  escrowReconciliationMismatchedInvoicesGauge,
+  escrowReconciliationDriftMagnitudeGauge,
+  escrowReconciliationDriftAlertsTotal,
+} = require('../src/metrics');
 const {
   performReconciliation,
   reconcileInvoice,
@@ -96,6 +102,7 @@ const {
   getReconciliationSummary,
   RECONCILE_STATUS,
   RECONCILABLE_STATUSES,
+  DRIFT_THRESHOLD,
 } = require('../src/jobs/reconcileEscrow');
 
 // Helpers ------------------------------------------------------------------
@@ -104,6 +111,27 @@ const {
 async function mismatchCount() {
   const metrics = await registry.getMetricsAsJSON();
   const m = metrics.find((x) => x.name === 'escrow_reconciliation_mismatches_total');
+  return m && m.values.length ? m.values[0].value : 0;
+}
+
+/** Reads the current value of the mismatched-invoices gauge. */
+async function mismatchedInvoicesGaugeValue() {
+  const metrics = await registry.getMetricsAsJSON();
+  const m = metrics.find((x) => x.name === 'escrow_reconciliation_mismatched_invoices');
+  return m && m.values.length ? m.values[0].value : 0;
+}
+
+/** Reads the current value of the drift-magnitude gauge. */
+async function driftMagnitudeGaugeValue() {
+  const metrics = await registry.getMetricsAsJSON();
+  const m = metrics.find((x) => x.name === 'escrow_reconciliation_drift_magnitude');
+  return m && m.values.length ? m.values[0].value : 0;
+}
+
+/** Reads the current value of the drift-alerts counter. */
+async function driftAlertsCount() {
+  const metrics = await registry.getMetricsAsJSON();
+  const m = metrics.find((x) => x.name === 'escrow_reconciliation_drift_alerts_total');
   return m && m.values.length ? m.values[0].value : 0;
 }
 
@@ -120,8 +148,11 @@ beforeEach(() => {
   dbState.failFirst = false;
   dbState.failSelect = false;
   jest.clearAllMocks();
-  // Reset counter between tests for deterministic assertions.
+  // Reset all reconciliation counters/gauges between tests for deterministic assertions.
   escrowReconciliationMismatches.reset();
+  escrowReconciliationMismatchedInvoicesGauge.reset();
+  escrowReconciliationDriftMagnitudeGauge.reset();
+  escrowReconciliationDriftAlertsTotal.reset();
 });
 
 // ---- reconcileInvoice ----------------------------------------------------
@@ -136,6 +167,7 @@ describe('reconcileInvoice', () => {
       status: RECONCILE_STATUS.MATCH,
       dbFundedTotal: 1000,
       onChainAmount: 1000,
+      driftMagnitude: 0,
       reconciledAt: expect.any(String),
     });
     expect(await mismatchCount()).toBe(0);
@@ -151,6 +183,7 @@ describe('reconcileInvoice', () => {
       status: RECONCILE_STATUS.MISMATCH,
       dbFundedTotal: 2000,
       onChainAmount: 1990,
+      driftMagnitude: 10,
     });
 
     // Metric incremented exactly once.
@@ -450,5 +483,314 @@ describe('readFundedAmount', () => {
 
   it('throws INVALID_INVOICE_ID for a malformed id', async () => {
     await expect(readFundedAmount('   ')).rejects.toMatchObject({ code: 'INVALID_INVOICE_ID' });
+  });
+});
+
+// ── drift alerting metrics (performReconciliation post-run gauges) ─────────
+
+describe('drift alerting metrics', () => {
+  it('sets mismatched-invoices gauge and drift-magnitude gauge to 0 when there is no drift', async () => {
+    dbState.selectResults = [[
+      { id: 'inv_1', fundedTotal: 1000 },
+      { id: 'inv_2', fundedTotal: 2000 },
+    ]];
+
+    await performReconciliation({
+      dbClient: mockDb,
+      escrowAdapter: adapterFor({ inv_1: 1000, inv_2: 2000 }),
+    });
+
+    expect(await mismatchedInvoicesGaugeValue()).toBe(0);
+    expect(await driftMagnitudeGaugeValue()).toBe(0);
+    expect(await driftAlertsCount()).toBe(0);
+    // No error-level alert log should be emitted.
+    expect(mockLogger.error).not.toHaveBeenCalled();
+  });
+
+  it('sets mismatched-invoices gauge, drift-magnitude gauge, and increments drift-alerts when drift exceeds threshold', async () => {
+    // Temporarily lower the threshold so we can trigger an alert with one mismatch.
+    const originalThreshold = process.env.RECONCILIATION_DRIFT_THRESHOLD;
+    process.env.RECONCILIATION_DRIFT_THRESHOLD = '1';
+
+    dbState.selectResults = [[
+      { id: 'inv_1', fundedTotal: 1000 },
+      { id: 'inv_2', fundedTotal: 500 },
+    ]];
+
+    await performReconciliation({
+      dbClient: mockDb,
+      escrowAdapter: adapterFor({ inv_1: 800, inv_2: 500 }), // inv_1 has drift of 200
+    });
+
+    // One mismatch with |1000 - 800| = 200 drift.
+    expect(await mismatchedInvoicesGaugeValue()).toBe(1);
+    expect(await driftMagnitudeGaugeValue()).toBe(200);
+    expect(await driftAlertsCount()).toBe(1);
+
+    // An error-level log should be emitted for the threshold breach.
+    expect(mockLogger.error).toHaveBeenCalledTimes(1);
+    const errorCall = mockLogger.error.mock.calls[0];
+    const meta = errorCall[0];
+    expect(meta).toMatchObject({ mismatches: 1, totalDrift: 200 });
+    expect(errorCall[1]).toMatch(/drift alert/i);
+
+    if (originalThreshold === undefined) {
+      delete process.env.RECONCILIATION_DRIFT_THRESHOLD;
+    } else {
+      process.env.RECONCILIATION_DRIFT_THRESHOLD = originalThreshold;
+    }
+  });
+
+  it('accumulates total drift magnitude across multiple mismatched invoices', async () => {
+    dbState.selectResults = [[
+      { id: 'inv_1', fundedTotal: 1000 },
+      { id: 'inv_2', fundedTotal: 2000 },
+      { id: 'inv_3', fundedTotal: 300 },
+    ]];
+
+    // inv_1: drift 200, inv_2: drift 500, inv_3: match
+    await performReconciliation({
+      dbClient: mockDb,
+      escrowAdapter: adapterFor({ inv_1: 800, inv_2: 1500, inv_3: 300 }),
+    });
+
+    expect(await mismatchedInvoicesGaugeValue()).toBe(2);
+    expect(await driftMagnitudeGaugeValue()).toBe(700); // 200 + 500
+  });
+
+  it('does NOT increment drift-alerts counter when mismatches are below threshold', async () => {
+    const originalThreshold = process.env.RECONCILIATION_DRIFT_THRESHOLD;
+    // Set threshold to 3 so a single mismatch doesn't alert.
+    process.env.RECONCILIATION_DRIFT_THRESHOLD = '3';
+
+    dbState.selectResults = [[
+      { id: 'inv_1', fundedTotal: 1000 },
+    ]];
+
+    await performReconciliation({
+      dbClient: mockDb,
+      escrowAdapter: adapterFor({ inv_1: 999 }), // 1 mismatch < threshold of 3
+    });
+
+    expect(await driftAlertsCount()).toBe(0);
+    expect(mockLogger.error).not.toHaveBeenCalled();
+
+    if (originalThreshold === undefined) {
+      delete process.env.RECONCILIATION_DRIFT_THRESHOLD;
+    } else {
+      process.env.RECONCILIATION_DRIFT_THRESHOLD = originalThreshold;
+    }
+  });
+
+  it('zero-drift run: gauges reflect empty invoice set', async () => {
+    dbState.selectResults = [[]];
+
+    await performReconciliation({ dbClient: mockDb, escrowAdapter: adapterFor({}) });
+
+    expect(await mismatchedInvoicesGaugeValue()).toBe(0);
+    expect(await driftMagnitudeGaugeValue()).toBe(0);
+    expect(await driftAlertsCount()).toBe(0);
+  });
+});
+
+// ── GET /api/admin/reconciliation/runs (route handler) ────────────────────
+
+const request = require('supertest');
+const express = require('express');
+const jwt = require('jsonwebtoken');
+
+// Sign a test JWT that satisfies authenticateToken (uses the secret from tests/mocks/setup.js)
+const TEST_JWT_SECRET = 'test-secret-at-least-32-characters-long-string-for-jest';
+const TEST_TENANT_ID = 'tenant-abc';
+const adminToken = jwt.sign(
+  { id: 'admin-user', tenantId: TEST_TENANT_ID, role: 'admin' },
+  TEST_JWT_SECRET,
+  { algorithm: 'HS256' },
+);
+
+/**
+ * Builds a minimal Express app mounting the reconciliation router with a
+ * real adminStack (JWT auth + tenant extraction). Pass an optional fakeDb to
+ * inject via req._dbClient before the router runs.
+ *
+ * @param {Function|null} fakeDb - Injectable knex mock, attached as req._dbClient
+ * @returns {import('express').Express}
+ */
+function makeRouteApp(fakeDb) {
+  const app = express();
+  app.use(express.json());
+  // Inject the db client before the router fires.
+  if (fakeDb) {
+    app.use('/api/admin/reconciliation', (req, _res, next) => {
+      req._dbClient = fakeDb;
+      next();
+    });
+  }
+  const reconciliationRouter = require('../src/routes/reconciliation');
+  app.use('/api/admin/reconciliation', reconciliationRouter);
+  return app;
+}
+
+/** Helper: build the Authorization header value. */
+const authHeader = `Bearer ${adminToken}`;
+
+describe('GET /api/admin/reconciliation/runs', () => {
+  describe('successful listing', () => {
+    let app;
+
+    const sampleRuns = [
+      { id: 'run-1', total: 10, matches: 9, mismatches: 1, errors: 0, reconciled_at: '2026-06-25T02:00:00.000Z', created_at: '2026-06-25T02:00:01.000Z' },
+      { id: 'run-2', total: 8, matches: 8, mismatches: 0, errors: 0, reconciled_at: '2026-06-24T02:00:00.000Z', created_at: '2026-06-24T02:00:01.000Z' },
+    ];
+
+    beforeEach(() => {
+      const fakeDb = jest.fn((table) => {
+        if (table !== 'reconciliation_runs') return makeBuilder(table);
+        return {
+          count: jest.fn().mockReturnThis(),
+          select: jest.fn().mockReturnThis(),
+          orderBy: jest.fn().mockReturnThis(),
+          limit: jest.fn().mockReturnThis(),
+          offset: jest.fn().mockResolvedValue(sampleRuns),
+          then: (res) => Promise.resolve([{ count: String(sampleRuns.length) }]).then(res),
+        };
+      });
+      app = makeRouteApp(fakeDb);
+    });
+
+    it('returns 200 with data array and pagination meta', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(200);
+      expect(res.body.data).toHaveLength(2);
+      expect(res.body.meta).toMatchObject({
+        total: 2,
+        page: 1,
+        limit: 20,
+        totalPages: 1,
+        hasMore: false,
+      });
+      expect(res.body.message).toMatch(/retrieved/i);
+    });
+
+    it('respects limit and page query params', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs?limit=1&page=1')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(200);
+      expect(res.body.meta).toMatchObject({ limit: 1, page: 1 });
+    });
+
+    it('does NOT expose results (per-invoice on-chain details) in list rows', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(200);
+      res.body.data.forEach((row) => {
+        expect(row.results).toBeUndefined();
+      });
+    });
+  });
+
+  describe('pagination validation', () => {
+    let app;
+
+    beforeEach(() => {
+      // No fakeDb needed — validation fails before any DB query.
+      app = makeRouteApp(null);
+    });
+
+    it('returns 400 when limit is out of range (> 100)', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs?limit=999')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_PAGINATION');
+    });
+
+    it('returns 400 when limit is 0', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs?limit=0')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 400 when page is 0', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs?page=0')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 400 for non-numeric limit', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs?limit=abc')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('empty history', () => {
+    let app;
+
+    beforeEach(() => {
+      const emptyDb = jest.fn((table) => {
+        if (table !== 'reconciliation_runs') return makeBuilder(table);
+        return {
+          count: jest.fn().mockReturnThis(),
+          select: jest.fn().mockReturnThis(),
+          orderBy: jest.fn().mockReturnThis(),
+          limit: jest.fn().mockReturnThis(),
+          offset: jest.fn().mockResolvedValue([]),
+          then: (res) => Promise.resolve([{ count: '0' }]).then(res),
+        };
+      });
+      app = makeRouteApp(emptyDb);
+    });
+
+    it('returns 200 with empty data array when no runs have been recorded', async () => {
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs')
+        .set('Authorization', authHeader)
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(200);
+      expect(res.body.data).toEqual([]);
+      expect(res.body.meta.total).toBe(0);
+      expect(res.body.meta.hasMore).toBe(false);
+    });
+  });
+
+  describe('unauthorized caller', () => {
+    it('returns 401 when no Authorization header is supplied', async () => {
+      const app = makeRouteApp(null);
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs')
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 401 when a bogus token is supplied', async () => {
+      const app = makeRouteApp(null);
+      const res = await request(app)
+        .get('/api/admin/reconciliation/runs')
+        .set('Authorization', 'Bearer not-a-real-token')
+        .set('x-tenant-id', TEST_TENANT_ID);
+      expect(res.status).toBe(401);
+    });
+  });
+});
+
+describe('DRIFT_THRESHOLD constant', () => {
+  it('is a positive integer (at least 1)', () => {
+    expect(Number.isInteger(DRIFT_THRESHOLD)).toBe(true);
+    expect(DRIFT_THRESHOLD).toBeGreaterThanOrEqual(1);
   });
 });

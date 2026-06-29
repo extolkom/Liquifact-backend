@@ -1,15 +1,40 @@
 'use strict';
 
+const makeMetricStub = () => {
+  const fn = jest.fn();
+  fn.inc = jest.fn();
+  fn.set = jest.fn();
+  fn.observe = jest.fn();
+  fn.labels = jest.fn(() => fn);
+  return fn;
+};
+
+jest.mock('../src/metrics', () => new Proxy({}, {
+  get(target, prop) {
+    if (!target[prop]) {
+      target[prop] = makeMetricStub();
+    }
+    return target[prop];
+  },
+}));
+
+jest.mock('../src/middleware/kycGating', () => ({
+  requireKycForFunding: (_req, _res, next) => next(),
+}));
+
 const request = require('supertest');
 const { createApp, resetStore } = require('../src/index');
 const jwt = require('jsonwebtoken');
 const investorCommitmentService = require('../src/services/investorCommitment');
 
 const TEST_SECRET = process.env.JWT_SECRET || 'test-secret';
-const validToken = jwt.sign({ id: 'user_investor', role: 'investor', tenantId: 'test-tenant' }, TEST_SECRET, { expiresIn: '1h' });
-
 const ADDR1 = 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK';
-const ADDR2 = 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL';
+const ADDR2 = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA';
+const tokenFor = (payload) => jwt.sign(payload, TEST_SECRET, { expiresIn: '1h' });
+const validToken = tokenFor({ id: 'user_investor', role: 'investor', tenantId: 'test-tenant', funderAddress: ADDR1 });
+const secondInvestorToken = tokenFor({ id: 'user_investor_2', role: 'investor', tenantId: 'test-tenant', funderAddress: ADDR2 });
+const adminToken = tokenFor({ id: 'admin_user', role: 'admin', tenantId: 'test-tenant' });
+const unboundInvestorToken = tokenFor({ id: 'user_unbound', role: 'investor', tenantId: 'test-tenant' });
 
 describe('Investor Locks API', () => {
   let app;
@@ -31,7 +56,7 @@ describe('Investor Locks API', () => {
       expect(response.status).toBe(401);
     });
 
-    it('should return 200 with all locks when authenticated without filters', async () => {
+    it('should scope omitted funderAddress to the authenticated investor', async () => {
       const response = await request(app)
         .get('/api/investor/locks')
         .set('Authorization', `Bearer ${validToken}`);
@@ -40,7 +65,20 @@ describe('Investor Locks API', () => {
       expect(response.body.data).toBeDefined();
       expect(Array.isArray(response.body.data)).toBe(true);
       expect(response.body.data.length).toBeGreaterThan(0);
+      expect(response.body.data.every((lock) => lock.funderAddress === ADDR1)).toBe(true);
+      expect(response.body.data.some((lock) => lock.funderAddress === ADDR2)).toBe(false);
       expect(response.body.meta.stale).toBe(true);
+    });
+
+    it('allows admin callers to list all tenant locks when funderAddress is omitted', async () => {
+      const response = await request(app)
+        .get('/api/investor/locks')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.length).toBe(6);
+      expect(response.body.data.some((lock) => lock.funderAddress === ADDR1)).toBe(true);
+      expect(response.body.data.some((lock) => lock.funderAddress === ADDR2)).toBe(true);
     });
 
     it('should include pagination meta fields', async () => {
@@ -75,6 +113,34 @@ describe('Investor Locks API', () => {
       expect(response.status).toBe(200);
       expect(response.body.data.length).toBeGreaterThan(0);
       expect(response.body.data.every((l) => l.funderAddress === ADDR1)).toBe(true);
+    });
+
+    it('denies a non-admin caller that requests another funderAddress', async () => {
+      const response = await request(app)
+        .get(`/api/investor/locks?funderAddress=${ADDR2}`)
+        .set('Authorization', `Bearer ${validToken}`);
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('not authorized');
+    });
+
+    it('allows an admin caller to request another funderAddress', async () => {
+      const response = await request(app)
+        .get(`/api/investor/locks?funderAddress=${ADDR2}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.length).toBe(1);
+      expect(response.body.data.every((lock) => lock.funderAddress === ADDR2)).toBe(true);
+    });
+
+    it('denies non-admin callers that have no bound funderAddress', async () => {
+      const response = await request(app)
+        .get('/api/investor/locks')
+        .set('Authorization', `Bearer ${unboundInvestorToken}`);
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('not bound');
     });
 
     it('should return 400 for invalid address format', async () => {
@@ -221,8 +287,26 @@ describe('Investor Locks API', () => {
         page++;
       }
 
-      // All 6 seeded locks must have been seen
-      expect(seen.size).toBe(6);
+      // The non-admin caller sees only the 5 seeded locks for their bound address.
+      expect(seen.size).toBe(5);
+      expect([...seen].every((key) => key.endsWith(`:${ADDR1}`))).toBe(true);
+    });
+
+    it('does not reuse cached list responses across different bound funders', async () => {
+      resetStore();
+
+      const first = await request(app)
+        .get('/api/investor/locks?limit=100')
+        .set('Authorization', `Bearer ${validToken}`);
+      const second = await request(app)
+        .get('/api/investor/locks?limit=100')
+        .set('Authorization', `Bearer ${secondInvestorToken}`);
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(first.body.data.every((lock) => lock.funderAddress === ADDR1)).toBe(true);
+      expect(second.body.data.every((lock) => lock.funderAddress === ADDR2)).toBe(true);
+      expect(second.body.data).toHaveLength(1);
     });
   });
 
@@ -265,6 +349,30 @@ describe('Investor Locks API', () => {
       expect(response.body.data).toHaveProperty('claimNotBefore');
       expect(response.body.data).toHaveProperty('investorEffectiveYieldBps');
       expect(response.body.data).toHaveProperty('stale');
+    });
+
+    it('denies a single-lock lookup for another funderAddress', async () => {
+      const response = await request(app)
+        .get(`/api/investor/locks/inv_9900?funderAddress=${ADDR2}`)
+        .set('Authorization', `Bearer ${validToken}`);
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('not authorized');
+    });
+
+    it('does not reuse cached single-lock responses across different bound funders', async () => {
+      resetStore();
+
+      const first = await request(app)
+        .get(`/api/investor/locks/inv_9900?funderAddress=${ADDR2}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      const second = await request(app)
+        .get(`/api/investor/locks/inv_9900?funderAddress=${ADDR2}`)
+        .set('Authorization', `Bearer ${validToken}`);
+
+      expect(first.status).toBe(200);
+      expect(first.body.data.funderAddress).toBe(ADDR2);
+      expect(second.status).toBe(403);
     });
   });
 });

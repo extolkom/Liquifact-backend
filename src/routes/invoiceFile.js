@@ -10,7 +10,14 @@ const storageService = require('../services/storage');
 const logger = require('../logger');
 const router = express.Router();
 
-const invoiceFiles = new Map();
+/** PDF magic bytes. */
+const PDF_MAGIC_BYTES = Buffer.from('%PDF');
+
+/**
+ * Configurable upload size limit from env, defaults to 5mb.
+ * @type {string}
+ */
+const UPLOAD_SIZE_LIMIT = process.env.INVOICE_FILE_MAX_SIZE || '5mb';
 
 /**
  * Computes the SHA-256 hash of a buffer.
@@ -19,6 +26,33 @@ const invoiceFiles = new Map();
  */
 function computeHash(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+/**
+ * Validates file content against PDF magic bytes (%PDF).
+ * @param {Buffer} fileBuffer - The uploaded file buffer.
+ * @returns {boolean} True if file starts with PDF magic bytes.
+ */
+function validatePdfMagicBytes(fileBuffer) {
+  return Buffer.isBuffer(fileBuffer) &&
+    fileBuffer.length >= 4 &&
+    fileBuffer.slice(0, 4).equals(PDF_MAGIC_BYTES);
+}
+
+/**
+ * Validates that the declared MIME type matches the actual file content.
+ * @param {string} declaredType - The Content-Type from the request header.
+ * @param {Buffer} fileBuffer - The uploaded file buffer.
+ * @returns {{ valid: boolean, message?: string }} Validation result.
+ */
+function validateMimeType(declaredType, fileBuffer) {
+  if (!declaredType || !declaredType.includes('application/pdf')) {
+    return { valid: false, message: 'Content-Type must be application/pdf' };
+  }
+  if (!validatePdfMagicBytes(fileBuffer)) {
+    return { valid: false, message: 'File content does not match declared MIME type application/pdf' };
+  }
+  return { valid: true };
 }
 
 /**
@@ -51,17 +85,18 @@ router.post('/:id/presigned-upload', express.json(), async (req, res) => {
  * POST /api/invoices/:id/file
  * Upload PDF file for an invoice and persist it.
  */
-router.post('/:id/file', express.raw({ type: 'application/pdf', limit: '5mb' }), async (req, res) => {
+router.post('/:id/file', express.raw({ type: 'application/pdf', limit: UPLOAD_SIZE_LIMIT }), async (req, res) => {
   const { id } = req.params;
   if (!id || typeof id !== 'string' || id.trim() === '') {
     return res.status(400).json({ error: 'Bad Request', message: 'Invalid invoice ID' });
   }
-  const contentType = req.headers['content-type'];
-  if (!contentType || !contentType.includes('application/pdf')) {
-    return res.status(400).json({ error: 'Bad Request', message: 'Content-Type must be application/pdf' });
-  }
   if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
     return res.status(400).json({ error: 'Bad Request', message: 'No file data provided' });
+  }
+  const contentType = req.headers['content-type'];
+  const mimeValidation = validateMimeType(contentType, req.body);
+  if (!mimeValidation.valid) {
+    return res.status(400).json({ error: 'Bad Request', message: mimeValidation.message });
   }
   const fileHash = computeHash(req.body);
   const fileSize = req.body.length;
@@ -134,7 +169,7 @@ router.get('/:id/file/verify', async (req, res) => {
  * POST /api/invoices/:id/file/verify
  * Verify integrity of a provided PDF against stored hash.
  */
-router.post('/:id/file/verify', express.raw({ type: 'application/pdf', limit: '5mb' }), async (req, res) => {
+router.post('/:id/file/verify', express.raw({ type: 'application/pdf', limit: UPLOAD_SIZE_LIMIT }), async (req, res) => {
   const { id } = req.params;
   if (!id || typeof id !== 'string' || id.trim() === '') {
     return res.status(400).json({ error: 'Bad Request', message: 'Invalid invoice ID' });
@@ -146,4 +181,19 @@ router.post('/:id/file/verify', express.raw({ type: 'application/pdf', limit: '5
   }
   if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
     return res.status(400).json({ error: 'Bad Request', message: 'No file data provided for verification' });
+  }
+  try {
+    const currentHash = computeHash(req.body);
+    const isValid = currentHash === meta.sha256;
+    return res.json({ data: { invoiceId: id, isValid, storedHash: meta.sha256, currentHash, verifiedAt: new Date().toISOString() }, message: isValid ? 'File integrity verified' : 'File integrity check failed' });
+  } catch (err) {
+    logger.error({ err, invoiceId: id }, 'Failed to verify provided invoice file');
+    return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to verify provided invoice file' });
+  }
 
+});
+
+module.exports = router;
+module.exports.validatePdfMagicBytes = validatePdfMagicBytes;
+module.exports.validateMimeType = validateMimeType;
+module.exports.UPLOAD_SIZE_LIMIT = UPLOAD_SIZE_LIMIT;

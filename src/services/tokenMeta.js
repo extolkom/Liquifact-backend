@@ -17,6 +17,10 @@
 const { createCacheStore } = require('./cacheStore');
 const { callSorobanContract } = require('./soroban');
 const logger = require('../logger');
+const {
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+} = require('../utils/validators');
 
 /**
  * Default TTL for token metadata cache in milliseconds (30 minutes).
@@ -52,20 +56,6 @@ const inFlightRequests = new Map();
  * @constant {RegExp}
  */
 const ASSET_CODE_PATTERN = /^[A-Z0-9]{1,12}$/;
-
-/**
- * Stellar public key pattern (G...).
- *
- * @constant {RegExp}
- */
-const STELLAR_PUBLIC_KEY_PATTERN = /^G[A-Z2-7]{55}$/;
-
-/**
- * Soroban contract ID pattern (C...).
- *
- * @constant {RegExp}
- */
-const SOROBAN_CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
 
 /**
  * Generates a cache key for a token asset.
@@ -130,7 +120,7 @@ function validateAsset(asset) {
     if (typeof contractId !== 'string') {
       return { valid: false, reason: 'Contract ID must be a string' };
     }
-    if (!SOROBAN_CONTRACT_ID_PATTERN.test(contractId)) {
+    if (!isValidStellarContractAddress(contractId)) {
       return { valid: false, reason: 'Invalid Soroban contract ID format' };
     }
     if (issuer !== null && issuer !== undefined) {
@@ -144,7 +134,7 @@ function validateAsset(asset) {
     if (typeof issuer !== 'string') {
       return { valid: false, reason: 'Issuer must be a string' };
     }
-    if (!STELLAR_PUBLIC_KEY_PATTERN.test(issuer)) {
+    if (!isValidStellarAccountAddress(issuer)) {
       return { valid: false, reason: 'Invalid Stellar public key format for issuer' };
     }
   } else {

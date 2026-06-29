@@ -22,11 +22,14 @@ const express = require('express');
 const cors = require('cors');
 const { createSecurityMiddleware } = require('./middleware/security');
 const { auditMiddleware } = require('./middleware/audit');
+const requestId = require('./middleware/requestId');
+const { correlationIdMiddleware } = require('./middleware/correlationId');
 const invoiceService = require('./services/invoiceService');
 const { resolveEscrowAddress } = require('./config/escrowMap');
 const { getEscrowStateWithProjection } = require('./services/escrowRead');
 const { createCorsOptions, isCorsOriginRejectedError } = require('./config/cors');
 const { validateInvoiceQueryParams } = require('./utils/validators');
+const { computeEscrowDerivedFields } = require('./services/escrowDerived');
 const { invoiceCreateSchema, parseValidationErrors } = require('./schemas/invoice');
 const {
   invoiceBodyLimit,
@@ -48,8 +51,13 @@ const retentionRoutes = require('./routes/retention');
 const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
 const adminEscrowRoutes = require('./routes/adminEscrow');
 const kycRoutes = require('./routes/kyc');
+const reconciliationRoutes = require('./routes/reconciliation');
 const v1Routes = require('./routes/v1');
-const investorRoutes = require('./routes/investor');
+const {
+  mountFeatureRouter,
+  assertNoDuplicateRouterMounts,
+  resetFeatureRouterMounts,
+} = require('./utils/routeMountRegistry');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -119,6 +127,7 @@ function handleInternalError(err, req, res, _next) {
  * @returns {import('express').Express} Configured Express application.
  */
 function createApp() {
+  resetFeatureRouterMounts();
   const app = express();
 
   // ── 1. CORS ──────────────────────────────────────────────────────────────
@@ -135,6 +144,8 @@ function createApp() {
   // Apply security headers middleware
   app.use(createSecurityMiddleware());
   app.use(auditMiddleware);
+  app.use(requestId);
+  app.use(correlationIdMiddleware);
 
   // ── 4. Routes ────────────────────────────────────────────────────────────
 
@@ -281,8 +292,11 @@ function createApp() {
       // Read from projection, cache, or live read fallback
       const state = await getEscrowStateWithProjection(invoiceId);
 
+      const derived = computeEscrowDerivedFields(state);
+
       const data = {
         ...state,
+        ...derived,
         escrowAddress
       };
 
@@ -319,19 +333,34 @@ function createApp() {
     next(new Error('Sensitive'));
   });
 
-  // ── 5. SME & Invoice File routes ─────────────────────────────────────────
-  app.use('/api/sme', smeRoutes);
-  app.use('/api/invoices', invoiceFileRoutes);
-  app.use('/api/invoices', invoiceStateRoutes);
-  app.use('/api/invest', investRoutes);
-  app.use('/api/investor', investorRoutes);
-  app.use('/api/kyc', kycRoutes);
-  app.use('/api/marketplace', marketplaceRoutes);
-  app.use('/api/retention', retentionRoutes);
-  app.use('/api/admin/audit', auditTrailRoutes);
-  app.use('/api/admin/escrow', adminEscrowRoutes);
-  app.use('/api/investor', investorRoutes);
-  app.use('/v1', v1Routes);
+  /**
+   * Feature router mounts — order is intentional.
+   *
+   * Each router is imported once and mounted once via `mountFeatureRouter`.
+   * Multiple routers may share a base path only when they are distinct instances
+   * (e.g. invoice file upload + invoice state machine both use `/api/invoices`).
+   * The investor router (`/api/investor`) must never be mounted twice; duplicate
+   * mounts are rejected at bootstrap by `assertNoDuplicateRouterMounts`.
+   *
+   * Investor handlers apply `authenticateToken` then `extractTenant` before
+   * lock list or detail logic runs (see `routes/investor.js`).
+   *
+   * @see docs/request-lifecycle-middleware-order.md
+   */
+  mountFeatureRouter(app, '/api/sme', smeRoutes);
+  mountFeatureRouter(app, '/api/invoices', invoiceFileRoutes);
+  mountFeatureRouter(app, '/api/invoices', invoiceStateRoutes);
+  mountFeatureRouter(app, '/api/invest', investRoutes);
+  mountFeatureRouter(app, '/api/investor', investorRoutes);
+  mountFeatureRouter(app, '/api/kyc', kycRoutes);
+  mountFeatureRouter(app, '/api/marketplace', marketplaceRoutes);
+  mountFeatureRouter(app, '/api/retention', retentionRoutes);
+  mountFeatureRouter(app, '/api/admin/audit', auditTrailRoutes);
+  mountFeatureRouter(app, '/api/admin/escrow', adminEscrowRoutes);
+  mountFeatureRouter(app, '/api/admin/reconciliation', reconciliationRoutes);
+  mountFeatureRouter(app, '/v1', v1Routes);
+
+  assertNoDuplicateRouterMounts();
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
   app.get('/metrics', metricsAuth, metricsHandler);
