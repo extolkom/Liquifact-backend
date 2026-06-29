@@ -10,7 +10,7 @@ const {
   isValidStellarAccountAddress,
   isValidStellarContractAddress,
   isValidStellarAddress,
-} = require('../src/utils/stellarAddress');
+} = require('../src/utils/validators');
 
 const VALID_TOKEN = 'test-suite-token';
 const VALID_STELLAR_ACCOUNT = StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 11));

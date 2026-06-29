@@ -29,7 +29,7 @@ const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmi
 const { persistCommitment } = require('../services/investorCommitment');
 const { listOpportunities } = require('../services/investService');
 const idempotencyMiddleware = require('../middleware/idempotency');
-const { isValidStellarAddress } = require('../utils/stellarAddress');
+const { isValidStellarAddress } = require('../utils/validators');
 
 const router = express.Router();
 

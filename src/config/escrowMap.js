@@ -31,7 +31,7 @@
 
 'use strict';
 
-const { isValidStellarAddress } = require('../utils/stellarAddress');
+const { isValidStellarAddress } = require('../utils/validators');
 
 /**
  * Thrown when no active escrow mapping exists for an invoice ID.

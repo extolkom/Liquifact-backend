@@ -213,14 +213,14 @@ describe('authorizeSmeWallet — Stellar address format validation', () => {
     expect(res.body.walletAddress).toBe(VALID_WALLET);
   });
 
-  it('accepts a valid Stellar contract address starting with C', async () => {
+  it('returns 400 for a valid contract address because SME wallets must be account public keys', async () => {
     const app = makeApp(
       injectUser({ id: 'user-001', walletAddress: VALID_CONTRACT_ADDRESS }),
       authorizeSmeWallet
     );
     const res = await request(app).get('/test');
-    expect(res.status).toBe(200);
-    expect(res.body.walletAddress).toBe(VALID_CONTRACT_ADDRESS);
+    expect(res.status).toBe(400);
+    expect(res.body.detail).toMatch(/Stellar wallet address format is invalid/);
   });
 
   it('returns 400 for wrong-length uppercase values that only look like StrKeys', async () => {
