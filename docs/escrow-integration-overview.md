@@ -64,8 +64,16 @@ const derived = computeEscrowDerivedFields(state, {
 ```
 
 When `ledgerCloseTime` is absent (e.g. the Soroban stub does not return it),
-the function falls back transparently to the server wall clock with a warn-level
-log, preserving the existing behaviour.
+the function falls back transparently to the server wall clock, preserving the
+existing behaviour.
+
+Validation anomalies are emitted through the shared structured logger at
+`warn` level with `component: "escrowDerived"`. These warnings cover
+milliseconds accidentally passed as epoch seconds, non-numeric or negative
+ledger close times, absurd future maturity dates, and stale overdue maturity
+dates beyond the grace window. Logs include bounded numeric context such as
+`ledgerCloseTime`, `daysDiff`, and the relevant threshold, but do not include
+raw unbounded caller-supplied strings.
 
 ### Rounding
 

@@ -42,6 +42,8 @@
  * @module services/escrowDerived
  */
 
+const logger = require('../logger');
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 // ── Validation constants ──────────────────────────────────────────────────────
@@ -56,6 +58,25 @@ const MAX_FUTURE_DAYS = 50 * 365;
 
 // Maximum overdue grace: 1 year in past (invoices shouldn't be stale longer).
 const MAX_OVERDUE_DAYS = 365;
+
+/**
+ * Emit a structured warning for escrow-derived validation anomalies.
+ *
+ * @param {string} reason Stable machine-readable warning reason.
+ * @param {string} message Human-readable warning message.
+ * @param {Record<string, number|string|null>} fields Bounded structured fields.
+ * @returns {void}
+ */
+function logEscrowDerivedWarning(reason, message, fields) {
+  logger.warn(
+    {
+      component: 'escrowDerived',
+      reason,
+      ...fields,
+    },
+    message
+  );
+}
 
 // ── Public validation helper ──────────────────────────────────────────────────
 
@@ -89,16 +110,26 @@ function validateLedgerCloseTimeUnit(value) {
 
   // Non-numeric, negative, or NaN → invalid
   if (!isFinite(num) || num < 0) {
-    console.warn(
-      '[escrowDerived] ledgerCloseTime is non-numeric or negative: ' + value
+    logEscrowDerivedWarning(
+      'invalid_ledger_close_time',
+      '[escrowDerived] ledgerCloseTime is non-numeric or negative',
+      {
+        ledgerCloseTime: Number.isFinite(num) ? num : null,
+        valueType: typeof value,
+      }
     );
     return null;
   }
 
   // Magnitude check: values at or above the threshold are not epoch seconds.
   if (num >= EPOCH_SECONDS_THRESHOLD) {
-    console.warn(
-      '[escrowDerived] ledgerCloseTime ' + num + ' exceeds threshold ' + EPOCH_SECONDS_THRESHOLD + '; unit mismatch suspected (milliseconds passed as seconds?). Rejecting.'
+    logEscrowDerivedWarning(
+      'ledger_close_time_unit_mismatch',
+      '[escrowDerived] ledgerCloseTime ' + num + ' exceeds threshold ' + EPOCH_SECONDS_THRESHOLD + '; unit mismatch suspected (milliseconds passed as seconds?). Rejecting.',
+      {
+        ledgerCloseTime: num,
+        threshold: EPOCH_SECONDS_THRESHOLD,
+      }
     );
     return null;
   }
@@ -126,15 +157,25 @@ function validateMaturityDateBounds(maturityDate, referenceTime) {
   );
 
   if (daysDiff > MAX_FUTURE_DAYS) {
-    console.warn(
-      '[escrowDerived] maturityDate is ' + daysDiff + ' days in future (> ' + MAX_FUTURE_DAYS + ' day max); absurd value flagged. Treating as invalid.'
+    logEscrowDerivedWarning(
+      'maturity_date_too_far_future',
+      '[escrowDerived] maturityDate is ' + daysDiff + ' days in future (> ' + MAX_FUTURE_DAYS + ' day max); absurd value flagged. Treating as invalid.',
+      {
+        daysDiff,
+        maxFutureDays: MAX_FUTURE_DAYS,
+      }
     );
     return false;
   }
 
   if (daysDiff < -MAX_OVERDUE_DAYS) {
-    console.warn(
-      '[escrowDerived] maturityDate is ' + daysDiff + ' days in past (> ' + MAX_OVERDUE_DAYS + ' day grace); stale or malformed. Treating as invalid.'
+    logEscrowDerivedWarning(
+      'maturity_date_too_far_past',
+      '[escrowDerived] maturityDate is ' + daysDiff + ' days in past (> ' + MAX_OVERDUE_DAYS + ' day grace); stale or malformed. Treating as invalid.',
+      {
+        daysDiff,
+        maxOverdueDays: MAX_OVERDUE_DAYS,
+      }
     );
     return false;
   }

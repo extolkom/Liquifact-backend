@@ -3,6 +3,7 @@
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'test-secret';
 
+const logger = require('../src/logger');
 const {
   computeApyPercent,
   computeFundedPercent,
@@ -187,18 +188,31 @@ describe('validateLedgerCloseTimeUnit', () => {
   });
 
   it('logs warning when rejecting milliseconds', () => {
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
     validateLedgerCloseTimeUnit(1_700_000_000_000);
     expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        component: 'escrowDerived',
+        reason: 'ledger_close_time_unit_mismatch',
+        ledgerCloseTime: 1_700_000_000_000,
+      }),
       expect.stringContaining('unit mismatch suspected')
     );
     warnSpy.mockRestore();
   });
 
   it('logs warning for non-numeric input', () => {
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
     validateLedgerCloseTimeUnit('bad');
-    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        component: 'escrowDerived',
+        reason: 'invalid_ledger_close_time',
+        ledgerCloseTime: null,
+        valueType: 'string',
+      }),
+      expect.stringContaining('non-numeric or negative')
+    );
     warnSpy.mockRestore();
   });
 });
@@ -266,20 +280,28 @@ describe('validateMaturityDateBounds', () => {
   });
 
   it('logs warning when rejecting too-far-future', () => {
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
     const tooFar = new Date(NOW.getTime() + 100 * 365 * 24 * 60 * 60 * 1000);
     validateMaturityDateBounds(tooFar, NOW);
     expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        component: 'escrowDerived',
+        reason: 'maturity_date_too_far_future',
+      }),
       expect.stringContaining('absurd value flagged')
     );
     warnSpy.mockRestore();
   });
 
   it('logs warning when rejecting too-stale-past', () => {
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
     const tooStale = new Date(NOW.getTime() - 500 * 24 * 60 * 60 * 1000);
     validateMaturityDateBounds(tooStale, NOW);
     expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        component: 'escrowDerived',
+        reason: 'maturity_date_too_far_past',
+      }),
       expect.stringContaining('stale or malformed')
     );
     warnSpy.mockRestore();
