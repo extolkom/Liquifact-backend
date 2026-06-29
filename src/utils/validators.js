@@ -39,7 +39,7 @@ function validateInvoiceQueryParams(query) {
   const { status, smeId, buyerId, dateFrom, dateTo, sortBy, order } = query;
 
   if (status !== undefined) {
-    const validStatuses = ['paid', 'pending', 'overdue'];
+    const validStatuses = ALL_INVOICE_STATUSES;
     if (validStatuses.includes(status)) {
       validatedParams.filters.status = status;
     } else {

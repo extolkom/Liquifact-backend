@@ -1,5 +1,6 @@
 const request = require('supertest');
 const { createApp } = require('../app');
+const { ALL_INVOICE_STATUSES } = require('../services/invoiceStateMachine');
 
 jest.mock('../services/invoiceService', () => ({
   getInvoices: jest.fn(),
@@ -83,7 +84,7 @@ describe('Invoice API Integration', () => {
       const res = await request(app).get('/api/invoices?status=invalid');
 
       expect(res.statusCode).toBe(400);
-      expect(res.body.errors).toContain('Invalid status. Must be one of: paid, pending, overdue');
+      expect(res.body.errors).toContain(`Invalid status. Must be one of: ${ALL_INVOICE_STATUSES.join(', ')}`);
       expect(invoiceService.getInvoices).not.toHaveBeenCalled();
     });
 

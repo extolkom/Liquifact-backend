@@ -261,6 +261,44 @@ X-Request-ID: req_123456796
 }
 ```
 
+### 3. List Invoices With a Status Filter (200)
+
+`GET /api/invoices` accepts the shared invoice status vocabulary used by the
+state machine and marketplace validators.
+
+Supported `status` values:
+
+`paid`, `pending`, `overdue`, `pending_verification`, `verified`,
+`partially_funded`, `funded`, `settled`, `completed`, `defaulted`, `approved`,
+`linked_escrow`, `rejected`, `cancelled`
+
+**Request:**
+```bash
+curl -X GET "http://localhost:3001/api/invoices?status=verified&sortBy=amount&order=desc" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Response:**
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Request-ID: req_123456797
+
+{
+  "data": [
+    {
+      "id": "inv_1640995200000_124",
+      "amount": 25000,
+      "customer": "Globex Corp",
+      "status": "verified",
+      "createdAt": "2021-12-31T23:59:59.999Z",
+      "deletedAt": null
+    }
+  ],
+  "message": "Invoices retrieved successfully."
+}
+```
+
 ## Client Implementation Examples
 
 ### JavaScript/Node.js
