@@ -560,6 +560,8 @@ The documentation covers all public endpoints including health checks, invoice m
 
   **Cursor pagination (recommended)** — stable under inserts/deletes; use the `nextCursor` value from one response as the `cursor` param in the next request. Cursors are opaque and HMAC-signed; any modification returns 400.
 
+  Cursor signatures use `CURSOR_SECRET` when set, otherwise `JWT_SECRET`. The public development fallback is only available in `development` and `test`; production deployments must configure a real secret before signing or verifying cursors. For production, prefer `CURSOR_TTL_ENABLED=true` with a bounded `CURSOR_TTL_SECONDS` such as `3600` to limit replay windows. Shorter TTLs reduce replay risk but can expire long-running pagination sessions.
+
   **Offset pagination (legacy)** — use `page` + `limit` as before. `nextCursor` and `hasMore` are also returned so clients can migrate incrementally.
 
   | Param | Mode | Description |

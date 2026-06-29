@@ -7,6 +7,7 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 ## Boot-Time Validation
 
 - `JWT_SECRET` is required by [`src/config/index.js`](../src/config/index.js) and must be at least 32 characters.
+- `CURSOR_SECRET` is optional when `JWT_SECRET` is available, but production cursor signing must never fall back to the public development/test cursor secret.
 - `STELLAR_NETWORK` and `SOROBAN_RPC_URL` are documented as a required boot-time pair in the Stellar validation section of the [README](../README.md#stellar-network-configuration). The expected pairs are `TESTNET` with `https://soroban-testnet.stellar.org`, `MAINNET` with `https://soroban.stellar.org`, and `FUTURENET` with `https://rpc-futurenet.stellar.org`.
 - `KYC_PROVIDER_URL` and `KYC_PROVIDER_API_KEY` must either both be set or both be absent outside `NODE_ENV=test`.
 - `ESCROW_PLATFORM_ADDRESS` is required only when `ESCROW_SIGNING_MODE` is `delegated` or `custodial` in [`src/services/escrowSubmit.js`](../src/services/escrowSubmit.js).
@@ -21,6 +22,9 @@ Secret values are marked **Secret** and must come from local `.env` files, deplo
 | `PORT` | integer port | `3001` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/index.js`](../src/index.js), [`src/server.js`](../src/server.js) |
 | `HELMET_CSP` | boolean string | `false` in template; app defaults vary by environment | No | No | [`src/app.js`](../src/app.js) |
 | `JWT_SECRET` | string, min 32 chars for config validation | None | Yes | **Secret** | [`src/config/index.js`](../src/config/index.js), [`src/middleware/auth.js`](../src/middleware/auth.js) |
+| `CURSOR_SECRET` | string, min 32 chars when set | Falls back to `JWT_SECRET`; public dev fallback only in development/test | No | **Secret** | [`src/config/index.js`](../src/config/index.js), [`src/utils/cursorPagination.js`](../src/utils/cursorPagination.js) |
+| `CURSOR_TTL_ENABLED` | boolean string | `false` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/utils/cursorPagination.js`](../src/utils/cursorPagination.js) |
+| `CURSOR_TTL_SECONDS` | integer seconds | `3600` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/utils/cursorPagination.js`](../src/utils/cursorPagination.js) |
 | `CORS_ORIGINS` | comma-separated origins | Development localhost fallback; production denies when unset | No | No | [`src/config/cors.js`](../src/config/cors.js) |
 | `CORS_ALLOWED_ORIGINS` | comma-separated origins | Optional alias preferred over `CORS_ORIGINS` | No | No | [`src/config/index.js`](../src/config/index.js), [`src/config/cors.js`](../src/config/cors.js) |
 | `CORS_MAX_AGE` | integer seconds | `600` | No | No | [`src/config/cors.js`](../src/config/cors.js) |
