@@ -47,6 +47,18 @@ describe('Request ID Middleware', () => {
     expect(next).toHaveBeenCalled();
   });
 
+  it('should replace an invalid request id header with a generated id', () => {
+    req.headers['x-request-id'] = 'bad id with spaces';
+
+    requestId(req, res, next);
+
+    expect(req.id).toBeDefined();
+    expect(req.id).not.toBe('bad id with spaces');
+    expect(req.log.bindings()).toMatchObject({ requestId: req.id });
+    expect(res.setHeader).toHaveBeenCalledWith('X-Request-Id', req.id);
+    expect(next).toHaveBeenCalled();
+  });
+
   it('should reuse an existing request-id header (case insensitive/alternate)', () => {
     const existingId = 'alt-id-456';
     req.headers['request-id'] = existingId;
@@ -55,6 +67,18 @@ describe('Request ID Middleware', () => {
 
     expect(req.id).toBe(existingId);
     expect(res.setHeader).toHaveBeenCalledWith('X-Request-Id', existingId);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('should use a clean alternate request-id header when the primary alias is invalid', () => {
+    req.headers['x-request-id'] = 'not valid';
+    req.headers['request-id'] = 'alt-id-456';
+
+    requestId(req, res, next);
+
+    expect(req.id).toBe('alt-id-456');
+    expect(req.log.bindings()).toMatchObject({ requestId: 'alt-id-456' });
+    expect(res.setHeader).toHaveBeenCalledWith('X-Request-Id', 'alt-id-456');
     expect(next).toHaveBeenCalled();
   });
 

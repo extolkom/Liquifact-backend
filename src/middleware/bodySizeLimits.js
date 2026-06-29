@@ -11,6 +11,7 @@
 'use strict';
 
 const express = require('express');
+const { bodySizeLimitRejectionsTotal } = require('../metrics');
 
 /**
  * Default byte limits for each body content type.
@@ -72,7 +73,10 @@ function parseSize(sizeStr) {
  * @param {string} limit - The human-readable size limit that was exceeded.
  * @returns {void}
  */
-function sendPayloadTooLarge(req, res, limit) {
+function sendPayloadTooLarge(req, res, limit, type) {
+  const limitType = type || 'unknown';
+  bodySizeLimitRejectionsTotal.labels(limitType).inc();
+
   res.status(413).json({
     error: 'Payload Too Large',
     message: `Request body exceeds the maximum allowed size of ${limit}.`,
@@ -94,9 +98,26 @@ function sendPayloadTooLarge(req, res, limit) {
  * @example
  * app.use(jsonBodyLimit('200kb'));
  */
+/**
+ * Determines the limit type label for metrics from the body parser type.
+ * Used to distinguish between `json`, `urlencoded`, and `invoice` limit types.
+ *
+ * @param {string} parserType - The base parser type ('json' or 'urlencoded').
+ * @param {string} resolvedLimit - The resolved limit string, used to detect invoice limit.
+ * @returns {string} The metric label type.
+ */
+function resolveLimitType(parserType, resolvedLimit) {
+  // When the invoice limit (512 KB) is used, label as 'invoice' for operational visibility
+  if (parserType === 'json' && resolvedLimit === DEFAULT_LIMITS.invoice) {
+    return 'invoice';
+  }
+  return parserType;
+}
+
 function jsonBodyLimit(limit) {
   const resolvedLimit = limit || DEFAULT_LIMITS.json;
   const maxBytes = parseSize(resolvedLimit);
+  const limitType = resolveLimitType('json', resolvedLimit);
 
   return [
     /**
@@ -111,7 +132,7 @@ function jsonBodyLimit(limit) {
     function jsonSizeGuard(req, res, next) {
       const contentLength = parseInt(req.headers['content-length'] || '0', 10);
       if (!isNaN(contentLength) && contentLength > maxBytes) {
-        return sendPayloadTooLarge(req, res, resolvedLimit);
+        return sendPayloadTooLarge(req, res, resolvedLimit, limitType);
       }
       next();
     },
@@ -145,7 +166,7 @@ function urlencodedBodyLimit(limit) {
     function urlencodedSizeGuard(req, res, next) {
       const contentLength = parseInt(req.headers['content-length'] || '0', 10);
       if (!isNaN(contentLength) && contentLength > maxBytes) {
-        return sendPayloadTooLarge(req, res, resolvedLimit);
+        return sendPayloadTooLarge(req, res, resolvedLimit, 'urlencoded');
       }
       next();
     },
@@ -168,9 +189,28 @@ function urlencodedBodyLimit(limit) {
  * @example
  * app.use(payloadTooLargeHandler);
  */
+/**
+ * Derives the limit type label from the request's content-type header for
+ * metrics emitted by the error handler. Content-type headers are
+ * attacker-controlled so we only match known safe prefixes; anything else
+ * falls back to 'unknown'.
+ *
+ * @param {import('express').Request} req
+ * @returns {string}
+ */
+function deriveLimitTypeFromContentType(req) {
+  const ct = (req.headers && req.headers['content-type']) || '';
+  if (ct.startsWith('application/json')) return 'json';
+  if (ct.startsWith('application/x-www-form-urlencoded')) return 'urlencoded';
+  return 'unknown';
+}
+
 function payloadTooLargeHandler(err, req, res, next) {
   if (err.type === 'entity.too.large') {
     const limitValue = typeof err.limit === 'number' ? `${err.limit}b` : 'unknown';
+    const limitType = deriveLimitTypeFromContentType(req);
+
+    bodySizeLimitRejectionsTotal.labels(limitType).inc();
 
     return res.status(413).json({
       error: 'Payload Too Large',

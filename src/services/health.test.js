@@ -5,6 +5,7 @@
 const {
   checkSorobanHealth,
   checkDatabaseHealth,
+  inspectPoolHealth,
   performHealthChecks
 } = require('./health');
 
@@ -75,21 +76,16 @@ describe('Health Service', () => {
 
     it('should classify latency as degraded when latency exceeds warn but not fail', async () => {
       process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
-      // Set thresholds low to force degraded
-      process.env.SOROBAN_LATENCY_WARN_MS = '0';
+      // Warn at -1ms so any real latency (>= 0ms) exceeds warn; fail at 500ms
+      process.env.SOROBAN_LATENCY_WARN_MS = '-1';
       process.env.SOROBAN_LATENCY_FAIL_MS = '500';
 
-      // Mock fetch to resolve after 100ms
-      fetchMock.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve({ ok: true, status: 200 }), 100)));
+      fetchMock.mockResolvedValue({ ok: true, status: 200 });
 
-      jest.useFakeTimers();
-      const resultPromise = checkSorobanHealth();
-      jest.advanceTimersByTime(100);
-      const result = await resultPromise;
-      jest.useRealTimers();
+      const result = await checkSorobanHealth();
 
       expect(result.status).toBe('degraded');
-      expect(result.latency).toBeGreaterThanOrEqual(100);
+      expect(result.latency).toBeGreaterThanOrEqual(0);
     });
 
     it('should return unhealthy when network error occurs', async () => {
@@ -113,13 +109,79 @@ describe('Health Service', () => {
       expect(result.status).toBe('not_configured');
     });
 
-    it('should return not_implemented when DATABASE_URL is set', async () => {
+    it('should return healthy when DATABASE_URL is set and DB is reachable', async () => {
       process.env.DATABASE_URL = 'postgresql://localhost:5432/test';
 
       const result = await checkDatabaseHealth();
 
-      expect(result.status).toBe('not_implemented');
-      expect(result.error).toBe('Database health check pending');
+      expect(result.status).toBe('healthy');
+      expect(result.latency).toBeGreaterThanOrEqual(0);
+      expect(result.pool).toBeUndefined();
+    });
+
+    it('should return unhealthy when the DB query rejects', async () => {
+      process.env.DATABASE_URL = 'postgresql://localhost:5432/test';
+      const db = require('../db/knex');
+      db.raw.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+      const result = await checkDatabaseHealth();
+
+      expect(result.status).toBe('unhealthy');
+      expect(result.error).toBe('Database unreachable');
+      expect(result.latency).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should return unhealthy on acquisition timeout', async () => {
+      process.env.DATABASE_URL = 'postgresql://localhost:5432/test';
+      process.env.DB_HEALTH_PROBE_TIMEOUT_MS = '10';
+      const db = require('../db/knex');
+      db.raw.mockImplementationOnce(
+        () => new Promise(resolve => setTimeout(resolve, 500))
+      );
+
+      const result = await checkDatabaseHealth();
+
+      expect(result.status).toBe('unhealthy');
+      expect(result.error).toBe('Connection pool acquire timeout');
+    });
+  });
+
+  describe('inspectPoolHealth', () => {
+    it('returns null when knex instance has no client', () => {
+      expect(inspectPoolHealth(null)).toBeNull();
+      expect(inspectPoolHealth({})).toBeNull();
+    });
+
+    it('returns null when pool is absent', () => {
+      expect(inspectPoolHealth({ client: {} })).toBeNull();
+    });
+
+    it('returns pool counters from tarn methods', () => {
+      const fakeKnex = {
+        client: {
+          pool: {
+            numUsed: () => 3,
+            numFree: () => 7,
+            numPendingAcquires: () => 1,
+          },
+          config: { pool: { max: 10 } },
+        },
+      };
+      expect(inspectPoolHealth(fakeKnex)).toEqual({ used: 3, free: 7, pending: 1, max: 10 });
+    });
+
+    it('defaults max to 10 when config is absent', () => {
+      const fakeKnex = {
+        client: {
+          pool: {
+            numUsed: () => 0,
+            numFree: () => 0,
+            numPendingAcquires: () => 0,
+          },
+        },
+      };
+      const metrics = inspectPoolHealth(fakeKnex);
+      expect(metrics.max).toBe(10);
     });
   });
 

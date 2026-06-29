@@ -158,6 +158,8 @@ function auditMiddleware(req, res, next) {
             method: req.method,
             path: req.path,
           },
+        }).catch((error) => {
+          console.error('Audit log fire-and-forget failed:', error.message);
         });
       } catch (error) {
         // Log error but don't interrupt response

@@ -181,8 +181,90 @@ The application exposes Prometheus metrics on `GET /metrics` (subject to the sam
 - `liquifact_job_queue_depth`: Number of pending jobs currently waiting in background queues (includes main queue across registered job queues).
 - `liquifact_job_retry_queue_size`: Number of jobs currently waiting in retry queues across registered job queues.
 - `liquifact_worker_inflight_count`: Number of jobs currently being processed by registered background workers.
+- `soroban_rpc_call_duration_seconds`: Histogram of end-to-end Soroban RPC wrapper latency, labelled by bounded `method` and `outcome` values. The timing includes retry delays because it measures the full `callSorobanContract()` wrapper path.
+- `soroban_rpc_retry_causes_total`: Counter of Soroban retry attempts, labelled by bounded `cause` values (`timeout`, `429`, `5xx`, `unknown`).
 
 These gauges are updated by sampling registered `JobQueue` and `BackgroundWorker` instances and are intentionally bounded to avoid high-cardinality labels.
+
+Soroban metric labels are intentionally coarse and bounded:
+
+- `method` is normalized to a small allowlist of method families such as `contract_call`, `simulate_transaction`, and `get_ledger_entries`. Unknown or untrusted values are collapsed to `unknown`.
+- `outcome` is limited to `success`, `error`, or `circuit_open`.
+- `cause` is limited to `timeout`, `429`, `5xx`, or `unknown`.
+
+No request payloads, contract arguments, presigned URLs, bearer tokens, or other secrets are included in metric labels.
+
+Example PromQL:
+
+```promql
+# 95th percentile end-to-end Soroban latency by method
+histogram_quantile(
+  0.95,
+  sum(rate(soroban_rpc_call_duration_seconds_bucket[5m])) by (le, method)
+)
+
+# Retry rate by retry cause
+sum(rate(soroban_rpc_retry_causes_total[5m])) by (cause)
+```
+
+### Body-size limit rejection metrics
+
+The `body_size_limit_rejections_total` counter tracks every request rejected with HTTP 413 Payload Too Large, labelled by the body parser type that rejected it:
+
+| Label `type` | Trigger |
+|---|---|
+| `json` | Rejected by the global JSON body parser (default 100 KB) |
+| `urlencoded` | Rejected by the URL-encoded body parser (default 50 KB) |
+| `invoice` | Rejected by the stricter invoice upload parser (default 512 KB) |
+| `unknown` | Rejected by the generic error handler when content-type cannot be determined |
+
+This counter is designed for **DoS detection**: a sudden spike in any `type` label indicates a potential attack attempting to overwhelm the API with oversized payloads.
+
+#### DoS detection alert rules
+
+The following PromQL alerts detect rapid increases in body-size rejections. A sustained rate of 10+ rejections per minute is a strong signal of a volumetric DoS attempt.
+
+```promql
+# Alert when JSON body-size rejections exceed 10 per minute (potential DoS)
+rate(body_size_limit_rejections_total{type="json"}[5m]) > 0.167
+
+# Alert when urlencoded body-size rejections exceed 10 per minute
+rate(body_size_limit_rejections_total{type="urlencoded"}[5m]) > 0.167
+
+# Aggregate alert across ALL body-size limit types
+sum(rate(body_size_limit_rejections_total[5m])) > 0.167
+```
+
+**Tuning guidance:**
+
+| Environment | Suggested rate threshold | Rationale |
+|---|---|---|
+| Development / CI | `> 0.5` (30/min) | Higher baseline from automated test traffic |
+| Production (normal) | `> 0.167` (10/min) | Expected occasional oversized payloads from legitimate clients |
+| Production (locked down) | `> 0.017` (1/min) | Very low tolerance — almost all oversized payloads are malicious |
+
+For production deployments, include the full YAML alert rule from [`docs/prometheus-rules.yml`](./docs/prometheus-rules.yml).
+
+### Grafana dashboard
+
+Import the pre-built Grafana dashboard to visualize body-size limit rejection metrics over time:
+
+  1. Open Grafana → **+** → **Import**.
+  2. Upload or paste [`docs/grafana-dashboard.json`](./docs/grafana-dashboard.json).
+  3. Select your Prometheus data source.
+  4. Click **Import**.
+
+The dashboard includes the following panels:
+
+| Panel | Type | Description |
+|---|---|---|
+| Rejection Rate by Type | Time series | `rate(body_size_limit_rejections_total[5m])` per `type` label (json, urlencoded, invoice, unknown) + aggregate |
+| Current Rejection Rate | Stat | Live rate with green/yellow/red background thresholds matching alert severity |
+| Rejections by Type (Current) | Bar gauge | Instant per-type rates for quick scanning |
+| Cumulative Rejections (Last Hour) | Bar gauge | `increase()[1h]` per type — sustained values > 600 suggest probing |
+| Cumulative Rejections Over Time | Time series | Hourly increase per type over the selected time window |
+| Alert Threshold Reference | Bar gauge | Combined rate with visual threshold markers |
+| Historical Rejection Heatmap | Time series (step) | All-types aggregate with color-coded severity bands |
 
 ---
 
@@ -292,6 +374,96 @@ On success, `req.apiClient` is set to `{ clientId, scopes }`.
 
 ---
 
+## Docker / Deployment
+
+The production image is built with two hardening measures that address
+container-security best practices (CIS Docker Benchmark):
+
+### Image overview
+
+| Property | Value |
+|---|---|
+| Base image | `node:20-slim` |
+| Build strategy | Multi-stage (deps → runtime) |
+| Runtime user | `appuser` (UID 1001, non-root) |
+| Dependency install | `npm ci --omit=dev` against committed `package-lock.json` |
+| Health probe | `GET /readyz` (HTTP 200 = healthy) |
+| Exposed port | `3001` |
+
+### Non-root runtime user
+
+The final image creates a dedicated `appuser`/`appgroup` (UID/GID 1001) and
+switches to that identity before `CMD`. The process therefore runs without
+`root` privileges, limiting the blast radius of any application-layer exploit.
+
+```dockerfile
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid appgroup --no-create-home --shell /bin/false appuser
+...
+USER appuser
+```
+
+### Lockfile-verified install
+
+`npm ci` requires `package-lock.json` to be present and in sync with
+`package.json`. If the lockfile is absent or diverged the build fails
+immediately — no silent version drift into production.
+
+> **Note:** `package-lock.json` must be committed to the repository.
+> The `.gitignore` was updated to allow this file; run
+> `npm install` locally and commit the generated lockfile before building the
+> Docker image.
+
+### Multi-stage build
+
+The `deps` stage installs dependencies; the `runtime` stage copies only the
+resolved `node_modules` and application source. Build tooling, npm itself,
+and any intermediate files never reach the final layer.
+
+### Building and running
+
+```bash
+# Build the hardened image
+docker build -t liquifact-backend:latest .
+
+# Run with required environment variables
+docker run --rm \
+  -p 3001:3001 \
+  -e NODE_ENV=production \
+  -e DATABASE_URL=postgresql://user:pass@host:5432/db \
+  liquifact-backend:latest
+
+# Verify the container runs as a non-root user
+docker run --rm --entrypoint id liquifact-backend:latest
+# Expected output: uid=1001(appuser) gid=1001(appgroup) groups=1001(appgroup)
+```
+
+### Edge cases
+
+| Scenario | Behaviour |
+|---|---|
+| `package-lock.json` missing | `npm ci` fails; `docker build` exits non-zero |
+| `package-lock.json` out of sync | `npm ci` fails; `docker build` exits non-zero |
+| Health check during startup | `--start-period=5s` absorbs boot time; probe retried up to 3× |
+| Non-root file permissions | `chown -R appuser:appgroup /app` grants app full access to its own tree |
+
+### Graceful Shutdown
+
+The application implements coordinated graceful shutdown to prevent request interruption, prevent database pool leaking, and allow background jobs to drain properly.
+
+When a termination signal (`SIGTERM` or `SIGINT`) is received:
+1. **HTTP Listener Closure**: The server immediately stops accepting new HTTP connections via `server.close()`.
+2. **Request Draining**: Existing active HTTP requests are allowed to complete. Idle keep-alive connections are closed immediately.
+3. **Background Worker Stop**: The active background worker is stopped gracefully using `worker.stop()`, allowing in-flight jobs to complete.
+4. **Knex Pool Destruction**: The Knex database connection pool is closed (`db.destroy()`).
+5. **Clean Exit**: The process exits cleanly with status code `0`.
+
+#### Configuration
+
+- `SHUTDOWN_TIMEOUT_MS`: The maximum time (in milliseconds) to wait for all phases of graceful shutdown to complete before forcing a process exit with status code `1` (defaults to `10000` / 10 seconds).
+
+---
+
 ## Development
 
 | Command | Description |
@@ -355,7 +527,7 @@ npm run db:migrate
 
 ### Key Features
 
-- **Multi-tenant isolation** with tenant-scoped data
+- **Multi-tenant isolation** with tenant-scoped data (see [`docs/multi-tenancy.md`](./docs/multi-tenancy.md))
 - **Soft deletes** for data recovery
 - **Audit trail** for compliance
 - **UUID primary keys** for distributed systems
@@ -373,6 +545,7 @@ The API is documented using OpenAPI 3.0 specification.
 - **Interactive Docs**: `GET /docs` - Swagger UI for exploring and testing the API
 - **Correlation Strategy**: See [`docs/invoice-correlation.md`](./docs/invoice-correlation.md) for details on how `invoiceId` correlates with on-chain Stellar and Soroban data.
 - **Signing Modes**: See [`docs/ops-signing.md`](./docs/ops-signing.md) for details on the escrow transaction signing modes (delegated, custodial, stubbed).
+- **Multi-Tenancy Model**: See [`docs/multi-tenancy.md`](./docs/multi-tenancy.md) for details on the multi-tenant architecture and data isolation constraints.
 
 The documentation covers all public endpoints including health checks, invoice management, escrow operations, and investment opportunities.
 
@@ -503,6 +676,10 @@ invoice.pdf            -> accepted
 
 ### Tenant and Invoice Validation
 
+Tenant IDs are **required** for all SME upload operations, provided either via:
+- `X-Tenant-Id` header (service-to-service), or
+- `tenantId` JWT claim (authenticated users).
+
 Tenant IDs and invoice IDs are validated before key generation.
 
 Allowed characters:
@@ -522,6 +699,14 @@ Rejected examples:
 tenant/admin
 inv/123
 ```
+
+### Idempotency for Presigned URL Generation
+
+The `POST /api/sme/invoice/presigned-url` endpoint **requires an `Idempotency-Key` header** to prevent duplicate invoiceId creation and ensure retries don't generate new presigned URLs.
+
+- Valid key format: 8–128 URL-safe characters (a-z, A-Z, 0-9, ., _, :, -)
+- Same key + same body → returns cached response (same invoiceId and presigned URL)
+- Same key + different body → returns 409 Conflict
 
 ### MIME Type Validation
 
@@ -1285,8 +1470,9 @@ Both ends of the pipeline attach `error` listeners. If the database stream or th
 
 Every CSV field is processed by `escapeCsvField()` in `src/services/auditLogStore.js`:
 
-1. **Leading-character neutralisation** — cells beginning with `=`, `+`, `-`, `@`, TAB, or CR are prefixed with a single quote (`'`). This prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or a DDE command.
-2. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
+1. **Leading-whitespace normalisation** — the field is checked after stripping leading whitespace (`trimStart()`), so values like ` =HYPERLINK(...)` or `\t=cmd` are caught even when the dangerous character is not in position 0.
+2. **Leading-character neutralisation** — cells whose first non-whitespace character is `=`, `+`, `-`, `@`, `|`, TAB, or CR are prefixed with a single quote (`'`). This covers the full OWASP CSV Injection list and prevents spreadsheet software (Excel, LibreOffice Calc, Google Sheets) from interpreting the cell as a formula or DDE command.
+3. **RFC 4180 quoting** — fields containing commas, double-quotes, or newlines are wrapped in double-quotes; embedded double-quotes are doubled (`"` → `""`).
 
 #### Tenant isolation
 
@@ -1428,7 +1614,7 @@ The backend sends maturity reminders to relevant parties before invoices reach t
 
 - **Exponential backoff**: Transient SMTP failures (4xx, network errors) are automatically retried with configurable backoff (default: 3 attempts, ~1s base delay, doubling each attempt)
 - **Error classification**: Permanent SMTP failures (5xx, invalid recipient) fail immediately without retry to avoid wasting resources
-- **Dead-lettering**: Emails that fail after all retries are dead-lettered to an in-memory queue for manual inspection and recovery
+- **Dead-lettering**: Emails that fail after all retries are recorded as sanitized rows in `maturity_reminder_dead_letters` for durable inspection
 - **Observability**: Prometheus counters track delivery attempts, successes, and dead-lettered messages with fine-grained failure reasons
 
 #### Configuration

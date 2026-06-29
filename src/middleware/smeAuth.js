@@ -1,8 +1,7 @@
 'use strict';
 
 const AppError = require('../errors/AppError');
-
-const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+const { isValidStellarAddress } = require('../utils/stellarAddress');
 
 /**
  * Middleware: verifies the authenticated user has a bound Stellar wallet address.
@@ -40,7 +39,7 @@ function authorizeSmeWallet(req, res, next) {
     }));
   }
 
-  if (!STELLAR_ADDRESS_RE.test(wallet)) {
+  if (!isValidStellarAddress(wallet)) {
     return next(new AppError({
       type: 'https://liquifact.com/probs/validation-error',
       title: 'Invalid Wallet Address',

@@ -27,15 +27,15 @@ const { legalHoldGate } = require('../middleware/legalHoldGate');
 const { resolveEscrowAddress, EscrowNotFoundError } = require('../config/escrowMap');
 const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmit');
 const { persistCommitment } = require('../services/investorCommitment');
+const { listOpportunities } = require('../services/investService');
 const idempotencyMiddleware = require('../middleware/idempotency');
+const { isValidStellarAddress } = require('../utils/stellarAddress');
 
 const router = express.Router();
 
 // ─── Validation helpers ───────────────────────────────────────────────────────
 
 const INVOICE_ID_RE = /^[a-zA-Z0-9_\-]{3,64}$/;
-const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
-
 router.use(...authenticatedTenantStack);
 
 /**
@@ -57,7 +57,7 @@ function validateFundInvoiceBody(body) {
     errors.push('invoiceId must be an alphanumeric string (3-64 chars, hyphens/underscores allowed).');
   }
 
-  if (!investorAddress || !STELLAR_ADDRESS_RE.test(investorAddress)) {
+  if (!investorAddress || !isValidStellarAddress(investorAddress)) {
     errors.push('investorAddress must be a valid Stellar public key (G... or C...).');
   }
 
@@ -98,7 +98,7 @@ router.post(
   '/fund-invoice',
   requireKycForFunding,
   idempotencyMiddleware,
-  asyncHandler(async (req, res, next) => {
+  asyncHandler(async (req, res) => {
     // 1. Input validation
     const validationErrors = validateFundInvoiceBody(req.body);
     if (validationErrors.length > 0) {
@@ -119,13 +119,17 @@ router.post(
     const gateHandler = legalHoldGate();
     await new Promise((resolve, reject) => {
       gateHandler(req, res, (err) => {
-        if (err) return reject(err);
+        if (err) {
+          return reject(err);
+        }
         resolve();
       });
     });
 
     // If the gate intercepted the response (e.g., returned a 423), stop execution processing immediately
-    if (res.headersSent) return;
+    if (res.headersSent) {
+      return;
+    }
 
     // 3. Resolve the escrow contract address
     let escrowAddress;

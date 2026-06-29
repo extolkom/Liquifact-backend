@@ -25,6 +25,7 @@ const {
   invoiceBodyLimit,
   payloadTooLargeHandler,
 } = require('../middleware/bodySizeLimits');
+const { bodySizeLimitRejectionsTotal } = require('../metrics');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -639,5 +640,174 @@ describe('payloadTooLargeHandler()', () => {
       .send(makeJsonBody(1024)); // 1 KB — well under 10 KB
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// bodySizeLimitRejectionsTotal metric
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('bodySizeLimitRejectionsTotal metric', () => {
+  let metricSpy;
+
+  beforeEach(() => {
+    // Spy on the counter's .inc() method to track invocations
+    metricSpy = jest.spyOn(bodySizeLimitRejectionsTotal, 'inc');
+  });
+
+  afterEach(() => {
+    metricSpy.mockRestore();
+  });
+
+  // ── Pre-flight guard: JSON ────────────────────────────────────────────
+
+  it('increments metric with type "json" on oversized JSON Content-Length pre-flight', async () => {
+    const app = buildApp(jsonBodyLimit('1kb'));
+
+    const res = await request(app)
+      .post('/test')
+      .set('Content-Type', 'application/json')
+      .set('Content-Length', String(parseSize('1kb') + 1))
+      .send('{}');
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'json' });
+  });
+
+  it('increments metric with type "json" on oversized JSON body rejection', async () => {
+    const app = buildApp(jsonBodyLimit('1kb'));
+
+    const res = await request(app)
+      .post('/test')
+      .set('Content-Type', 'application/json')
+      .send(makeJsonBody(2048));
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'json' });
+  });
+
+  // ── Pre-flight guard: URL-encoded ─────────────────────────────────────
+
+  it('increments metric with type "urlencoded" on oversized URL-encoded pre-flight', async () => {
+    const app = buildApp(urlencodedBodyLimit('1kb'));
+
+    const res = await request(app)
+      .post('/test')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .set('Content-Length', String(parseSize('1kb') + 1))
+      .send('x=1');
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'urlencoded' });
+  });
+
+  it('increments metric with type "urlencoded" on oversized URL-encoded body rejection', async () => {
+    const app = buildApp(urlencodedBodyLimit('1kb'));
+
+    const res = await request(app)
+      .post('/test')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .send(makeUrlencodedBody(2048));
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'urlencoded' });
+  });
+
+  // ── PayloadTooLargeHandler: derives from content-type ────────────────
+
+  it('increments metric with type "json" from payloadTooLargeHandler for JSON content-type', async () => {
+    const app = express();
+    app.post('/trigger', (_req, _res, next) => {
+      next(Object.assign(new Error('too large'), { type: 'entity.too.large', limit: 102400 }));
+    });
+    app.use(payloadTooLargeHandler);
+
+    const res = await request(app)
+      .post('/trigger')
+      .set('Content-Type', 'application/json');
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'json' });
+  });
+
+  it('increments metric with type "urlencoded" from payloadTooLargeHandler for form content-type', async () => {
+    const app = express();
+    app.post('/trigger', (_req, _res, next) => {
+      next(Object.assign(new Error('too large'), { type: 'entity.too.large', limit: 51200 }));
+    });
+    app.use(payloadTooLargeHandler);
+
+    const res = await request(app)
+      .post('/trigger')
+      .set('Content-Type', 'application/x-www-form-urlencoded');
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'urlencoded' });
+  });
+
+  it('increments metric with type "unknown" from payloadTooLargeHandler for unrecognized content-type', async () => {
+    const app = express();
+    app.post('/trigger', (_req, _res, next) => {
+      next(Object.assign(new Error('too large'), { type: 'entity.too.large', limit: 102400 }));
+    });
+    app.use(payloadTooLargeHandler);
+
+    const res = await request(app)
+      .post('/trigger')
+      .set('Content-Type', 'application/octet-stream');
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'unknown' });
+  });
+
+  it('increments metric with type "unknown" from payloadTooLargeHandler when no content-type header', async () => {
+    const app = express();
+    app.post('/trigger', (_req, _res, next) => {
+      next(Object.assign(new Error('too large'), { type: 'entity.too.large', limit: 102400 }));
+    });
+    app.use(payloadTooLargeHandler);
+
+    const res = await request(app).post('/trigger');
+
+    expect(res.status).toBe(413);
+    expect(metricSpy).toHaveBeenCalledWith({ type: 'unknown' });
+  });
+
+  // ── Under-limit requests do NOT increment ────────────────────────────
+
+  it('does NOT increment metric for under-limit JSON request', async () => {
+    const app = buildApp(jsonBodyLimit('10kb'));
+
+    const res = await request(app)
+      .post('/test')
+      .set('Content-Type', 'application/json')
+      .send(makeJsonBody(512));
+
+    expect(res.status).toBe(200);
+    expect(metricSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT increment metric for under-limit URL-encoded request', async () => {
+    const app = buildApp(urlencodedBodyLimit('10kb'));
+
+    const res = await request(app)
+      .post('/test')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .send(makeUrlencodedBody(200));
+
+    expect(res.status).toBe(200);
+    expect(metricSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT increment metric when payloadTooLargeHandler passes non-size error through', async () => {
+    const app = express();
+    app.post('/trigger', (_req, _res, next) => next(new Error('unrelated')));
+    app.use(payloadTooLargeHandler);
+    app.use((err, _req, res, _next) => res.status(500).json({ error: err.message }));
+
+    const res = await request(app).post('/trigger');
+
+    expect(res.status).toBe(500);
+    expect(metricSpy).not.toHaveBeenCalled();
   });
 });
