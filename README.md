@@ -168,6 +168,10 @@ Health state is also surfaced as a Prometheus gauge (`readiness_gauge`).
 
 Environment variables:
 
+- `SOROBAN_RPC_URL` - Optional Soroban RPC endpoint. When unset, Soroban readiness reports `unknown` and does not block readiness.
+- `SOROBAN_HEALTH_TIMEOUT_MS` - Soroban readiness probe abort timeout in milliseconds. Defaults to `5000` and is clamped to `250-10000`.
+- `SOROBAN_LATENCY_WARN_MS` - RPC latency at or below this value is reported as `healthy`. Defaults to `200`.
+- `SOROBAN_LATENCY_FAIL_MS` - RPC latency above this value is reported as `unhealthy`, with `degraded` between warn and fail. Defaults to `500`.
 - `SENTRY_DSN` — Optional Sentry DSN. Example: `https://<PUBLIC_KEY>@o<ORG_ID>.ingest.sentry.io/<PROJECT_ID>`
 - `SENTRY_RELEASE` — Optional release tag. Defaults to package version when available.
 - `SENTRY_ENVIRONMENT` — Optional environment tag. Defaults to `NODE_ENV`.

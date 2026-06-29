@@ -10,6 +10,30 @@ const { escrowIndexerLastCursorAdvanceTimestampSeconds, readinessGauge } = requi
 const db = require('../db/knex');
 const cfg = require('../config');
 
+const DEFAULT_SOROBAN_HEALTH_TIMEOUT_MS = 5000;
+const MIN_SOROBAN_HEALTH_TIMEOUT_MS = 250;
+const MAX_SOROBAN_HEALTH_TIMEOUT_MS = 10000;
+
+/**
+ * Resolves the Soroban RPC health-probe timeout from environment variables.
+ * Values are clamped so a typo cannot disable the timeout or make readiness
+ * probes wait indefinitely.
+ *
+ * @param {NodeJS.ProcessEnv} [env=process.env] Environment source.
+ * @returns {number} Timeout in milliseconds.
+ */
+function resolveSorobanHealthTimeoutMs(env = process.env) {
+  const configuredTimeoutMs = parseInt(env.SOROBAN_HEALTH_TIMEOUT_MS, 10);
+  if (Number.isNaN(configuredTimeoutMs)) {
+    return DEFAULT_SOROBAN_HEALTH_TIMEOUT_MS;
+  }
+
+  return Math.min(
+    Math.max(configuredTimeoutMs, MIN_SOROBAN_HEALTH_TIMEOUT_MS),
+    MAX_SOROBAN_HEALTH_TIMEOUT_MS
+  );
+}
+
 /**
  * Classify Soroban RPC latency against configurable thresholds.
  * Returns "healthy" for latency <= warn, "degraded" for latency > warn && <= fail,
@@ -20,8 +44,12 @@ const cfg = require('../config');
 function classifySorobanLatency(latencyMs) {
   const warnMs = parseInt(process.env.SOROBAN_LATENCY_WARN_MS, 10) || 200;
   const failMs = parseInt(process.env.SOROBAN_LATENCY_FAIL_MS, 10) || 500;
-  if (latencyMs <= warnMs) return 'healthy';
-  if (latencyMs <= failMs) return 'degraded';
+  if (latencyMs <= warnMs) {
+    return 'healthy';
+  }
+  if (latencyMs <= failMs) {
+    return 'degraded';
+  }
   return 'unhealthy';
 }
 
@@ -36,9 +64,15 @@ async function checkSorobanHealth() {
   }
 
   const start = Date.now();
+  let timeout;
+
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    const timeoutMs = resolveSorobanHealthTimeoutMs();
+    timeout = setTimeout(() => controller.abort(), timeoutMs);
+    if (timeout.unref) {
+      timeout.unref();
+    }
 
     const response = await fetch(url, {
       method: 'POST',
@@ -47,7 +81,6 @@ async function checkSorobanHealth() {
       signal: controller.signal,
     });
 
-    clearTimeout(timeout);
     const latency = Date.now() - start;
 
     if (response.ok) {
@@ -58,6 +91,8 @@ async function checkSorobanHealth() {
   } catch (error) {
     const latency = Date.now() - start;
     return { status: 'unhealthy', latency, error: error.message };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -84,7 +119,9 @@ async function checkSorobanHealth() {
  */
 function inspectPoolHealth(knexInstance) {
   const pool = knexInstance && knexInstance.client && knexInstance.client.pool;
-  if (!pool) return null;
+  if (!pool) {
+    return null;
+  }
 
   const used = typeof pool.numUsed === 'function' ? pool.numUsed() : 0;
   const free = typeof pool.numFree === 'function' ? pool.numFree() : 0;
@@ -147,7 +184,9 @@ async function checkDatabaseHealth() {
         timedOut = true;
         reject(new Error('POOL_ACQUIRE_TIMEOUT'));
       }, probeTimeoutMs);
-      if (timeoutId.unref) timeoutId.unref();
+      if (timeoutId.unref) {
+        timeoutId.unref();
+      }
     });
 
     await Promise.race([db.raw('SELECT 1'), timeoutPromise]);
@@ -160,9 +199,11 @@ async function checkDatabaseHealth() {
     const status = (hasPending || atSaturation) ? 'degraded' : 'healthy';
 
     const result = { status, latency };
-    if (poolMetrics) result.pool = poolMetrics;
+    if (poolMetrics) {
+      result.pool = poolMetrics;
+    }
     return result;
-  } catch (error) {
+  } catch (_error) {
     clearTimeout(timeoutId);
     const latency = Date.now() - start;
     const result = {
@@ -170,7 +211,9 @@ async function checkDatabaseHealth() {
       latency,
       error: timedOut ? 'Connection pool acquire timeout' : 'Database unreachable',
     };
-    if (poolMetrics) result.pool = poolMetrics;
+    if (poolMetrics) {
+      result.pool = poolMetrics;
+    }
     return result;
   }
 }
@@ -221,9 +264,14 @@ async function checkKycHealth() {
   }
 
   const start = Date.now();
+  let timeout;
+
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    timeout = setTimeout(() => controller.abort(), 5000);
+    if (timeout.unref) {
+      timeout.unref();
+    }
 
     const response = await fetch(kycCfg.baseUrl, {
       method: 'HEAD',
@@ -231,7 +279,6 @@ async function checkKycHealth() {
       signal: controller.signal,
     });
 
-    clearTimeout(timeout);
     const latency = Date.now() - start;
 
     // Any HTTP response (even 4xx) means the host is reachable
@@ -241,6 +288,8 @@ async function checkKycHealth() {
   } catch (error) {
     const latency = Date.now() - start;
     return { status: 'unhealthy', latency, error: error.message };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -414,7 +463,9 @@ module.exports = {
   checkKycHealth,
   checkStorageHealth,
   checkIndexerStaleness,
+  checkReconciliationHealth,
   performHealthChecks,
   performReadinessChecks,
   inspectPoolHealth,
+  resolveSorobanHealthTimeoutMs,
 };
