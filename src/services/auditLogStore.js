@@ -263,6 +263,7 @@ function createCsvTransform() {
 module.exports = {
   appendAuditEvent,
   redactValue,
+  normalizeMetadata,
   REDACTED,
   escapeCsvField,
   CSV_HEADERS,
