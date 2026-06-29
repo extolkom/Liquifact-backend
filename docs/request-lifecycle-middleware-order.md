@@ -23,6 +23,16 @@ Applied in this order before any route handler runs:
 
 The request ID middleware accepts a client-supplied header only when it is a non-empty string of at most 128 characters and contains only the safe characters `[A-Za-z0-9._-]`. Values with control characters, newlines, whitespace, or other disallowed bytes are rejected and replaced with a server-generated UUID. The sanitized value is then attached to `req.id`, propagated into child loggers, and echoed in the `X-Request-Id` response header.
 
+## Input sanitization contract
+
+The input sanitization middleware normalizes request bodies, route params, and
+query values before downstream handlers consume them. Express 5 exposes
+`req.query` as a getter-only framework property, so the middleware sanitizes
+query values by wrapping the app-level query parser instead of installing an own
+`query` property on each request. Route params remain guarded with a sanitized
+request-owned accessor because Express can assign `req.params` after global
+middleware runs during route matching.
+
 ## Inline routes (defined on `app` directly)
 
 Health probes (`/health`, `/healthz`, `/ready`, `/readyz`), API info (`/api`),
